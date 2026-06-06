@@ -71,19 +71,29 @@ fn cmd_pull(args: &[String]) -> ExitCode {
     };
     let cache = Path::new("amber-cache/blobs");
     let rootfs = Path::new("amber-cache/rootfs");
-    match amber_image::pull_and_flatten(image, cache, rootfs) {
-        Ok(img) => {
-            println!("rootfs: {}", img.rootfs.display());
-            let argv = img.config.default_argv();
-            println!("default argv: {argv:?}");
-            if let Some(wd) = &img.config.working_dir {
-                println!("workdir: {wd}");
-            }
-            println!("env entries: {}", img.config.env.len());
+    let img = match amber_image::pull_and_flatten(image, cache, rootfs) {
+        Ok(img) => img,
+        Err(e) => {
+            eprintln!("pull failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("rootfs: {}", img.rootfs.display());
+    println!("default argv: {:?}", img.config.default_argv());
+    if let Some(wd) = &img.config.working_dir {
+        println!("workdir: {wd}");
+    }
+    println!("env entries: {}", img.config.env.len());
+
+    let base = Path::new("amber-cache/base.sqfs");
+    match amber_image::pack_squashfs(&img.rootfs, base) {
+        Ok(()) => {
+            let sz = std::fs::metadata(base).map(|m| m.len()).unwrap_or(0);
+            println!("base: {} ({} KiB)", base.display(), sz / 1024);
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("pull failed: {e}");
+            eprintln!("pack failed: {e}");
             ExitCode::FAILURE
         }
     }

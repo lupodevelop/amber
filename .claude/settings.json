@@ -52,7 +52,12 @@
       "Bash(python3 build-initramfs.py)",
       "Bash(brew info *)",
       "Read(//Users/lupodevelop/.cargo/registry/cache/**)",
-      "Bash(./target/release/amber pull *)"
+      "Bash(./target/release/amber pull *)",
+      "Bash(cd /Users/lupodevelop/Git/GitHub/amber/assets/irx/lib/modules/6.12.81-0-virt/kernel *)",
+      "Read(//Users/lupodevelop/Git/GitHub/**)",
+      "Bash(brew install *)",
+      "Bash(mksquashfs -version)",
+      "Bash(unsquashfs -s amber-cache/base.sqfs)"
     ]
   }
 }

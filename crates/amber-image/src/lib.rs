@@ -7,10 +7,12 @@
 //! filesystem work, nothing about the VM.
 
 mod flatten;
+mod pack;
 mod registry;
 
 use std::path::{Path, PathBuf};
 
+pub use pack::pack_squashfs;
 pub use registry::Reference;
 
 #[derive(Debug)]
@@ -20,6 +22,7 @@ pub enum Error {
     Registry(String),
     Json(String),
     Digest { want: String, got: String },
+    Pack(String),
     Io(std::io::Error),
 }
 
@@ -31,6 +34,7 @@ impl std::fmt::Display for Error {
             Error::Registry(m) => write!(f, "registry error: {m}"),
             Error::Json(m) => write!(f, "json error: {m}"),
             Error::Digest { want, got } => write!(f, "digest mismatch: want {want}, got {got}"),
+            Error::Pack(m) => write!(f, "pack error: {m}"),
             Error::Io(e) => write!(f, "io error: {e}"),
         }
     }
