@@ -39,6 +39,7 @@ by guessing.
    Fix: map EC=0x01 to Idle.
 
 **Other M0 notes:**
+
 - Unmodeled sysreg traps (EC=0x18) made inert (reads→0, writes dropped) so boot
   reaches its ceiling instead of faulting. This zeroed `CNTVCT`, which is why M0
   timestamps were all `[0.000000]` — a clue that paid off at M0.5.
@@ -57,6 +58,7 @@ build.** This cost a debugging detour at least once.
 ## M0.5 — GIC + timer + interactive console
 
 **Native vGIC (`hv_gic_*`, macOS 15+):**
+
 - Creation order is strict: after `hv_vm_create`, **before** any vcpu (the GIC
   allocates per-vcpu CPU-interface state). Set vcpu `MPIDR_EL1` affinity (vcpu 0 →
   `0x80000000`) or the kernel can't find its redistributor.
@@ -182,6 +184,27 @@ pull+pack, which caching and warm pools address later — not guest boot.
 
 This was the cheaper fix than virtio-rng; a real virtio-rng device is still worth
 adding for continuous entropy, but the boot stall is no longer a reason to.
+
+### virtio transport refactor + virtio-rng
+
+Before growing the device model (net, vsock later), pulled the virtio-mmio
+transport out of the block device into a reusable `VirtioMmio` (the register
+state machine + split-virtqueue mechanics) behind a small `VirtioDevice` trait
+(device id, feature bits, config space, `handle(ram, bufs)`). Block and entropy
+devices now both plug in, and the VM holds a list of them at separate MMIO
+windows with consecutive SPIs (device i at `BASE + i*STRIDE`, SPI `2+i`). The DTB
+emits one node per device from the same list, so addresses/IRQs can't drift.
+
+Added `RngDevice` (device id 4), filling request buffers from the host
+`/dev/urandom`. Gotchas:
+
+- The guest `virtio-rng.ko` needs `rng-core.ko` first (`Unknown symbol
+  hwrng_register`) — `modules.dep` lists the dependency; load it before.
+- Confirmed end to end: the guest's `hw_random/rng_current` reads `virtio_rng.0`,
+  so its hardware RNG is now our device.
+
+The refactor was validated for free: the block device kept working (still
+`/dev/vda`, now device index 0) through the new transport.
 
 ---
 
