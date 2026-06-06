@@ -61,6 +61,16 @@ pub struct VmInfo {
     pub id: String,
     pub reference: String,
     pub pid: u32,
+    /// Unix epoch seconds when the VM was started, for `ps` age.
+    pub started: u64,
+}
+
+/// Current Unix time in whole seconds.
+pub fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 pub fn write_frame(w: &mut impl Write, tag: u8, payload: &[u8]) -> io::Result<()> {

@@ -384,6 +384,12 @@ spawn this session: **~185 ms → ~81 ms** (offline cache + quiet boot), with ho
 overhead ~5 ms — the rest is real kernel boot, whose floor needs a trimmed kernel
 or snapshot/fork to break.
 
+### M2 iteration — `ps` age column
+
+Small Docker-shaped polish: `VmInfo` gained a `started` (epoch seconds) stamped
+when the daemon registers a VM, and `amber ps` shows an `AGE` column
+(`5s`/`3m`/`2h`). Verified it grows across calls.
+
 ---
 
 ## Cross-cutting choices

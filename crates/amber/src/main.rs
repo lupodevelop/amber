@@ -140,9 +140,10 @@ fn cmd_ps() -> ExitCode {
     }
     match daemon::list() {
         Ok(vms) => {
-            println!("{:<8} {:<8} IMAGE", "ID", "PID");
+            let now = proto::now_secs();
+            println!("{:<8} {:<8} {:<6} IMAGE", "ID", "PID", "AGE");
             for v in vms {
-                println!("{:<8} {:<8} {}", v.id, v.pid, v.reference);
+                println!("{:<8} {:<8} {:<6} {}", v.id, v.pid, fmt_age(now.saturating_sub(v.started)), v.reference);
             }
             ExitCode::SUCCESS
         }
@@ -437,6 +438,17 @@ fn first_module_dir() -> std::io::Result<std::path::PathBuf> {
         .next()
         .ok_or_else(|| std::io::Error::other("no kernel modules dir"))??;
     Ok(first.path().join("kernel"))
+}
+
+/// Human-friendly age from whole seconds: `5s`, `3m`, `2h`.
+fn fmt_age(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}h", secs / 3600)
+    }
 }
 
 /// POSIX single-quote escaping: wrap in '...' and escape embedded quotes.

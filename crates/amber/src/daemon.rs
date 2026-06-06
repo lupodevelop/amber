@@ -148,7 +148,10 @@ fn run_one_shot(
     let kill = Arc::new(AtomicBool::new(false));
     reg.lock().unwrap().insert(
         id.clone(),
-        VmEntry { info: VmInfo { id: id.clone(), reference, pid }, kill: kill.clone() },
+        VmEntry {
+            info: VmInfo { id: id.clone(), reference, pid, started: proto::now_secs() },
+            kill: kill.clone(),
+        },
     );
 
     // `client_gone` is set when either relay sees the client disconnect, so the
