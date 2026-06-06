@@ -231,6 +231,38 @@ Verified: `amber run alpine` → alpine:3 with `MemTotal` ≈ 128 MiB; `amber ru
 pytools` → python:3.12-slim with `AMBER_TEMPLATE`/`PYTHONUNBUFFERED` set and
 `MemTotal` ≈ 384 MiB. A size parser handles IEC/SI suffixes (`512MiB`, `4GiB`).
 
+### M2 slice — amberd supervisor + control socket
+
+**Forcing fact:** HVF is **one VM per process** (`hv_vm_create` returns no
+handle — it's the process's singleton). So a single daemon *cannot* host
+multiple guests in-process. amberd is therefore a **supervisor**: it owns the
+unix-socket API and a VM registry, and spawns one child `amber __vm` process per
+VM. This is not a workaround — it's the security model amber wanted anyway (each
+VM in its own restricted host process, Firecracker-jailer style). The child
+inherits the binary's hypervisor entitlement, so no extra signing.
+
+Protocol (`proto.rs`): length-prefixed frames `[tag][len][payload]`; control
+frames are JSON (`Request`/`Reply`), the `Stdout` frame is raw bytes so binary
+console output passes through. `RunOneShot` spawns the child with its stdout
+piped and relays it to the client frame by frame, then sends `Exit{code}`;
+`List`/`Kill`/`Shutdown` manage the fleet. `Kill` finds the child by pid and
+`libc::kill`s it (the registry stores pid, not the `Child`, since the relaying
+thread owns the handle).
+
+CLI: `amber up` spawns a detached `amber serve` (logs to
+`amber-cache/amberd.log`) and waits for the socket; `down` sends `Shutdown`
+(the daemon exits as it replies, so a dropped connection is success); `ps` →
+`List`, `rm <id>` → `Kill`. `amber run` routes through the daemon when reachable,
+else runs in-process (`__vm` is that same in-process worker).
+
+Verified the whole loop: `up` → `ps` (empty) → `run alpine` (child VM, stdout
+streamed back) → a backgrounded `sleep` VM shows in `ps` as `vm1/<pid>/alpine`
+→ `rm vm1` kills it → `ps` empties → `down`.
+
+Deferred (not throwaway-scaffolding yet): warm pool (pays off with M4 fork) and
+interactive stdin *through* the daemon (the fiddly bidirectional relay; one-shot
+stdout streaming works now).
+
 ---
 
 ## Cross-cutting choices
