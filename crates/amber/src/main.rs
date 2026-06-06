@@ -130,7 +130,7 @@ fn cmd_ps() -> ExitCode {
     }
     match daemon::list() {
         Ok(vms) => {
-            println!("{:<8} {:<8} {}", "ID", "PID", "IMAGE");
+            println!("{:<8} {:<8} IMAGE", "ID", "PID");
             for v in vms {
                 println!("{:<8} {:<8} {}", v.id, v.pid, v.reference);
             }
