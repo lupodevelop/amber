@@ -87,12 +87,20 @@ fn cmd_up() -> ExitCode {
         }
     };
     let err = log.try_clone().expect("clone log fd");
-    if let Err(e) = std::process::Command::new(exe)
-        .arg("serve")
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("serve")
+        .stdin(std::process::Stdio::null())
         .stdout(log)
-        .stderr(err)
-        .spawn()
-    {
+        .stderr(err);
+    // Detach into its own session so it outlives the launching shell/TTY.
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    if let Err(e) = cmd.spawn() {
         eprintln!("failed to start amberd: {e}");
         return ExitCode::FAILURE;
     }

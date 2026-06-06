@@ -280,6 +280,40 @@ disconnect/EOF; the client's blocked `read(0)` thread is reaped by process exit
 on the terminal `Exit`. Verified: `(sleep 7; echo hello-via-daemon) | amber run
 alpine -- sh -c 'read x; echo daemon-got:[$x]'` prints `daemon-got:[hello-via-daemon]`.
 
+### M2 iteration — daemon audit + hardening
+
+Ran a focused audit of the control-plane code (a code-review agent over
+`daemon.rs`/`proto.rs`/`manifest.rs`/`main.rs`). It surfaced real bugs, fixed
+here:
+
+- **Orphaned VM on client disconnect (high).** The old relay only noticed a dead
+  client when a stdout write failed — so a quiet/idle guest whose client was
+  killed kept running forever, daemon thread blocked in `wait()`. Fix: a
+  supervisor loop (`try_wait` + 50 ms poll) plus a `client_gone` flag set by
+  *either* relay; the stdin relay's `read_frame` returning EOF is the reliable
+  disconnect signal even when the guest is silent. On disconnect (or `rm`) the
+  child is killed and reaped. Verified: killing the client of a `sleep 60` VM
+  reaps the child and leaves no stray `__vm` process.
+- **Leaked/blocked relay threads (high).** Threads are now joined; the socket is
+  `shutdown(Both)` after the terminal reply so both relays unblock and exit.
+- **Kill by raw pid → PID-reuse race (med).** `Kill`/`rm` now sets a per-VM
+  `AtomicBool`; the owning supervisor (the only reaper) kills and waits. No
+  signalling a pid we no longer own.
+- **Unbounded frame length → OOM/DoS (high).** `read_frame` rejects frames over
+  `MAX_FRAME` (16 MiB) before allocating.
+- **No socket access control (high).** Socket lives in a 0700 per-uid dir, is
+  chmod'd 0600, and every connection is checked with `getpeereid` — only the
+  owner's euid may drive it.
+- **Errors dropped the connection silently (med).** Malformed/oversized/wrong
+  frames now get a structured `Reply::Error` instead of a bare disconnect.
+- **`up` wasn't a real daemon (med).** `serve` is spawned with `setsid` and stdin
+  `/dev/null`, so it outlives the launching shell.
+- **`parse_size` accepted negatives/NaN/zero (low).** Now rejected.
+
+Known limitation kept: the daemon and its `__vm` children use cwd-relative
+`assets/` and `amber-cache/`, so amberd must run from the repo root for now —
+tied to the "borrowed guest assets" debt; resolves when the kernel is bundled.
+
 ---
 
 ## Cross-cutting choices

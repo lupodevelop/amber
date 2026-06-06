@@ -3,26 +3,46 @@
 //! HVF allows one VM per process, so amberd does not host VMs itself — it owns
 //! the control socket and a registry, and spawns one child `amber __vm` process
 //! per VM (which also gives each VM its own restricted host process, the security
-//! model amber wants). `RunOneShot` spawns a child and relays its stdout to the
-//! client; `List`/`Kill`/`Shutdown` manage the fleet.
+//! model amber wants). `RunOneShot` spawns a child and relays its stdin/stdout to
+//! the client; `List`/`Kill`/`Shutdown` manage the fleet.
 
-use crate::proto::{self, read_frame, write_frame, write_reply, Reply, Request, VmInfo, TAG_REPLY, TAG_REQUEST, TAG_STDIN, TAG_STDOUT};
+use crate::proto::{
+    self, read_frame, write_frame, write_reply, Reply, Request, VmInfo, TAG_REPLY, TAG_REQUEST,
+    TAG_STDIN, TAG_STDOUT,
+};
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
+use std::net::Shutdown;
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
-type Registry = Arc<Mutex<HashMap<String, VmInfo>>>;
+/// A live VM's registry entry: its public info plus a flag the owning supervisor
+/// thread watches so `Kill` never has to touch a raw pid (no PID-reuse race).
+struct VmEntry {
+    info: VmInfo,
+    kill: Arc<AtomicBool>,
+}
+
+type Registry = Arc<Mutex<HashMap<String, VmEntry>>>;
 
 // ---- daemon ----
 
 pub fn serve() -> io::Result<()> {
     let sock = proto::socket_path();
+    // Restrict the socket to the owner: a 0700 parent dir and a 0600 socket.
+    if let Some(parent) = sock.parent() {
+        std::fs::create_dir_all(parent)?;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+    }
     let _ = std::fs::remove_file(&sock);
     let listener = UnixListener::bind(&sock)?;
+    std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600))?;
     log::info!("amberd listening on {}", sock.display());
 
     let reg: Registry = Arc::new(Mutex::new(HashMap::new()));
@@ -42,30 +62,50 @@ pub fn serve() -> io::Result<()> {
     Ok(())
 }
 
+/// Reject any peer whose effective uid is not ours: the socket runs arbitrary
+/// images, so only the owner may drive it.
+fn authorized(stream: &UnixStream) -> bool {
+    let (mut uid, mut gid) = (0u32, 0u32);
+    let ok = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } == 0;
+    ok && uid == unsafe { libc::geteuid() }
+}
+
 fn handle(
     mut stream: UnixStream,
     reg: Registry,
     counter: Arc<AtomicU64>,
     sock: &std::path::Path,
 ) -> io::Result<()> {
+    if !authorized(&stream) {
+        let _ = write_reply(&mut stream, &Reply::Error { message: "unauthorized".into() });
+        return Ok(());
+    }
     let Some((tag, payload)) = read_frame(&mut stream)? else {
         return Ok(());
     };
     if tag != TAG_REQUEST {
+        let _ = write_reply(&mut stream, &Reply::Error { message: "expected a request".into() });
         return Ok(());
     }
-    let req: Request = serde_json::from_slice(&payload)?;
+    let req: Request = match serde_json::from_slice(&payload) {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = write_reply(&mut stream, &Reply::Error { message: format!("bad request: {e}") });
+            return Ok(());
+        }
+    };
 
     match req {
         Request::List => {
-            let vms = reg.lock().unwrap().values().cloned().collect();
+            let vms = reg.lock().unwrap().values().map(|e| e.info.clone()).collect();
             write_reply(&mut stream, &Reply::Vms { vms })?;
         }
         Request::Kill { id } => {
-            let removed = reg.lock().unwrap().remove(&id);
-            match removed {
-                Some(info) => {
-                    unsafe { libc::kill(info.pid as i32, libc::SIGKILL) };
+            // Signal the owner thread; it kills and reaps the child it owns.
+            let found = reg.lock().unwrap().get(&id).map(|e| e.kill.clone());
+            match found {
+                Some(flag) => {
+                    flag.store(true, Ordering::Relaxed);
                     write_reply(&mut stream, &Reply::Ok)?;
                 }
                 None => write_reply(&mut stream, &Reply::Error { message: format!("no such vm: {id}") })?,
@@ -105,41 +145,89 @@ fn run_one_shot(
 
     let id = format!("vm{}", counter.fetch_add(1, Ordering::Relaxed) + 1);
     let pid = child.id();
+    let kill = Arc::new(AtomicBool::new(false));
     reg.lock().unwrap().insert(
         id.clone(),
-        VmInfo { id: id.clone(), reference, pid },
+        VmEntry { info: VmInfo { id: id.clone(), reference, pid }, kill: kill.clone() },
     );
 
-    // Relay client stdin -> child stdin on a side thread (full-duplex socket).
-    if let (Ok(mut reader), Some(mut cin)) = (stream.try_clone(), child.stdin.take()) {
+    // `client_gone` is set when either relay sees the client disconnect, so the
+    // supervisor below kills an otherwise-orphaned VM.
+    let client_gone = Arc::new(AtomicBool::new(false));
+    let cout = child.stdout.take();
+    let cin = child.stdin.take();
+
+    // stdout: child -> client.
+    let h_out = {
+        let mut w = stream.try_clone()?;
+        let gone = client_gone.clone();
         thread::spawn(move || {
-            while let Ok(Some((tag, payload))) = read_frame(&mut reader) {
-                if tag == TAG_STDIN && cin.write_all(&payload).and_then(|_| cin.flush()).is_err() {
-                    break;
+            let Some(mut out) = cout else { return };
+            let mut buf = [0u8; 8192];
+            loop {
+                match out.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if write_frame(&mut w, TAG_STDOUT, &buf[..n]).is_err() {
+                            gone.store(true, Ordering::Relaxed);
+                            break;
+                        }
+                    }
                 }
             }
-        });
-    }
+        })
+    };
 
-    // Relay the guest's stdout to the client until the VM exits.
-    if let Some(mut out) = child.stdout.take() {
-        let mut buf = [0u8; 8192];
-        loop {
-            match out.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if write_frame(&mut stream, TAG_STDOUT, &buf[..n]).is_err() {
-                        let _ = child.kill();
+    // stdin: client -> child. EOF/error here means the client is gone.
+    let h_in = {
+        let mut r = stream.try_clone()?;
+        let gone = client_gone.clone();
+        thread::spawn(move || {
+            let Some(mut cin) = cin else { return };
+            loop {
+                match read_frame(&mut r) {
+                    Ok(Some((TAG_STDIN, payload))) => {
+                        if cin.write_all(&payload).and_then(|_| cin.flush()).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(Some(_)) => {}
+                    _ => {
+                        gone.store(true, Ordering::Relaxed);
                         break;
                     }
                 }
             }
-        }
-    }
-    let code = child.wait().ok().and_then(|s| s.code()).unwrap_or(-1);
+        })
+    };
+
+    // Supervise: exit on guest shutdown, or kill the child if asked (rm) or if the
+    // client disconnected.
+    let code = supervise(&mut child, &kill, &client_gone);
     reg.lock().unwrap().remove(&id);
+
+    // Tell the client, then close the socket so the relay threads unblock and join.
     let _ = write_reply(&mut stream, &Reply::Exit { code });
+    let _ = stream.shutdown(Shutdown::Both);
+    let _ = h_out.join();
+    let _ = h_in.join();
     Ok(())
+}
+
+fn supervise(child: &mut Child, kill: &AtomicBool, client_gone: &AtomicBool) -> i32 {
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.code().unwrap_or(-1),
+            Ok(None) => {}
+            Err(_) => return -1,
+        }
+        if kill.load(Ordering::Relaxed) || client_gone.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return -1;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
 }
 
 // ---- clients ----
@@ -163,7 +251,8 @@ fn request(req: &Request) -> io::Result<Reply> {
     }
 }
 
-/// Run via the daemon: stream guest stdout to our stdout, return the exit code.
+/// Run via the daemon: forward our stdin, stream the guest's stdout to ours,
+/// return the exit code.
 pub fn run_client(reference: &str, argv: &[String]) -> io::Result<i32> {
     let mut s = connect().ok_or_else(|| io::Error::other("no amberd"))?;
     proto::write_request(

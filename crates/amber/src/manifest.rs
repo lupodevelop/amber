@@ -72,6 +72,9 @@ pub fn parse_size(s: &str) -> Option<usize> {
     let split = s.find(|c: char| c.is_ascii_alphabetic()).unwrap_or(s.len());
     let (num, unit) = s.split_at(split);
     let num: f64 = num.trim().parse().ok()?;
+    if !num.is_finite() || num < 0.0 {
+        return None;
+    }
     let mult: f64 = match unit.trim().to_ascii_lowercase().as_str() {
         "" | "b" => 1.0,
         "k" | "kib" => 1024.0,
@@ -82,5 +85,6 @@ pub fn parse_size(s: &str) -> Option<usize> {
         "gb" => 1_000_000_000.0,
         _ => return None,
     };
-    Some((num * mult) as usize)
+    let bytes = (num * mult) as usize;
+    (bytes > 0).then_some(bytes)
 }

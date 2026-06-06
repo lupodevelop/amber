@@ -14,13 +14,19 @@ pub const TAG_REPLY: u8 = 2;
 pub const TAG_STDOUT: u8 = 3;
 pub const TAG_STDIN: u8 = 4;
 
+/// Reject frames larger than this. Control frames are small and stdout chunks are
+/// 8 KiB; the cap stops a malformed length from forcing a huge allocation.
+pub const MAX_FRAME: usize = 16 * 1024 * 1024;
+
 /// Default control-socket path. macOS rarely sets `XDG_RUNTIME_DIR`, so fall back
-/// to the temp dir.
+/// to a per-uid subdirectory of the temp dir (created 0700 by the daemon) so the
+/// socket is not world-accessible.
 pub fn socket_path() -> PathBuf {
     if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
         PathBuf::from(dir).join("amber.sock")
     } else {
-        std::env::temp_dir().join("amber.sock")
+        let uid = unsafe { libc::getuid() };
+        std::env::temp_dir().join(format!("amber-{uid}")).join("amber.sock")
     }
 }
 
@@ -75,6 +81,9 @@ pub fn read_frame(r: &mut impl Read) -> io::Result<Option<(u8, Vec<u8>)>> {
     let mut len = [0u8; 4];
     r.read_exact(&mut len)?;
     let len = u32::from_le_bytes(len) as usize;
+    if len > MAX_FRAME {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "frame too large"));
+    }
     let mut payload = vec![0u8; len];
     r.read_exact(&mut payload)?;
     Ok(Some((tag[0], payload)))
