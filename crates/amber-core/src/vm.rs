@@ -48,9 +48,12 @@ impl Default for VmConfig {
             mem_size: 512 * 1024 * 1024,
             kernel: Vec::new(),
             initrd: None,
-            // earlycon prints before the GIC exists; console=ttyAMA0 is the real
-            // tty once the PL011 driver binds, giving an interactive console.
-            cmdline: "earlycon=pl011,0x9000000 console=ttyAMA0".into(),
+            // console=ttyAMA0 is the real tty (app output, interactive). `quiet`
+            // suppresses the verbose boot dmesg, which otherwise streams to the
+            // PL011 one char per MMIO exit — thousands of vmexits that dominate
+            // boot time. earlycon is left off here for the same reason (add it
+            // back for boot debugging).
+            cmdline: "console=ttyAMA0 quiet".into(),
             disk: None,
         }
     }

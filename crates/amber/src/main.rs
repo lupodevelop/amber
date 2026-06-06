@@ -313,6 +313,11 @@ fn cmd_vm(args: &[String]) -> ExitCode {
     if let Some(bytes) = mem_size {
         cfg.mem_size = bytes;
     }
+    // Restore earlycon + verbose boot dmesg for debugging (off by default because
+    // the dmesg streams char-per-MMIO-exit and roughly doubles boot time).
+    if std::env::var("AMBER_VERBOSE").is_ok() {
+        cfg.cmdline = "earlycon=pl011,0x9000000 console=ttyAMA0".into();
+    }
     let t_prep_start = std::time::Instant::now();
     let vm = match Vm::prepare(&cfg) {
         Ok(vm) => vm,

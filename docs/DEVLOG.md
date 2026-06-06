@@ -367,6 +367,23 @@ trimmed/built-in kernel (less device probing, no `insmod`) to lower the floor,
 and **snapshot/fork (M3/M4) to skip boot entirely** for single-digit-ms forks.
 Measuring first stopped us from optimizing the 7 ms and missing the 130 ms.
 
+### M2 iteration — quiet boot (halve the boot time)
+
+The measurement pointed at the boot; the cause turned out to be cheap to fix.
+The guest's boot dmesg (~150 lines) streams to the PL011 **one character per MMIO
+vmexit** — thousands of round-trips that dominated the boot. Changed the default
+kernel cmdline from `earlycon=pl011,0x9000000 console=ttyAMA0` to `console=ttyAMA0
+quiet`: `console=` still gives the app its tty, but `quiet` suppresses the kernel
+boot spam (and earlycon, the other char-per-exit firehose, is dropped). App
+output is unaffected (it's not kernel printk).
+
+Effect on warm `amber run alpine -- true`: boot+run+teardown **137 ms → ~77 ms**,
+total **~81 ms** (steady). Roughly half the old boot was console vmexits.
+`AMBER_VERBOSE=1` restores earlycon + full dmesg for boot debugging. Net warm
+spawn this session: **~185 ms → ~81 ms** (offline cache + quiet boot), with host
+overhead ~5 ms — the rest is real kernel boot, whose floor needs a trimmed kernel
+or snapshot/fork to break.
+
 ---
 
 ## Cross-cutting choices

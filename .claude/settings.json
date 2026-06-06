@@ -65,7 +65,10 @@
       "Bash(ls kernel/drivers/char/hw_random/)",
       "Bash(grep -E 'virtio-rng' modules.dep)",
       "Bash(awk '/OS_ENUM\\\\\\(hv_sys_reg/,/\\\\\\);/' __CMDSUB_OUTPUT__/System/Library/Frameworks/Hypervisor.framework/Headers/hv_vcpu_types.h)",
-      "Bash(grep -vE '^\\\\s*\\\\*|^/\\\\*|^\\\\s*$')"
+      "Bash(grep -vE '^\\\\s*\\\\*|^/\\\\*|^\\\\s*$')",
+      "Bash(./target/release/amber run *)",
+      "Bash(AMBER_TIME=1 ./target/release/amber run alpine -- true)",
+      "Bash(pkill -f 'amber serve')"
     ]
   }
 }
