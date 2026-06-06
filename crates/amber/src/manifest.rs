@@ -3,6 +3,10 @@
 //! slice — the daemon, warm pools, and budget enforcement come later; fields for
 //! them are parsed (forward-compatible) but not yet acted on.
 
+// Several fields are parsed for forward compatibility and consumed in later
+// milestones (pool, budget, timeout); don't warn on them being unread yet.
+#![allow(dead_code)]
+
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
