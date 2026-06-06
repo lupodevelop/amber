@@ -2,6 +2,9 @@
 //! resolution (picking the arm64/linux image from a multi-arch index), and blob
 //! download with sha256 verification.
 
+// ureq's error carries a Response, so Results threading it trip the large-err lint.
+#![allow(clippy::result_large_err)]
+
 use crate::{Error, ImageConfig, Result};
 use sha2::{Digest, Sha256};
 use std::io::Read;
