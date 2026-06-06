@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/amber-core", "crates/amber-hvf", "crates/amber"]
+members = ["crates/amber-core", "crates/amber-hvf", "crates/amber-image", "crates/amber"]
 
 [workspace.package]
 edition = "2021"
@@ -16,3 +16,4 @@ log = "0.4"
 env_logger = "0.11"
 amber-core = { path = "crates/amber-core" }
 amber-hvf = { path = "crates/amber-hvf" }
+amber-image = { path = "crates/amber-image" }

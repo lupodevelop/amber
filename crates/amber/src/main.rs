@@ -7,17 +7,30 @@
 //! backend and tells you so.
 
 use amber_core::{Vm, VmConfig};
+use std::path::Path;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let args: Vec<String> = std::env::args().collect();
-    if args.len() < 3 || args[1] != "boot" {
+    match args.get(1).map(String::as_str) {
+        Some("boot") => cmd_boot(&args),
+        Some("pull") => cmd_pull(&args),
+        _ => {
+            eprintln!("usage:");
+            eprintln!("  amber boot <kernel-Image> [initramfs]");
+            eprintln!("  amber pull <image>");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn cmd_boot(args: &[String]) -> ExitCode {
+    if args.len() < 3 {
         eprintln!("usage: amber boot <kernel-Image> [initramfs]");
         return ExitCode::FAILURE;
     }
-
     let kernel = match std::fs::read(&args[2]) {
         Ok(b) => b,
         Err(e) => {
@@ -46,6 +59,31 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("run failed: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn cmd_pull(args: &[String]) -> ExitCode {
+    let Some(image) = args.get(2) else {
+        eprintln!("usage: amber pull <image>");
+        return ExitCode::FAILURE;
+    };
+    let cache = Path::new("amber-cache/blobs");
+    let rootfs = Path::new("amber-cache/rootfs");
+    match amber_image::pull_and_flatten(image, cache, rootfs) {
+        Ok(img) => {
+            println!("rootfs: {}", img.rootfs.display());
+            let argv = img.config.default_argv();
+            println!("default argv: {argv:?}");
+            if let Some(wd) = &img.config.working_dir {
+                println!("workdir: {wd}");
+            }
+            println!("env entries: {}", img.config.env.len());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("pull failed: {e}");
             ExitCode::FAILURE
         }
     }

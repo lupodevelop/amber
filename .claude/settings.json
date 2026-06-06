@@ -49,7 +49,10 @@
       "Bash(git commit *)",
       "Bash(chmod +x amberfs/init)",
       "Bash(cp amberfs/init /Users/lupodevelop/Git/GitHub/amber/tools/initramfs/init)",
-      "Bash(python3 build-initramfs.py)"
+      "Bash(python3 build-initramfs.py)",
+      "Bash(brew info *)",
+      "Read(//Users/lupodevelop/.cargo/registry/cache/**)",
+      "Bash(./target/release/amber pull *)"
     ]
   }
 }
