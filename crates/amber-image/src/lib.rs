@@ -54,7 +54,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// What an image declares about how to run it: the bits `amber run` needs to
 /// build a default command and environment when the caller does not override.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ImageConfig {
     pub entrypoint: Vec<String>,
     pub cmd: Vec<String>,
@@ -101,4 +101,64 @@ pub fn pull_and_flatten(reference: &str, cache_dir: &Path, rootfs: &Path) -> Res
         rootfs: rootfs.to_path_buf(),
         config,
     })
+}
+
+/// A ready-to-boot image: a packed read-only base plus its run config.
+pub struct Built {
+    pub base: PathBuf,
+    pub config: ImageConfig,
+}
+
+/// Resolve, pull, flatten, and pack `reference` into a squashfs base, caching the
+/// result by the image's content id (its config digest) under `cache_dir/bases`.
+/// A cache hit skips the network, flatten, and pack entirely and goes straight to
+/// boot — the closest thing to a warm start before snapshots exist.
+pub fn build(reference: &str, cache_dir: &Path) -> Result<Built> {
+    let reference = Reference::parse(reference)?;
+    let mut client = registry::Client::new(&reference)?;
+    let manifest = client.fetch_manifest()?;
+
+    // The config digest is the content id: same image -> same base, cached.
+    let id = manifest
+        .config_digest
+        .strip_prefix("sha256:")
+        .unwrap_or(&manifest.config_digest);
+    let bases = cache_dir.join("bases");
+    std::fs::create_dir_all(&bases)?;
+    let base = bases.join(format!("{id}.sqfs"));
+    let cfg_path = bases.join(format!("{id}.json"));
+
+    if base.exists() && cfg_path.exists() {
+        if let Ok(text) = std::fs::read_to_string(&cfg_path) {
+            if let Ok(config) = serde_json::from_str(&text) {
+                log::info!("image cache hit {}", &id[..id.len().min(12)]);
+                return Ok(Built { base, config });
+            }
+        }
+    }
+
+    log::info!("building {reference}");
+    let config = client.fetch_config(&manifest.config_digest)?;
+    let blobs = cache_dir.join("blobs");
+    std::fs::create_dir_all(&blobs)?;
+    let mut layers = Vec::new();
+    for (i, layer) in manifest.layers.iter().enumerate() {
+        log::info!("layer {}/{} {}", i + 1, manifest.layers.len(), layer.digest);
+        layers.push(client.fetch_blob(&layer.digest, &blobs)?);
+    }
+
+    // Concurrent builds (amberd spawns VMs in parallel) must not collide: flatten
+    // into a per-build temp dir and pack to a temp file renamed into place.
+    let stamp = std::process::id();
+    let rootfs = bases.join(format!("rootfs-{id}.{stamp}"));
+    let base_tmp = bases.join(format!("{id}.{stamp}.tmp"));
+    flatten::flatten(&layers, &rootfs)?;
+    pack::pack_squashfs(&rootfs, &base_tmp)?;
+    std::fs::rename(&base_tmp, &base)?;
+    let _ = std::fs::remove_dir_all(&rootfs);
+
+    let json = serde_json::to_string(&config).map_err(|e| Error::Json(e.to_string()))?;
+    std::fs::write(&cfg_path, json)?;
+
+    Ok(Built { base, config })
 }

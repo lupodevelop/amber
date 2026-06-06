@@ -275,30 +275,24 @@ fn cmd_vm(args: &[String]) -> ExitCode {
             None => (target.clone(), None, HashMap::new()),
         };
 
-    let cache = Path::new("amber-cache/blobs");
-    let rootfs = Path::new("amber-cache/rootfs");
-    let base = Path::new("amber-cache/base.sqfs");
-
-    let mut img = match amber_image::pull_and_flatten(&oci_ref, cache, rootfs) {
-        Ok(img) => img,
+    // Resolve, pull, flatten, and pack — cached by image content id, so repeated
+    // runs of the same image skip straight to boot.
+    let mut built = match amber_image::build(&oci_ref, Path::new("amber-cache")) {
+        Ok(b) => b,
         Err(e) => {
-            eprintln!("pull failed: {e}");
+            eprintln!("build failed: {e}");
             return ExitCode::FAILURE;
         }
     };
     // Template env overrides the image's, by key.
     for (k, v) in &extra_env {
         let prefix = format!("{k}=");
-        img.config.env.retain(|e| !e.starts_with(&prefix));
-        img.config.env.push(format!("{k}={v}"));
-    }
-    if let Err(e) = amber_image::pack_squashfs(&img.rootfs, base) {
-        eprintln!("pack failed: {e}");
-        return ExitCode::FAILURE;
+        built.config.env.retain(|e| !e.starts_with(&prefix));
+        built.config.env.push(format!("{k}={v}"));
     }
 
     let argv = if user_argv.is_empty() {
-        img.config.default_argv()
+        built.config.default_argv()
     } else {
         user_argv
     };
@@ -307,7 +301,7 @@ fn cmd_vm(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let initrd = match build_bootstrap(&img.config, &argv) {
+    let initrd = match build_bootstrap(&built.config, &argv) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("bootstrap initramfs: {e}");
@@ -325,7 +319,7 @@ fn cmd_vm(args: &[String]) -> ExitCode {
     let mut cfg = VmConfig {
         kernel,
         initrd: Some(initrd),
-        disk: Some(base.to_path_buf()),
+        disk: Some(built.base.clone()),
         ..Default::default()
     };
     if let Some(bytes) = mem_size {

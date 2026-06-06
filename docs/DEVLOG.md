@@ -314,6 +314,25 @@ Known limitation kept: the daemon and its `__vm` children use cwd-relative
 `assets/` and `amber-cache/`, so amberd must run from the repo root for now —
 tied to the "borrowed guest assets" debt; resolves when the kernel is bundled.
 
+### M2 iteration — image build cache (spawn latency)
+
+Each run used to re-pull, re-flatten, and re-pack the image. Added
+`amber_image::build()`, which caches the packed squashfs base and the run config
+under `bases/<config-digest>.{sqfs,json}` — keyed by the image's **content id**,
+so a moved tag rebuilds but identical content is reused. A warm run skips the
+layer download, flatten, and pack and goes straight to boot. Measured (alpine):
+cold **3.2s** → warm **1.5s** wall. (The warm 1.5s still does the manifest fetch
+to learn the digest plus boot+run; a reference→digest cache could drop the
+network too, at the cost of tag-staleness — deferred deliberately.)
+
+Audit of this change caught a real one: amberd builds VMs **concurrently**, but
+the first cut flattened into a shared `rootfs` dir and wrote the base in place —
+two parallel builds would clobber each other. Fixed: flatten into a per-build
+temp dir (`rootfs-<id>.<pid>`), pack to a temp file, then atomic-rename into the
+content-addressed base, and clean up the temp tree. Verified: alpine and
+python:3.12-slim built in parallel via the daemon both succeed, two bases cached,
+no leftover temp dirs.
+
 ---
 
 ## Cross-cutting choices
