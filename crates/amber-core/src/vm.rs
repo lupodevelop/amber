@@ -5,6 +5,8 @@
 use crate::bus::{MmioBus, Pl011};
 use crate::hypervisor::{Hypervisor, MmioOp, Vcpu, VmExit};
 use crate::{dtb, layout, loader, GuestMemory, Result};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 pub struct VmConfig {
     pub mem_size: usize,
@@ -19,8 +21,9 @@ impl Default for VmConfig {
             mem_size: 512 * 1024 * 1024,
             kernel: Vec::new(),
             initrd: None,
-            // earlycon prints before the GIC exists, which is the whole M0 trick.
-            cmdline: "earlycon=pl011,0x9000000 console=ttyAMA0 panic=-1".into(),
+            // earlycon prints before the GIC exists; console=ttyAMA0 is the real
+            // tty once the PL011 driver binds, giving an interactive console.
+            cmdline: "earlycon=pl011,0x9000000 console=ttyAMA0".into(),
         }
     }
 }
@@ -28,6 +31,7 @@ impl Default for VmConfig {
 pub struct Vm {
     mem: GuestMemory,
     bus: MmioBus,
+    pl011: Pl011,
     entry: u64,
     dtb_addr: u64,
     // Kept so the device tree can be built in `run`, once the backend has
@@ -48,12 +52,10 @@ impl Vm {
         let initrd = loader::load_initramfs(&mem, cfg.initrd.as_deref())?;
         let dtb_addr = mem.base() + layout::DTB_OFFSET;
 
-        let mut bus = MmioBus::default();
-        Pl011::register_on(&mut bus, Box::new(std::io::stdout()));
-
         Ok(Self {
             mem,
-            bus,
+            bus: MmioBus::default(),
+            pl011: Pl011::new(Box::new(std::io::stdout())),
             entry: kernel.entry,
             dtb_addr,
             mem_size: cfg.mem_size as u64,
@@ -66,56 +68,151 @@ impl Vm {
         &self.mem
     }
 
-    /// Boot and run on backend `H` until shutdown or a fatal fault. Single vcpu
-    /// for M0, so this runs on the calling thread.
-    pub fn run<H: Hypervisor>(mut self) -> Result<()> {
-        let mut hv = H::create(&self.mem)?;
+    /// Boot and run on backend `H` until shutdown or a fatal fault.
+    ///
+    /// Two threads. The vcpu runs synchronously on this one. A second thread
+    /// reads host stdin and feeds the UART: with a GIC present the host
+    /// hypervisor parks the vcpu inside `run` on a guest WFI and wakes it on an
+    /// interrupt, so console input has to arrive as an interrupt. The reader
+    /// pushes bytes into the PL011 and raises its GIC line, which wakes the vcpu;
+    /// that is what makes the console interactive rather than output-only.
+    pub fn run<H: Hypervisor + Sync>(self) -> Result<()> {
+        let Vm {
+            mem,
+            mut bus,
+            pl011,
+            entry,
+            dtb_addr,
+            mem_size,
+            cmdline,
+            initrd,
+        } = self;
+
+        let mut hv = H::create(&mem)?;
 
         // Build the device tree now that the backend exists: its GIC node must
         // match the interrupt controller the backend just created.
         let blob = dtb::build(&dtb::DtbParams {
-            mem_size: self.mem_size,
-            cmdline: &self.cmdline,
-            initrd: self.initrd,
+            mem_size,
+            cmdline: &cmdline,
+            initrd,
             gic: hv.gic_info(),
         })?;
-        self.mem.write(self.dtb_addr, &blob)?;
+        mem.write(dtb_addr, &blob)?;
 
         let mut vcpu = hv.create_vcpu(0)?;
-        vcpu.set_boot_regs(self.entry, self.dtb_addr)?;
+        vcpu.set_boot_regs(entry, dtb_addr)?;
 
-        loop {
-            match vcpu.run()? {
-                VmExit::Mmio { access } => {
-                    match access.op {
-                        MmioOp::Write { value, .. } => {
-                            self.bus.write(access.ipa, access.size, value);
+        let pl011_lo = layout::PL011_BASE;
+        let pl011_hi = layout::PL011_BASE + layout::PL011_SIZE;
+        let pl011_intid = layout::GIC_SPI_BASE + layout::PL011_SPI;
+
+        let pl011 = Mutex::new(pl011);
+        let running = AtomicBool::new(true);
+        let hv = &hv;
+        let pl011 = &pl011;
+        let running = &running;
+
+        std::thread::scope(|s| {
+            // Console reader: host stdin -> UART RX -> GIC line -> wake the vcpu.
+            s.spawn(move || console_reader(hv, pl011, pl011_intid, running));
+
+            // vcpu loop on this thread.
+            let mut step = || -> Result<bool> {
+                match vcpu.run()? {
+                    VmExit::Mmio { access } => {
+                        let in_pl011 = access.ipa >= pl011_lo && access.ipa < pl011_hi;
+                        let off = access.ipa - pl011_lo;
+                        match access.op {
+                            MmioOp::Write { value, .. } => {
+                                if in_pl011 {
+                                    pl011.lock().unwrap().write(off, access.size, value);
+                                } else {
+                                    bus.write(access.ipa, access.size, value);
+                                }
+                            }
+                            MmioOp::Read { reg } => {
+                                let v = if in_pl011 {
+                                    pl011.lock().unwrap().read(off, access.size)
+                                } else {
+                                    bus.read(access.ipa, access.size)
+                                };
+                                vcpu.set_x(reg, v)?;
+                            }
                         }
-                        MmioOp::Read { reg } => {
-                            let v = self.bus.read(access.ipa, access.size);
-                            vcpu.set_x(reg, v)?;
+                        if in_pl011 {
+                            // The access may have changed the UART's interrupt line.
+                            let lvl = pl011.lock().unwrap().irq_level();
+                            hv.set_irq(pl011_intid, lvl)?;
                         }
+                        // Step past the faulting load/store: arm64 instructions
+                        // are 4 bytes, and a syndrome-decodable access is one insn.
+                        let pc = vcpu.pc()?;
+                        vcpu.set_pc(pc + 4)?;
+                        Ok(true)
                     }
-                    // Step past the faulting load/store: arm64 instructions are
-                    // 4 bytes, and a syndrome-decodable access is a single insn.
-                    let pc = vcpu.pc()?;
-                    vcpu.set_pc(pc + 4)?;
+                    // With a GIC the hypervisor handles WFI internally; an Idle
+                    // exit only arrives from an explicit cancel. Nothing to do.
+                    VmExit::Idle => Ok(true),
+                    VmExit::Shutdown => {
+                        log::info!("guest requested shutdown");
+                        Ok(false)
+                    }
+                    VmExit::Fault { pc, esr, ipa } => Err(crate::Error::GuestFault { pc, esr, ipa }),
                 }
-                VmExit::Idle => {
-                    // With a GIC the backend parks on WFI and resumes itself, so
-                    // Idle only reaches here from an explicit cancel. Without a
-                    // GIC (the M0 path) a WFI surfaces here and is the ceiling.
-                    log::info!("guest idle (WFI); reached its ceiling without a GIC");
-                    return Ok(());
-                }
-                VmExit::Shutdown => {
-                    log::info!("guest requested shutdown");
-                    return Ok(());
-                }
-                VmExit::Fault { pc, esr, ipa } => {
-                    return Err(crate::Error::GuestFault { pc, esr, ipa });
+            };
+
+            let mut result = Ok(());
+            loop {
+                match step() {
+                    Ok(true) => continue,
+                    Ok(false) => break,
+                    Err(e) => {
+                        result = Err(e);
+                        break;
+                    }
                 }
             }
+            // Let the reader thread exit so the scope can join it.
+            running.store(false, Ordering::Relaxed);
+            result
+        })
+    }
+}
+
+/// Read host stdin and deliver bytes to the guest UART, raising its GIC line so a
+/// parked vcpu wakes. Polls with a timeout so it can notice shutdown; stops
+/// feeding on EOF (the timer still drives the guest). Reads fd 0 directly, which
+/// couples amber-core to "stdin is the console" — true for `amber boot`, and the
+/// control plane will replace it later.
+fn console_reader<H: Hypervisor>(
+    hv: &H,
+    pl011: &Mutex<Pl011>,
+    intid: u32,
+    running: &AtomicBool,
+) {
+    let mut buf = [0u8; 64];
+    while running.load(Ordering::Relaxed) {
+        let mut pfd = libc::pollfd {
+            fd: 0,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let n = unsafe { libc::poll(&mut pfd, 1, 100) };
+        if n <= 0 {
+            continue;
         }
+        let r = unsafe { libc::read(0, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        if r <= 0 {
+            break; // EOF or error: stop feeding input
+        }
+        let level = {
+            let mut p = pl011.lock().unwrap();
+            for b in &buf[..r as usize] {
+                p.push_rx(*b);
+            }
+            p.irq_level()
+        };
+        let _ = hv.set_irq(intid, level);
     }
 }

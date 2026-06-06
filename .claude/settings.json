@@ -46,7 +46,10 @@
       "Bash(grep -nE 'OS_ENUM\\\\\\(hv_sys_reg|OS_ENUM\\\\\\(hv_gic_config|hv_gic_config_t' __CMDSUB_OUTPUT__/System/Library/Frameworks/Hypervisor.framework/Headers/hv_vcpu_types.h __CMDSUB_OUTPUT__/System/Library/Frameworks/Hypervisor.framework/Headers/hv_gic_types.h)",
       "Bash(grep -nE 'Kernel panic|Run /init|init process|Mounting|not syncing|No filesystem|VFS:|nibble|Failed|find|exitcode|Attempted' /tmp/amber-boot.log | head -20)",
       "Read(//private/tmp/**)",
-      "Bash(git commit *)"
+      "Bash(git commit *)",
+      "Bash(chmod +x amberfs/init)",
+      "Bash(cp amberfs/init /Users/lupodevelop/Git/GitHub/amber/tools/initramfs/init)",
+      "Bash(python3 build-initramfs.py)"
     ]
   }
 }

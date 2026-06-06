@@ -13,6 +13,7 @@ path = "src/main.rs"
 amber-core.workspace = true
 log.workspace = true
 env_logger.workspace = true
+libc.workspace = true
 
 # The HVF backend is linked into the binary only on macOS arm64. main.rs already
 # cfg-gates the call site, so off-target the binary builds without it.

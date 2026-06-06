@@ -57,6 +57,12 @@ pub mod layout {
     /// controller is alive: `earlycon=pl011,0x9000000`.
     pub const PL011_BASE: u64 = 0x0900_0000;
     pub const PL011_SIZE: u64 = 0x0000_1000;
+
+    /// GICv3 shared peripheral interrupts start at INTID 32. The PL011 is wired
+    /// to SPI 1, so its absolute INTID is `GIC_SPI_BASE + 1`. The DTB advertises
+    /// the relative number (1); the backend injects the absolute INTID.
+    pub const GIC_SPI_BASE: u32 = 32;
+    pub const PL011_SPI: u32 = 1;
 }
 
 /// Everything that can go wrong below the seam. Structured, not stringly-typed at

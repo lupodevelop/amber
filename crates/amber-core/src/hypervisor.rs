@@ -23,6 +23,13 @@ pub trait Hypervisor: Sized {
     fn gic_info(&self) -> Option<crate::GicInfo> {
         None
     }
+
+    /// Set the level of a shared peripheral interrupt (SPI) by its GIC INTID.
+    /// Called by the run loop when a device's line changes, e.g. the PL011 when
+    /// its receive FIFO fills or drains. No-op on a backend without a GIC.
+    fn set_irq(&self, _intid: u32, _level: bool) -> Result<()> {
+        Ok(())
+    }
 }
 
 pub trait Vcpu {
@@ -48,6 +55,13 @@ pub trait Vcpu {
     /// Run until the next exit. Synchronous. One OS thread per vcpu, so this call
     /// blocks that thread and nothing async ever touches the hot path.
     fn run(&mut self) -> Result<VmExit>;
+
+    /// Nanoseconds until the guest's virtual timer is next due, for the run loop
+    /// to bound how long it parks on a WFI. `Some(0)` means already due, `None`
+    /// means no armed timer (park until another event, e.g. console input).
+    fn pending_timer_ns(&self) -> Result<Option<u64>> {
+        Ok(None)
+    }
 }
 
 /// The shared exit vocabulary. Each backend translates its raw exit into one of

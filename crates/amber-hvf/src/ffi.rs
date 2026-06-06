@@ -88,6 +88,9 @@ extern "C" {
     pub fn hv_gic_get_distributor_size(size: *mut usize) -> hv_return_t;
     pub fn hv_gic_get_redistributor_region_size(size: *mut usize) -> hv_return_t;
     pub fn hv_gic_get_redistributor_base_alignment(align: *mut usize) -> hv_return_t;
+    pub fn hv_gic_get_spi_interrupt_range(base: *mut u32, count: *mut u32) -> hv_return_t;
+    // Set a shared peripheral interrupt's level by absolute INTID.
+    pub fn hv_gic_set_spi(intid: u32, level: bool) -> hv_return_t;
 }
 
 // hv_sys_reg_t == uint16_t. Only the few amber reads/writes are named here.

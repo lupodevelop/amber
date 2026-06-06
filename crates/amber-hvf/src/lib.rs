@@ -69,6 +69,10 @@ impl Hypervisor for HvfVm {
     fn gic_info(&self) -> Option<GicInfo> {
         Some(self.gic)
     }
+
+    fn set_irq(&self, intid: u32, level: bool) -> Result<()> {
+        unsafe { check(hv_gic_set_spi(intid, level), "hv_gic_set_spi") }
+    }
 }
 
 impl HvfVm {
@@ -128,10 +132,23 @@ impl HvfVm {
             // cfg is an os_object; one-time, leak it rather than link libobjc.
         }
 
+        let (mut spi_base, mut spi_count) = (0u32, 0u32);
+        unsafe {
+            check(
+                hv_gic_get_spi_interrupt_range(&mut spi_base, &mut spi_count),
+                "gic spi range",
+            )?;
+        }
         log::info!(
-            "GICv3: dist {:#x}+{:#x}, redist {:#x}+{:#x}",
-            dist_base, dist_size, redist_base, redist_size
+            "GICv3: dist {:#x}+{:#x}, redist {:#x}+{:#x}, SPI base {} count {}",
+            dist_base, dist_size, redist_base, redist_size, spi_base, spi_count
         );
+        if spi_base != amber_core::layout::GIC_SPI_BASE {
+            log::warn!(
+                "GIC SPI base {} != assumed {}; PL011 IRQ may be misrouted",
+                spi_base, amber_core::layout::GIC_SPI_BASE
+            );
+        }
         Ok(GicInfo {
             dist_base,
             dist_size: dist_size as u64,
@@ -167,47 +184,6 @@ impl HvfVcpu {
         let mut v = 0u64;
         unsafe { check(hv_vcpu_get_sys_reg(self.handle, reg, &mut v), "get_sys")? };
         Ok(v)
-    }
-
-    /// Park the host thread on a guest WFI until the virtual timer is due, capped
-    /// so the loop stays responsive. CNTV_CTL tells us whether the timer is armed
-    /// and whether it has already fired; CNTV_CVAL is the deadline in the same
-    /// mach-timebase units as `mach_absolute_time() - vtimer_offset` (= CNTVCT).
-    #[allow(deprecated)] // libc's mach_* are fine here; mach2 is the only alternative
-    fn park_on_wfi(&self) -> Result<()> {
-        const CAP_NS: u64 = 100_000_000; // 100 ms ceiling
-
-        let ctl = self.get_sys(HV_SYS_REG_CNTV_CTL_EL0)?;
-        let enabled = ctl & 0b001 != 0; // ENABLE
-        let imask = ctl & 0b010 != 0; // IMASK
-        let istatus = ctl & 0b100 != 0; // condition already met
-
-        if istatus {
-            // A tick is already pending; resume immediately so the GIC delivers it.
-            return Ok(());
-        }
-
-        let dur_ns = if enabled && !imask {
-            let cval = self.get_sys(HV_SYS_REG_CNTV_CVAL_EL0)?;
-            let mut offset = 0u64;
-            unsafe { check(hv_vcpu_get_vtimer_offset(self.handle, &mut offset), "vtimer offset")? };
-            let now = unsafe { libc::mach_absolute_time() }.wrapping_sub(offset);
-            if cval <= now {
-                return Ok(());
-            }
-            mach_ticks_to_ns(cval - now).min(CAP_NS)
-        } else {
-            // No armed timer (and no other wake source yet): sleep a slice rather
-            // than spin, then re-check.
-            CAP_NS
-        };
-
-        let ts = libc::timespec {
-            tv_sec: (dur_ns / 1_000_000_000) as libc::time_t,
-            tv_nsec: (dur_ns % 1_000_000_000) as _,
-        };
-        unsafe { libc::nanosleep(&ts, std::ptr::null_mut()) };
-        Ok(())
     }
 }
 
@@ -253,6 +229,29 @@ impl Vcpu for HvfVcpu {
         self.set_reg(HV_REG_PC, pc)
     }
 
+    #[allow(deprecated)] // libc's mach_* are fine here; mach2 is the only alternative
+    fn pending_timer_ns(&self) -> Result<Option<u64>> {
+        // CNTV_CTL: ENABLE(0), IMASK(1), ISTATUS(2). An enabled, unmasked timer
+        // is due when CNTVCT >= CNTV_CVAL; CNTVCT == mach_absolute_time() minus
+        // the vtimer offset, in the same mach-timebase units as CVAL.
+        let ctl = self.get_sys(HV_SYS_REG_CNTV_CTL_EL0)?;
+        if ctl & 0b001 == 0 || ctl & 0b010 != 0 {
+            return Ok(None); // disabled or masked: no timer wake to wait for
+        }
+        if ctl & 0b100 != 0 {
+            return Ok(Some(0)); // already fired
+        }
+        let cval = self.get_sys(HV_SYS_REG_CNTV_CVAL_EL0)?;
+        let mut offset = 0u64;
+        unsafe { check(hv_vcpu_get_vtimer_offset(self.handle, &mut offset), "vtimer offset")? };
+        let now = unsafe { libc::mach_absolute_time() }.wrapping_sub(offset);
+        Ok(Some(if cval <= now {
+            0
+        } else {
+            mach_ticks_to_ns(cval - now)
+        }))
+    }
+
     fn run(&mut self) -> Result<VmExit> {
         // Loop, not recurse: HVC (PSCI) and trapped-sysreg exits are handled
         // here and resumed in place, and a busy boot does enough of them that
@@ -279,13 +278,10 @@ impl Vcpu for HvfVcpu {
                     }
 
                     if ec == EC_WFX {
-                        // Guest WFI/WFE: idle until something is due. With the
-                        // vGIC the timer is internal, so we park the host thread
-                        // until the virtual timer's deadline, then resume; HVF's
-                        // GIC delivers the tick on the next run. Bounded so we
-                        // stay responsive (and, later, can poll console input).
-                        self.park_on_wfi()?;
-                        continue;
+                        // Guest WFI/WFE: surface as Idle so the run loop can park
+                        // until the timer is due or console input arrives, then
+                        // resume. The deadline comes from `pending_timer_ns`.
+                        return Ok(VmExit::Idle);
                     }
 
                     if ec == EC_HVC64 {

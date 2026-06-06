@@ -1,19 +1,12 @@
 #!/bin/busybox sh
 /bin/busybox --install -s /bin
-export PATH=/bin
+export PATH=/bin TERM=vt100
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 mount -t devtmpfs dev /dev 2>/dev/null
-# PL011 is earlycon-only for now (no full ttyAMA0), so send output to the
-# kernel log; earlycon prints it to amber's stdout.
-exec >/dev/kmsg 2>&1
-echo "amber: ====== guest userspace up ======"
-echo "amber: $(uname -a)"
-echo "amber: date $(date)"
-echo "amber: uptime$(cat /proc/uptime)"
-echo "amber: timer irqs ->"; grep -iE 'tick|timer|virt' /proc/interrupts
-echo "amber: sleep 2s to prove the timer..."
-sleep 2
-echo "amber: woke; uptime$(cat /proc/uptime)"
-echo "amber: ====== poweroff ======"
-poweroff -f
+exec </dev/console >/dev/console 2>&1
+stty rows 24 cols 80 2>/dev/null
+echo
+echo "amber: interactive shell on ttyAMA0 (busybox)"
+echo "amber: try 'uname -a', 'cat /proc/interrupts', 'poweroff -f'"
+exec setsid -c /bin/sh

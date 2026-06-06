@@ -37,11 +37,48 @@ fn main() -> ExitCode {
         }
     };
 
+    // Put the host terminal in raw mode so keystrokes reach the guest console
+    // unbuffered and unprocessed; the guest's tty does the echo and line editing.
+    // Restored on drop. No-op when stdin is not a terminal (piped input).
+    let _raw = RawTerm::enable();
+
     match run(vm) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("run failed: {e}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+/// RAII raw-mode for the host terminal, restored on drop.
+struct RawTerm {
+    saved: Option<libc::termios>,
+}
+
+impl RawTerm {
+    fn enable() -> Self {
+        unsafe {
+            if libc::isatty(0) == 1 {
+                let mut t: libc::termios = std::mem::zeroed();
+                if libc::tcgetattr(0, &mut t) == 0 {
+                    let saved = t;
+                    libc::cfmakeraw(&mut t);
+                    libc::tcsetattr(0, libc::TCSANOW, &t);
+                    return RawTerm { saved: Some(saved) };
+                }
+            }
+        }
+        RawTerm { saved: None }
+    }
+}
+
+impl Drop for RawTerm {
+    fn drop(&mut self) {
+        if let Some(t) = self.saved {
+            unsafe {
+                libc::tcsetattr(0, libc::TCSANOW, &t);
+            }
         }
     }
 }

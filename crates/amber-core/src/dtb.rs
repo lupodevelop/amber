@@ -114,7 +114,20 @@ pub fn build(p: &DtbParams) -> Result<Vec<u8>> {
     .map_err(fdt_err)?;
     fdt.end_node(timer).map_err(fdt_err)?;
 
-    // /pl011: the early console. earlycon=pl011,0x9000000 reads only DR and FR.
+    // /apb-pclk: a fixed clock the PL011 needs. An AMBA PrimeCell will not probe
+    // without an "apb_pclk", and the pl011 driver also wants "uartclk"; both
+    // point here. 24 MHz to match the timer the guest already sees.
+    const APB_PCLK_PHANDLE: u32 = 2;
+    let clk = fdt.begin_node("apb-pclk").map_err(fdt_err)?;
+    fdt.property_string("compatible", "fixed-clock").map_err(fdt_err)?;
+    fdt.property_u32("#clock-cells", 0).map_err(fdt_err)?;
+    fdt.property_u32("clock-frequency", 24_000_000).map_err(fdt_err)?;
+    fdt.property_string("clock-output-names", "uartclk").map_err(fdt_err)?;
+    fdt.property_u32("phandle", APB_PCLK_PHANDLE).map_err(fdt_err)?;
+    fdt.end_node(clk).map_err(fdt_err)?;
+
+    // /pl011: the console. earlycon uses DR/FR; the full driver binds via the
+    // PrimeCell IDs and the clocks below, registering ttyAMA0 with RX on SPI 1.
     let uart = fdt.begin_node("pl011@9000000").map_err(fdt_err)?;
     fdt.property_string_list(
         "compatible",
@@ -124,6 +137,12 @@ pub fn build(p: &DtbParams) -> Result<Vec<u8>> {
     fdt.property_array_u64("reg", &[layout::PL011_BASE, layout::PL011_SIZE]).map_err(fdt_err)?;
     fdt.property_u32("interrupt-parent", GIC_PHANDLE).map_err(fdt_err)?;
     fdt.property_array_u32("interrupts", &[0, 1, 0x04]).map_err(fdt_err)?;
+    fdt.property_array_u32("clocks", &[APB_PCLK_PHANDLE, APB_PCLK_PHANDLE]).map_err(fdt_err)?;
+    fdt.property_string_list(
+        "clock-names",
+        vec!["uartclk".into(), "apb_pclk".into()],
+    )
+    .map_err(fdt_err)?;
     fdt.end_node(uart).map_err(fdt_err)?;
 
     fdt.end_node(root).map_err(fdt_err)?;

@@ -1,9 +1,13 @@
-//! The MMIO bus and the one device M0 needs: a minimal PL011 UART so the kernel
-//! can print over earlycon. A device handles reads and writes at an offset within
-//! its window. New devices (virtio-mmio blk and vsock, the GIC) register here in
-//! later milestones; the run loop never changes.
+//! The MMIO bus and the PL011 UART. The PL011 is now a full-enough PrimeCell for
+//! Linux's `amba-pl011` driver to bind and bring up `ttyAMA0`: it answers the
+//! PrimeCell/peripheral ID reads the AMBA bus matches on, models the control and
+//! interrupt registers, and has a receive FIFO fed by the host. That is what
+//! turns earlycon-only output into a real interactive console.
+//!
+//! `MmioBus`/`MmioDevice` stay for future non-interrupting devices; the PL011 is
+//! owned directly by the VM because the run loop introspects its interrupt line.
 
-use crate::layout;
+use std::collections::VecDeque;
 
 pub trait MmioDevice: Send {
     fn read(&mut self, offset: u64, size: u8) -> u64;
@@ -50,40 +54,126 @@ impl MmioBus {
     }
 }
 
-/// Minimal PL011. Enough for earlycon TX: writes to DR go to stdout, FR always
-/// reports "ready, not full". Everything else reads as zero. Real RX, interrupts,
-/// and baud config come later; the kernel's early console does not need them.
+/// A PL011 PrimeCell UART, enough for an interactive console: TX to a host sink,
+/// an RX FIFO fed by `push_rx`, the control/mask/status registers the driver
+/// drives, and the AMBA ID registers it probes. The single interrupt line is
+/// level-triggered; the run loop reads `irq_level` and drives the GIC.
 pub struct Pl011 {
     out: Box<dyn std::io::Write + Send>,
+    rx: VecDeque<u8>,
+    cr: u32,   // control
+    imsc: u32, // interrupt mask set/clear (1 = enabled)
+    ris: u32,  // raw interrupt status
+    ibrd: u32,
+    fbrd: u32,
+    lcr_h: u32,
+    ifls: u32,
 }
 
 impl Pl011 {
-    const DR: u64 = 0x00; // data register
-    const FR: u64 = 0x18; // flag register
+    // Register offsets.
+    const DR: u64 = 0x000;
+    const FR: u64 = 0x018;
+    const IBRD: u64 = 0x024;
+    const FBRD: u64 = 0x028;
+    const LCR_H: u64 = 0x02c;
+    const CR: u64 = 0x030;
+    const IFLS: u64 = 0x034;
+    const IMSC: u64 = 0x038;
+    const RIS: u64 = 0x03c;
+    const MIS: u64 = 0x040;
+    const ICR: u64 = 0x044;
+
+    // FR bits.
+    const FR_RXFE: u64 = 1 << 4; // receive FIFO empty
+    const FR_TXFE: u64 = 1 << 7; // transmit FIFO empty
+
+    // Interrupt bits (RIS/MIS/IMSC/ICR): RX (4) and receive-timeout (6).
+    const INT_RX: u32 = 1 << 4;
+    const INT_RT: u32 = 1 << 6;
+
+    // PrimeCell PL011 identification, low byte of each word. The AMBA bus reads
+    // these to bind the driver; without them ttyAMA0 never registers.
+    const ID: [(u64, u8); 8] = [
+        (0xfe0, 0x11), (0xfe4, 0x10), (0xfe8, 0x14), (0xfec, 0x00), // PeriphID0..3
+        (0xff0, 0x0d), (0xff4, 0xf0), (0xff8, 0x05), (0xffc, 0xb1), // PCellID0..3
+    ];
 
     pub fn new(out: Box<dyn std::io::Write + Send>) -> Self {
-        Self { out }
+        Self {
+            out,
+            rx: VecDeque::new(),
+            cr: 0,
+            imsc: 0,
+            ris: 0,
+            ibrd: 0,
+            fbrd: 0,
+            lcr_h: 0,
+            ifls: 0,
+        }
     }
 
-    pub fn register_on(bus: &mut MmioBus, out: Box<dyn std::io::Write + Send>) {
-        bus.register(layout::PL011_BASE, layout::PL011_SIZE, Box::new(Pl011::new(out)));
+    /// Push a received byte from the host into the RX FIFO and raise the raw RX
+    /// interrupt. The run loop calls `irq_level` afterwards to update the GIC.
+    pub fn push_rx(&mut self, byte: u8) {
+        self.rx.push_back(byte);
+        self.ris |= Self::INT_RX | Self::INT_RT;
     }
-}
 
-impl MmioDevice for Pl011 {
-    fn read(&mut self, offset: u64, _size: u8) -> u64 {
+    /// The current interrupt line level: any unmasked status bit set.
+    pub fn irq_level(&self) -> bool {
+        self.ris & self.imsc != 0
+    }
+
+    pub fn read(&mut self, offset: u64, _size: u8) -> u64 {
+        if let Some(&(_, v)) = Self::ID.iter().find(|&&(off, _)| off == offset) {
+            return v as u64;
+        }
         match offset {
-            // FR: clear TXFF (bit 5) and set TXFE (bit 7) -> always ready, empty.
-            Self::FR => 1 << 7,
+            Self::DR => {
+                let byte = self.rx.pop_front().unwrap_or(0);
+                if self.rx.is_empty() {
+                    self.ris &= !(Self::INT_RX | Self::INT_RT);
+                }
+                byte as u64
+            }
+            // TX always ready/empty; RXFE set when the receive FIFO is empty.
+            Self::FR => {
+                let mut fr = Self::FR_TXFE;
+                if self.rx.is_empty() {
+                    fr |= Self::FR_RXFE;
+                }
+                fr
+            }
+            Self::RIS => self.ris as u64,
+            Self::MIS => (self.ris & self.imsc) as u64,
+            Self::IMSC => self.imsc as u64,
+            Self::CR => self.cr as u64,
+            Self::IBRD => self.ibrd as u64,
+            Self::FBRD => self.fbrd as u64,
+            Self::LCR_H => self.lcr_h as u64,
+            Self::IFLS => self.ifls as u64,
             _ => 0,
         }
     }
 
-    fn write(&mut self, offset: u64, _size: u8, value: u64) {
-        if offset == Self::DR {
-            let byte = [value as u8];
-            let _ = self.out.write_all(&byte);
-            let _ = self.out.flush();
+    pub fn write(&mut self, offset: u64, _size: u8, value: u64) {
+        let v32 = value as u32;
+        match offset {
+            Self::DR => {
+                let byte = [value as u8];
+                let _ = self.out.write_all(&byte);
+                let _ = self.out.flush();
+            }
+            Self::IMSC => self.imsc = v32,
+            Self::CR => self.cr = v32,
+            Self::IBRD => self.ibrd = v32,
+            Self::FBRD => self.fbrd = v32,
+            Self::LCR_H => self.lcr_h = v32,
+            Self::IFLS => self.ifls = v32,
+            // Write-1-to-clear the raw interrupt status.
+            Self::ICR => self.ris &= !v32,
+            _ => {}
         }
     }
 }
