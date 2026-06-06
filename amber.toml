@@ -1,0 +1,15 @@
+[fleet]
+ram_budget = "4GiB"
+
+[template.pytools]
+image   = "docker.io/library/python:3.12-slim"
+ram_cap = "384MiB"
+snapshot = "post-init"
+warm_pool = 2
+  [template.pytools.env]
+  AMBER_TEMPLATE = "pytools"
+  PYTHONUNBUFFERED = "1"
+
+[template.alpine]
+image   = "docker.io/library/alpine:3"
+ram_cap = "128MiB"

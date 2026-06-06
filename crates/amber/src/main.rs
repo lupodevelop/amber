@@ -6,7 +6,10 @@
 //! earlycon output on stdout. Off macOS arm64 it builds everything except the
 //! backend and tells you so.
 
+mod manifest;
+
 use amber_core::{Vm, VmConfig};
+use std::collections::HashMap;
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -106,8 +109,8 @@ fn cmd_pull(args: &[String]) -> ExitCode {
 /// base, generate a bootstrap initramfs that mounts it under a tmpfs overlay and
 /// execs the command, then boot. Cold boot, run once, tear down.
 fn cmd_run(args: &[String]) -> ExitCode {
-    let Some(image) = args.get(2) else {
-        eprintln!("usage: amber run <image> [-- <argv>...]");
+    let Some(target) = args.get(2) else {
+        eprintln!("usage: amber run <image|template> [-- <argv>...]");
         return ExitCode::FAILURE;
     };
     // argv after a "--" separator overrides the image's default command.
@@ -116,17 +119,39 @@ fn cmd_run(args: &[String]) -> ExitCode {
         None => Vec::new(),
     };
 
+    // A bare arg names an `amber.toml` template if one matches; otherwise it is an
+    // OCI reference. A template contributes its image, ram_cap, and env.
+    let manifest = manifest::Manifest::load();
+    let (oci_ref, mem_size, extra_env): (String, Option<usize>, HashMap<String, String>) =
+        match manifest.as_ref().and_then(|m| m.template(target)) {
+            Some(t) => {
+                log::info!("template '{target}' -> {}", t.image);
+                let mem = t.ram_cap.as_deref().and_then(manifest::parse_size);
+                if t.ram_cap.is_some() && mem.is_none() {
+                    eprintln!("warning: bad ram_cap for template '{target}', using default");
+                }
+                (t.image.clone(), mem, t.env.clone())
+            }
+            None => (target.clone(), None, HashMap::new()),
+        };
+
     let cache = Path::new("amber-cache/blobs");
     let rootfs = Path::new("amber-cache/rootfs");
     let base = Path::new("amber-cache/base.sqfs");
 
-    let img = match amber_image::pull_and_flatten(image, cache, rootfs) {
+    let mut img = match amber_image::pull_and_flatten(&oci_ref, cache, rootfs) {
         Ok(img) => img,
         Err(e) => {
             eprintln!("pull failed: {e}");
             return ExitCode::FAILURE;
         }
     };
+    // Template env overrides the image's, by key.
+    for (k, v) in &extra_env {
+        let prefix = format!("{k}=");
+        img.config.env.retain(|e| !e.starts_with(&prefix));
+        img.config.env.push(format!("{k}={v}"));
+    }
     if let Err(e) = amber_image::pack_squashfs(&img.rootfs, base) {
         eprintln!("pack failed: {e}");
         return ExitCode::FAILURE;
@@ -157,12 +182,15 @@ fn cmd_run(args: &[String]) -> ExitCode {
         }
     };
 
-    let cfg = VmConfig {
+    let mut cfg = VmConfig {
         kernel,
         initrd: Some(initrd),
         disk: Some(base.to_path_buf()),
         ..Default::default()
     };
+    if let Some(bytes) = mem_size {
+        cfg.mem_size = bytes;
+    }
     let vm = match Vm::prepare(&cfg) {
         Ok(vm) => vm,
         Err(e) => {

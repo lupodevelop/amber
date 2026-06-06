@@ -15,6 +15,8 @@ amber-image.workspace = true
 log.workspace = true
 env_logger.workspace = true
 libc.workspace = true
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }
 
 # The HVF backend is linked into the binary only on macOS arm64. main.rs already
 # cfg-gates the call site, so off-target the binary builds without it.
