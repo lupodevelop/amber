@@ -6,7 +6,9 @@
 //! earlycon output on stdout. Off macOS arm64 it builds everything except the
 //! backend and tells you so.
 
+mod daemon;
 mod manifest;
+mod proto;
 
 use amber_core::{Vm, VmConfig};
 use std::collections::HashMap;
@@ -18,14 +20,141 @@ fn main() -> ExitCode {
 
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
-        Some("boot") => cmd_boot(&args),
-        Some("pull") => cmd_pull(&args),
+        // `run` routes through amberd if one is up, else runs in-process.
         Some("run") => cmd_run(&args),
+        // Internal worker: run one VM in-process (spawned by amberd).
+        Some("__vm") => cmd_vm(&args),
+        Some("serve") => match daemon::serve() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("amberd failed: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Some("up") => cmd_up(),
+        Some("down") => cmd_down(),
+        Some("ps") => cmd_ps(),
+        Some("rm") => cmd_rm(&args),
+        Some("pull") => cmd_pull(&args),
+        Some("boot") => cmd_boot(&args),
         _ => {
             eprintln!("usage:");
-            eprintln!("  amber run <image> [-- <argv>...]");
+            eprintln!("  amber run <image|template> [-- <argv>...]");
+            eprintln!("  amber up | down | ps | rm <id>");
             eprintln!("  amber pull <image>");
             eprintln!("  amber boot <kernel-Image> [initramfs] [disk]");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Route `run`: through amberd if reachable, else in-process.
+fn cmd_run(args: &[String]) -> ExitCode {
+    if !daemon::running() {
+        return cmd_vm(args);
+    }
+    let Some(target) = args.get(2) else {
+        eprintln!("usage: amber run <image|template> [-- <argv>...]");
+        return ExitCode::FAILURE;
+    };
+    let argv: Vec<String> = match args.iter().position(|a| a == "--") {
+        Some(i) => args[i + 1..].to_vec(),
+        None => Vec::new(),
+    };
+    match daemon::run_client(target, &argv) {
+        Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
+        Err(e) => {
+            eprintln!("run failed: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn cmd_up() -> ExitCode {
+    if daemon::running() {
+        println!("amberd already running");
+        return ExitCode::SUCCESS;
+    }
+    let exe = std::env::current_exe().expect("current_exe");
+    let _ = std::fs::create_dir_all("amber-cache");
+    let log = match std::fs::File::create("amber-cache/amberd.log") {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("cannot open amberd log: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let err = log.try_clone().expect("clone log fd");
+    if let Err(e) = std::process::Command::new(exe)
+        .arg("serve")
+        .stdout(log)
+        .stderr(err)
+        .spawn()
+    {
+        eprintln!("failed to start amberd: {e}");
+        return ExitCode::FAILURE;
+    }
+    // Wait briefly for the socket to come up.
+    for _ in 0..40 {
+        if daemon::running() {
+            println!("amberd started ({})", proto::socket_path().display());
+            return ExitCode::SUCCESS;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    eprintln!("amberd did not come up; see amber-cache/amberd.log");
+    ExitCode::FAILURE
+}
+
+fn cmd_down() -> ExitCode {
+    if !daemon::running() {
+        println!("amberd not running");
+        return ExitCode::SUCCESS;
+    }
+    match daemon::shutdown() {
+        Ok(()) => {
+            println!("amberd stopped");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("down failed: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn cmd_ps() -> ExitCode {
+    if !daemon::running() {
+        eprintln!("no amberd (run 'amber up')");
+        return ExitCode::FAILURE;
+    }
+    match daemon::list() {
+        Ok(vms) => {
+            println!("{:<8} {:<8} {}", "ID", "PID", "IMAGE");
+            for v in vms {
+                println!("{:<8} {:<8} {}", v.id, v.pid, v.reference);
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("ps failed: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn cmd_rm(args: &[String]) -> ExitCode {
+    let Some(id) = args.get(2) else {
+        eprintln!("usage: amber rm <id>");
+        return ExitCode::FAILURE;
+    };
+    match daemon::kill(id) {
+        Ok(()) => {
+            println!("killed {id}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("rm failed: {e}");
             ExitCode::FAILURE
         }
     }
@@ -105,10 +234,11 @@ fn cmd_pull(args: &[String]) -> ExitCode {
     }
 }
 
-/// `amber run <image> [-- argv...]`: pull and flatten the image, pack a squashfs
-/// base, generate a bootstrap initramfs that mounts it under a tmpfs overlay and
-/// execs the command, then boot. Cold boot, run once, tear down.
-fn cmd_run(args: &[String]) -> ExitCode {
+/// Run one VM in-process: pull and flatten the image, pack a squashfs base,
+/// generate a bootstrap initramfs that mounts it under a tmpfs overlay and execs
+/// the command, then boot. Cold boot, run once, tear down. This is the worker
+/// amberd spawns (`__vm`), and also the standalone path when no daemon is up.
+fn cmd_vm(args: &[String]) -> ExitCode {
     let Some(target) = args.get(2) else {
         eprintln!("usage: amber run <image|template> [-- <argv>...]");
         return ExitCode::FAILURE;
