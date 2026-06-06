@@ -6,12 +6,14 @@
 //! (M1b). This crate is host-side and synchronous: it does the network and the
 //! filesystem work, nothing about the VM.
 
+pub mod cpio;
 mod flatten;
 mod pack;
 mod registry;
 
 use std::path::{Path, PathBuf};
 
+pub use cpio::Cpio;
 pub use pack::pack_squashfs;
 pub use registry::Reference;
 

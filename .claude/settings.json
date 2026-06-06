@@ -57,7 +57,9 @@
       "Read(//Users/lupodevelop/Git/GitHub/**)",
       "Bash(brew install *)",
       "Bash(mksquashfs -version)",
-      "Bash(unsquashfs -s amber-cache/base.sqfs)"
+      "Bash(unsquashfs -s amber-cache/base.sqfs)",
+      "Bash(grep -E 'virtio_mmio|virtio_blk\\\\.ko|squashfs|overlay' modules.dep)",
+      "Bash(find kernel *)"
     ]
   }
 }

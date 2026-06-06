@@ -6,6 +6,7 @@ use crate::bus::{MmioBus, Pl011};
 use crate::hypervisor::{Hypervisor, MmioOp, Vcpu, VmExit};
 use crate::{dtb, layout, loader, GuestMemory, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 pub struct VmConfig {
@@ -13,6 +14,9 @@ pub struct VmConfig {
     pub kernel: Vec<u8>,
     pub initrd: Option<Vec<u8>>,
     pub cmdline: String,
+    /// Host image file to back the guest's virtio-blk root device (e.g. a
+    /// squashfs base). None means no block device.
+    pub disk: Option<PathBuf>,
 }
 
 impl Default for VmConfig {
@@ -24,6 +28,7 @@ impl Default for VmConfig {
             // earlycon prints before the GIC exists; console=ttyAMA0 is the real
             // tty once the PL011 driver binds, giving an interactive console.
             cmdline: "earlycon=pl011,0x9000000 console=ttyAMA0".into(),
+            disk: None,
         }
     }
 }
@@ -32,6 +37,7 @@ pub struct Vm {
     mem: GuestMemory,
     bus: MmioBus,
     pl011: Pl011,
+    blk: Option<crate::virtio::VirtioBlk>,
     entry: u64,
     dtb_addr: u64,
     // Kept so the device tree can be built in `run`, once the backend has
@@ -52,10 +58,16 @@ impl Vm {
         let initrd = loader::load_initramfs(&mem, cfg.initrd.as_deref())?;
         let dtb_addr = mem.base() + layout::DTB_OFFSET;
 
+        let blk = match &cfg.disk {
+            Some(path) => Some(crate::virtio::VirtioBlk::open(path)?),
+            None => None,
+        };
+
         Ok(Self {
             mem,
             bus: MmioBus::default(),
             pl011: Pl011::new(Box::new(std::io::stdout())),
+            blk,
             entry: kernel.entry,
             dtb_addr,
             mem_size: cfg.mem_size as u64,
@@ -81,6 +93,7 @@ impl Vm {
             mem,
             mut bus,
             pl011,
+            blk,
             entry,
             dtb_addr,
             mem_size,
@@ -90,6 +103,12 @@ impl Vm {
 
         let mut hv = H::create(&mem)?;
 
+        // Give the block device its view of guest RAM (it reads rings/buffers).
+        let mut blk = blk;
+        if let Some(b) = &mut blk {
+            b.attach(mem.ram());
+        }
+
         // Build the device tree now that the backend exists: its GIC node must
         // match the interrupt controller the backend just created.
         let blob = dtb::build(&dtb::DtbParams {
@@ -97,6 +116,7 @@ impl Vm {
             cmdline: &cmdline,
             initrd,
             gic: hv.gic_info(),
+            virtio_blk: blk.is_some(),
         })?;
         mem.write(dtb_addr, &blob)?;
 
@@ -106,6 +126,9 @@ impl Vm {
         let pl011_lo = layout::PL011_BASE;
         let pl011_hi = layout::PL011_BASE + layout::PL011_SIZE;
         let pl011_intid = layout::GIC_SPI_BASE + layout::PL011_SPI;
+        let virtio_lo = layout::VIRTIO_BLK_BASE;
+        let virtio_hi = layout::VIRTIO_BLK_BASE + layout::VIRTIO_BLK_SIZE;
+        let virtio_intid = layout::GIC_SPI_BASE + layout::VIRTIO_BLK_SPI;
 
         let pl011 = Mutex::new(pl011);
         let running = AtomicBool::new(true);
@@ -122,28 +145,40 @@ impl Vm {
                 match vcpu.run()? {
                     VmExit::Mmio { access } => {
                         let in_pl011 = access.ipa >= pl011_lo && access.ipa < pl011_hi;
-                        let off = access.ipa - pl011_lo;
+                        let in_virtio = access.ipa >= virtio_lo && access.ipa < virtio_hi;
                         match access.op {
                             MmioOp::Write { value, .. } => {
                                 if in_pl011 {
-                                    pl011.lock().unwrap().write(off, access.size, value);
+                                    pl011.lock().unwrap().write(access.ipa - pl011_lo, access.size, value);
+                                } else if in_virtio {
+                                    if let Some(b) = &mut blk {
+                                        b.write(access.ipa - virtio_lo, access.size, value);
+                                    }
                                 } else {
                                     bus.write(access.ipa, access.size, value);
                                 }
                             }
                             MmioOp::Read { reg } => {
                                 let v = if in_pl011 {
-                                    pl011.lock().unwrap().read(off, access.size)
+                                    pl011.lock().unwrap().read(access.ipa - pl011_lo, access.size)
+                                } else if in_virtio {
+                                    blk.as_mut()
+                                        .map(|b| b.read(access.ipa - virtio_lo, access.size))
+                                        .unwrap_or(0)
                                 } else {
                                     bus.read(access.ipa, access.size)
                                 };
                                 vcpu.set_x(reg, v)?;
                             }
                         }
+                        // An access may have changed a device's interrupt line.
                         if in_pl011 {
-                            // The access may have changed the UART's interrupt line.
                             let lvl = pl011.lock().unwrap().irq_level();
                             hv.set_irq(pl011_intid, lvl)?;
+                        } else if in_virtio {
+                            if let Some(b) = &blk {
+                                hv.set_irq(virtio_intid, b.irq_level())?;
+                            }
                         }
                         // Step past the faulting load/store: arm64 instructions
                         // are 4 bytes, and a syndrome-decodable access is one insn.

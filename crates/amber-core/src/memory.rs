@@ -67,6 +67,80 @@ impl GuestMemory {
         }
         Ok(())
     }
+
+    /// A cheap copyable view of guest RAM for device emulation. Devices read
+    /// descriptor rings and data buffers through it. Single-threaded use only
+    /// (the vcpu thread), and it must not outlive the `GuestMemory` it views.
+    pub fn ram(&self) -> GuestRam {
+        GuestRam {
+            host: self.host.as_ptr(),
+            base: self.base,
+            len: self.len,
+        }
+    }
+}
+
+/// A raw, copyable window into guest RAM. Holds no lifetime, so the caller is
+/// responsible for keeping the owning `GuestMemory` alive (it does: both live on
+/// the vcpu thread for the VM's duration). Out-of-range accesses are rejected.
+#[derive(Clone, Copy)]
+pub struct GuestRam {
+    host: *mut u8,
+    base: u64,
+    len: usize,
+}
+
+impl GuestRam {
+    fn offset(&self, gpa: u64, n: usize) -> Option<usize> {
+        let off = gpa.checked_sub(self.base)? as usize;
+        (off.checked_add(n)? <= self.len).then_some(off)
+    }
+
+    pub fn read(&self, gpa: u64, buf: &mut [u8]) -> bool {
+        match self.offset(gpa, buf.len()) {
+            Some(off) => unsafe {
+                std::ptr::copy_nonoverlapping(self.host.add(off), buf.as_mut_ptr(), buf.len());
+                true
+            },
+            None => false,
+        }
+    }
+
+    pub fn write(&self, gpa: u64, buf: &[u8]) -> bool {
+        match self.offset(gpa, buf.len()) {
+            Some(off) => unsafe {
+                std::ptr::copy_nonoverlapping(buf.as_ptr(), self.host.add(off), buf.len());
+                true
+            },
+            None => false,
+        }
+    }
+
+    pub fn read_u16(&self, gpa: u64) -> u16 {
+        let mut b = [0u8; 2];
+        self.read(gpa, &mut b);
+        u16::from_le_bytes(b)
+    }
+
+    pub fn read_u32(&self, gpa: u64) -> u32 {
+        let mut b = [0u8; 4];
+        self.read(gpa, &mut b);
+        u32::from_le_bytes(b)
+    }
+
+    pub fn read_u64(&self, gpa: u64) -> u64 {
+        let mut b = [0u8; 8];
+        self.read(gpa, &mut b);
+        u64::from_le_bytes(b)
+    }
+
+    pub fn write_u16(&self, gpa: u64, v: u16) {
+        self.write(gpa, &v.to_le_bytes());
+    }
+
+    pub fn write_u32(&self, gpa: u64, v: u32) {
+        self.write(gpa, &v.to_le_bytes());
+    }
 }
 
 impl Drop for GuestMemory {

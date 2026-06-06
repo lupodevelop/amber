@@ -11,6 +11,7 @@ pub mod dtb;
 pub mod hypervisor;
 pub mod loader;
 pub mod memory;
+pub mod virtio;
 mod vm;
 
 pub use hypervisor::{Hypervisor, Vcpu};
@@ -63,6 +64,12 @@ pub mod layout {
     /// the relative number (1); the backend injects the absolute INTID.
     pub const GIC_SPI_BASE: u32 = 32;
     pub const PL011_SPI: u32 = 1;
+
+    /// virtio-mmio block device window and its SPI, placed in the hole above the
+    /// GIC redistributor and below RAM.
+    pub const VIRTIO_BLK_BASE: u64 = 0x0c00_0000;
+    pub const VIRTIO_BLK_SIZE: u64 = 0x0000_0200;
+    pub const VIRTIO_BLK_SPI: u32 = 2;
 }
 
 /// Everything that can go wrong below the seam. Structured, not stringly-typed at
@@ -81,6 +88,8 @@ pub enum Error {
     /// The guest took an exit the run loop cannot handle. Fatal to the VM. The
     /// registers are what you need to find the offending instruction.
     GuestFault { pc: u64, esr: u64, ipa: u64 },
+    /// A device backend failed (e.g. opening a disk image).
+    Device(String),
 }
 
 impl std::fmt::Display for Error {
@@ -94,6 +103,7 @@ impl std::fmt::Display for Error {
                 f,
                 "unhandled guest fault: pc={pc:#x} esr={esr:#x} ipa={ipa:#x}"
             ),
+            Error::Device(m) => write!(f, "device error: {m}"),
         }
     }
 }
