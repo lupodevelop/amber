@@ -59,7 +59,9 @@
       "Bash(mksquashfs -version)",
       "Bash(unsquashfs -s amber-cache/base.sqfs)",
       "Bash(grep -E 'virtio_mmio|virtio_blk\\\\.ko|squashfs|overlay' modules.dep)",
-      "Bash(find kernel *)"
+      "Bash(find kernel *)",
+      "Bash(cd /Users/lupodevelop/Git/GitHub/amber *)",
+      "Read(//Users/lupodevelop/.cargo/registry/src/**)"
     ]
   }
 }

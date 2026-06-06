@@ -23,6 +23,10 @@ pub struct DtbParams<'a> {
     pub gic: Option<crate::GicInfo>,
     /// Whether to advertise the virtio-mmio block device node.
     pub virtio_blk: bool,
+    /// Random bytes for `/chosen/rng-seed`. The kernel credits these as entropy
+    /// at early boot, so crng initializes immediately instead of stalling for
+    /// seconds waiting for a source the microVM does not have.
+    pub rng_seed: &'a [u8],
 }
 
 pub fn build(p: &DtbParams) -> Result<Vec<u8>> {
@@ -41,6 +45,9 @@ pub fn build(p: &DtbParams) -> Result<Vec<u8>> {
     if let Some((start, end)) = p.initrd {
         fdt.property_u64("linux,initrd-start", start).map_err(fdt_err)?;
         fdt.property_u64("linux,initrd-end", end).map_err(fdt_err)?;
+    }
+    if !p.rng_seed.is_empty() {
+        fdt.property("rng-seed", p.rng_seed).map_err(fdt_err)?;
     }
     fdt.end_node(chosen).map_err(fdt_err)?;
 

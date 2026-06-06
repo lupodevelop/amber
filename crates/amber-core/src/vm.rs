@@ -109,6 +109,13 @@ impl Vm {
             b.attach(mem.ram());
         }
 
+        // Seed the guest's RNG from the host so crng inits at once (no entropy
+        // source in a microVM otherwise). Best effort: an unseeded boot just
+        // stalls a little, it does not fail.
+        let mut rng_seed = [0u8; 64];
+        let _ = std::fs::File::open("/dev/urandom")
+            .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut rng_seed));
+
         // Build the device tree now that the backend exists: its GIC node must
         // match the interrupt controller the backend just created.
         let blob = dtb::build(&dtb::DtbParams {
@@ -117,6 +124,7 @@ impl Vm {
             initrd,
             gic: hv.gic_info(),
             virtio_blk: blk.is_some(),
+            rng_seed: &rng_seed,
         })?;
         mem.write(dtb_addr, &blob)?;
 
