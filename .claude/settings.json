@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo --version)",
+      "Bash(rustc --version)",
+      "Bash(git --version)",
+      "Bash(xcrun --show-sdk-path)",
+      "Bash(ls \"$\\(xcrun --show-sdk-path \\)/usr/include/Hypervisor/\")",
+      "Bash(echo \"sdk: $\\(xcrun --show-sdk-path 2>&1\\)\")",
+      "Read(//Library/Developer/**)",
+      "Read(//Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/**)",
+      "Bash(grep -nE 'HV_REG_\\(X0|PC|CPSR|FP|LR\\)|} hv_reg_t' __CMDSUB_OUTPUT__/System/Library/Frameworks/Hypervisor.framework/Headers/hv_vcpu_types.h)",
+      "Bash(grep -nE 'hv_vcpu_exit_exception_t|hv_vcpu_exit_t|syndrome|virtual_address|physical_address|hv_exit_reason_t reason' __CMDSUB_OUTPUT__/System/Library/Frameworks/Hypervisor.framework/Headers/hv_vcpu_types.h)",
+      "Bash(cargo build *)",
+      "Bash(codesign --entitlements amber.entitlements -s - target/release/amber)",
+      "Bash(codesign -d --entitlements - target/release/amber)",
+      "Bash(./target/release/amber)",
+      "Bash(echo \"exit=$?\")",
+      "Bash(cargo clippy *)",
+      "Bash(git init *)",
+      "Bash(git add *)",
+      "Bash(git commit -q -m 'M0 skeleton: backend-agnostic arm64 microVM core + HVF backend *)"
+    ]
+  }
+}

@@ -1,0 +1,14 @@
+[package]
+name = "amber-hvf"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Builds everywhere (so the workspace stays buildable), but only links the
+# Hypervisor framework on macOS. On any other target the backend is empty and
+# amber-core compiles alone; main.rs cfg-gates the call into it.
+[dependencies]
+amber-core.workspace = true
+libc.workspace = true
+log.workspace = true

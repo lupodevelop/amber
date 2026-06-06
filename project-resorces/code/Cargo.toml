@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = ["crates/amber-core", "crates/amber-hvf", "crates/amber"]
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/USER/amber"
+
+# arm64 only, for now. The build will refuse to link the HVF backend off macOS;
+# the KVM backend (amber-kvm) is M8 and not in this workspace yet.
+[workspace.dependencies]
+libc = "0.2"
+vm-fdt = "0.3"
+log = "0.4"
+env_logger = "0.11"

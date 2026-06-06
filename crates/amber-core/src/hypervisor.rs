@@ -1,0 +1,106 @@
+//! The seam. The only thing a hypervisor backend implements.
+//!
+//! Both targets are arm64, so the two backends differ in exactly two places:
+//! how guest memory is mapped, and how a vcpu is run and its exit decoded.
+//! Everything else is shared code above this file.
+
+use crate::memory::GuestMemory;
+use crate::Result;
+
+/// A configured but not-yet-running VM, owned by a backend.
+pub trait Hypervisor: Sized {
+    type Vcpu: Vcpu;
+
+    /// Create the VM and map `mem` into guest-physical space at its base.
+    fn create(mem: &GuestMemory) -> Result<Self>;
+
+    /// Create vcpu `id`. M0 only ever asks for vcpu 0.
+    fn create_vcpu(&mut self, id: u8) -> Result<Self::Vcpu>;
+}
+
+pub trait Vcpu {
+    /// arm64 boot protocol: PC at the kernel entry, x0 at the DTB address,
+    /// x1..x3 zero, started at EL1 with interrupts masked. The backend sets the
+    /// architectural defaults; this call sets the two values amber controls.
+    fn set_boot_regs(&mut self, entry: u64, dtb: u64) -> Result<()>;
+
+    /// Read a general register x0..x30 by index. Needed to pull the value of an
+    /// MMIO store out of the source register the faulting instruction used.
+    fn get_x(&self, idx: u8) -> Result<u64>;
+
+    /// Write a general register x0..x30 by index. Needed to deliver the result of
+    /// an MMIO load into the destination register before resuming.
+    fn set_x(&mut self, idx: u8, val: u64) -> Result<()>;
+
+    /// Read the program counter.
+    fn pc(&self) -> Result<u64>;
+
+    /// Set the program counter. Used to step past a faulting MMIO instruction.
+    fn set_pc(&mut self, pc: u64) -> Result<()>;
+
+    /// Run until the next exit. Synchronous. One OS thread per vcpu, so this call
+    /// blocks that thread and nothing async ever touches the hot path.
+    fn run(&mut self) -> Result<VmExit>;
+}
+
+/// The shared exit vocabulary. Each backend translates its raw exit into one of
+/// these so the run loop in `vm.rs` is backend-independent.
+#[derive(Debug, Clone, Copy)]
+pub enum VmExit {
+    /// A trapped access to an unbacked guest-physical address: a device register.
+    Mmio { access: MmioAccess },
+    /// WFI/WFE: the guest has nothing to do. Park or wake on an event.
+    Idle,
+    /// PSCI SYSTEM_OFF (or equivalent). Clean shutdown.
+    Shutdown,
+    /// Anything the backend could not classify. The run loop treats it as fatal.
+    Fault { pc: u64, esr: u64, ipa: u64 },
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct MmioAccess {
+    pub ipa: u64,
+    pub op: MmioOp,
+    /// Access width in bytes: 1, 2, 4, or 8.
+    pub size: u8,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum MmioOp {
+    /// Guest read. The bus computes a value; the run loop writes it into `reg`.
+    Read { reg: u8 },
+    /// Guest write of `value` from register `reg`.
+    Write { reg: u8, value: u64 },
+}
+
+/// ESR_EL2 data-abort decoding, shared by both backends. On a data abort the
+/// backend hands us the raw syndrome and the faulting IPA; we turn it into a
+/// `MmioAccess`. Returns None if the instruction syndrome is not valid (ISV=0),
+/// which means we cannot emulate it from the syndrome alone.
+///
+/// ESR layout: EC = bits[31:26], ISS = bits[24:0].
+/// Data abort from a lower EL: EC == 0x24.
+/// ISS for a data abort: ISV[24], SAS[23:22], SSE[21], SRT[20:16], WnR[6].
+pub fn decode_data_abort(esr: u64, ipa: u64, get_x: impl Fn(u8) -> u64) -> Option<MmioAccess> {
+    const EC_DATA_ABORT_LOWER_EL: u64 = 0x24;
+    let ec = (esr >> 26) & 0x3f;
+    if ec != EC_DATA_ABORT_LOWER_EL {
+        return None;
+    }
+    let iss = esr & 0x1ff_ffff;
+    let isv = (iss >> 24) & 1;
+    if isv == 0 {
+        return None; // syndrome not usable; would need instruction decode
+    }
+    let sas = (iss >> 22) & 0b11;
+    let size = 1u8 << sas; // 0->1, 1->2, 2->4, 3->8 bytes
+    let srt = ((iss >> 16) & 0x1f) as u8;
+    let wnr = (iss >> 6) & 1;
+
+    let op = if wnr == 1 {
+        MmioOp::Write { reg: srt, value: get_x(srt) }
+    } else {
+        MmioOp::Read { reg: srt }
+    };
+    Some(MmioAccess { ipa, op, size })
+}
