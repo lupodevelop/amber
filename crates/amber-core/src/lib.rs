@@ -17,6 +17,17 @@ pub use hypervisor::{Hypervisor, Vcpu};
 pub use memory::GuestMemory;
 pub use vm::{Vm, VmConfig};
 
+/// Where a backend placed its interrupt controller, so the device tree can
+/// advertise the matching addresses. Today only GICv3 (HVF now, KVM at M8). The
+/// sizes come from the host, not baked constants, because the host decides them.
+#[derive(Debug, Clone, Copy)]
+pub struct GicInfo {
+    pub dist_base: u64,
+    pub dist_size: u64,
+    pub redist_base: u64,
+    pub redist_size: u64,
+}
+
 /// The guest-physical memory map. The QEMU `virt` layout, which is the reference
 /// every arm64 microVM follows and what the kernel's `earlycon` expects. Devices
 /// sit below RAM; RAM starts at 1 GiB.

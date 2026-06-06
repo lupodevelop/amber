@@ -31,7 +31,22 @@
       "Bash(./target/release/amber boot *)",
       "Bash(echo \"exit code: $?\")",
       "Bash(sed 's/^/clippy issues: /')",
-      "Bash(git commit -q -m 'Boot M0 to userspace on HVF: fix three bring-up bugs *)"
+      "Bash(git commit -q -m 'Boot M0 to userspace on HVF: fix three bring-up bugs *)",
+      "Bash(grep -nE 'hv_return_t hv_gic|hv_gic_[a-z_]+\\\\\\(' __CMDSUB_OUTPUT__/System/Library/Frameworks/Hypervisor.framework/Headers/hv_gic.h)",
+      "Bash(grep -nE 'hv_gic_config|hv_return_t|HV_' __CMDSUB_OUTPUT__/System/Library/Frameworks/Hypervisor.framework/Headers/hv_gic_config.h)",
+      "Bash(sed -n 30,50p __CMDSUB_OUTPUT__/System/Library/Frameworks/Hypervisor.framework/Headers/hv_gic.h)",
+      "Bash(grep -nE 'vtimer|hv_vcpus_exit|pending_interrupt|hv_vcpu_set_pending' __CMDSUB_OUTPUT__/System/Library/Frameworks/Hypervisor.framework/Headers/hv_vcpu.h)",
+      "Bash(grep -nE 'HV_GIC_INT|hv_gic_intid_t|hv_gic_distributor_reg_t|HV_GIC_DISTRIBUTOR' __CMDSUB_OUTPUT__/System/Library/Frameworks/Hypervisor.framework/Headers/hv_gic_types.h)",
+      "Bash(grep -rnE 'hv_gic_config_t;|hv_interrupt_type_t|HV_INTERRUPT_TYPE|hv_gic_intid_t;|} hv_gic_intid_t' __CMDSUB_OUTPUT__/System/Library/Frameworks/Hypervisor.framework/Headers/hv_types.h __CMDSUB_OUTPUT__/System/Library/Frameworks/Hypervisor.framework/Headers/hv_gic_types.h __CMDSUB_OUTPUT__/System/Library/Frameworks/Hypervisor.framework/Headers/hv_vcpu_types.h)",
+      "WebSearch",
+      "WebFetch(domain:deepwiki.com)",
+      "Bash(grep -nE 'HV_SYS_REG_\\(CNTV_CTL|CNTV_CVAL|CNTVCT|CNTV_TVAL|CNTFRQ|CNTKCTL|CNTP_CTL|CNTP_CVAL|MPIDR|MIDR|SCTLR\\)' __CMDSUB_OUTPUT__/System/Library/Frameworks/Hypervisor.framework/Headers/hv_vcpu_types.h)",
+      "Bash(sed -n 38,52p __CMDSUB_OUTPUT__/System/Library/Frameworks/Hypervisor.framework/Headers/hv_gic_types.h)",
+      "WebFetch(domain:github.com)",
+      "Bash(grep -nE 'OS_ENUM\\\\\\(hv_sys_reg|OS_ENUM\\\\\\(hv_gic_config|hv_gic_config_t' __CMDSUB_OUTPUT__/System/Library/Frameworks/Hypervisor.framework/Headers/hv_vcpu_types.h __CMDSUB_OUTPUT__/System/Library/Frameworks/Hypervisor.framework/Headers/hv_gic_types.h)",
+      "Bash(grep -nE 'Kernel panic|Run /init|init process|Mounting|not syncing|No filesystem|VFS:|nibble|Failed|find|exitcode|Attempted' /tmp/amber-boot.log | head -20)",
+      "Read(//private/tmp/**)",
+      "Bash(git commit *)"
     ]
   }
 }

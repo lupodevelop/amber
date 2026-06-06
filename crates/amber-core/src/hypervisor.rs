@@ -16,6 +16,13 @@ pub trait Hypervisor: Sized {
 
     /// Create vcpu `id`. M0 only ever asks for vcpu 0.
     fn create_vcpu(&mut self, id: u8) -> Result<Self::Vcpu>;
+
+    /// The interrupt controller the backend created, if any, so the device tree
+    /// can describe it. A backend with no GIC returns None and the guest boots
+    /// without functional interrupts (the M0 ceiling).
+    fn gic_info(&self) -> Option<crate::GicInfo> {
+        None
+    }
 }
 
 pub trait Vcpu {

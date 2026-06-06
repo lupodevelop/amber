@@ -30,28 +30,36 @@ pub struct Vm {
     bus: MmioBus,
     entry: u64,
     dtb_addr: u64,
+    // Kept so the device tree can be built in `run`, once the backend has
+    // created its interrupt controller and we know the real GIC layout.
+    mem_size: u64,
+    cmdline: String,
+    initrd: Option<(u64, u64)>,
 }
 
 impl Vm {
-    /// Place the kernel, initramfs, and DTB in guest RAM and build the device bus.
+    /// Place the kernel and initramfs in guest RAM and wire the device bus. The
+    /// DTB is deferred to `run`, because its interrupt-controller node depends on
+    /// the GIC the backend creates.
     pub fn prepare(cfg: &VmConfig) -> Result<Self> {
         let mem = GuestMemory::new(layout::RAM_BASE, cfg.mem_size)?;
 
         let kernel = loader::load_kernel(&mem, &cfg.kernel)?;
         let initrd = loader::load_initramfs(&mem, cfg.initrd.as_deref())?;
-
-        let blob = dtb::build(&dtb::DtbParams {
-            mem_size: cfg.mem_size as u64,
-            cmdline: &cfg.cmdline,
-            initrd,
-        })?;
         let dtb_addr = mem.base() + layout::DTB_OFFSET;
-        mem.write(dtb_addr, &blob)?;
 
         let mut bus = MmioBus::default();
         Pl011::register_on(&mut bus, Box::new(std::io::stdout()));
 
-        Ok(Self { mem, bus, entry: kernel.entry, dtb_addr })
+        Ok(Self {
+            mem,
+            bus,
+            entry: kernel.entry,
+            dtb_addr,
+            mem_size: cfg.mem_size as u64,
+            cmdline: cfg.cmdline.clone(),
+            initrd,
+        })
     }
 
     pub fn memory(&self) -> &GuestMemory {
@@ -62,6 +70,17 @@ impl Vm {
     /// for M0, so this runs on the calling thread.
     pub fn run<H: Hypervisor>(mut self) -> Result<()> {
         let mut hv = H::create(&self.mem)?;
+
+        // Build the device tree now that the backend exists: its GIC node must
+        // match the interrupt controller the backend just created.
+        let blob = dtb::build(&dtb::DtbParams {
+            mem_size: self.mem_size,
+            cmdline: &self.cmdline,
+            initrd: self.initrd,
+            gic: hv.gic_info(),
+        })?;
+        self.mem.write(self.dtb_addr, &blob)?;
+
         let mut vcpu = hv.create_vcpu(0)?;
         vcpu.set_boot_regs(self.entry, self.dtb_addr)?;
 
@@ -83,9 +102,10 @@ impl Vm {
                     vcpu.set_pc(pc + 4)?;
                 }
                 VmExit::Idle => {
-                    // M0 has no interrupt source, so a WFI with nothing pending
-                    // means early boot has gone as far as it can without a GIC.
-                    log::info!("guest idle (WFI); M0 reached its ceiling without a GIC");
+                    // With a GIC the backend parks on WFI and resumes itself, so
+                    // Idle only reaches here from an explicit cancel. Without a
+                    // GIC (the M0 path) a WFI surfaces here and is the ceiling.
+                    log::info!("guest idle (WFI); reached its ceiling without a GIC");
                     return Ok(());
                 }
                 VmExit::Shutdown => {

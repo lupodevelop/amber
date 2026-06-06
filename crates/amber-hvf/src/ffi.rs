@@ -70,7 +70,34 @@ extern "C" {
 
     pub fn hv_vcpu_get_reg(vcpu: hv_vcpu_t, reg: hv_reg_t, value: *mut u64) -> hv_return_t;
     pub fn hv_vcpu_set_reg(vcpu: hv_vcpu_t, reg: hv_reg_t, value: u64) -> hv_return_t;
+
+    pub fn hv_vcpu_get_sys_reg(vcpu: hv_vcpu_t, reg: hv_sys_reg_t, value: *mut u64) -> hv_return_t;
+    pub fn hv_vcpu_set_sys_reg(vcpu: hv_vcpu_t, reg: hv_sys_reg_t, value: u64) -> hv_return_t;
+
+    // VTimer. CNTVCT_EL0 == mach_absolute_time() - vtimer_offset, so the offset
+    // lets the WFI handler compute how long until the next tick is due.
+    pub fn hv_vcpu_get_vtimer_offset(vcpu: hv_vcpu_t, vtimer_offset: *mut u64) -> hv_return_t;
+    pub fn hv_vcpu_set_vtimer_mask(vcpu: hv_vcpu_t, vtimer_is_masked: bool) -> hv_return_t;
+
+    // GICv3 (macOS 15+). The config object is built, applied with hv_gic_create
+    // after the VM exists but before any vcpu, then discarded.
+    pub fn hv_gic_config_create() -> hv_gic_config_t;
+    pub fn hv_gic_config_set_distributor_base(config: hv_gic_config_t, base: hv_ipa_t) -> hv_return_t;
+    pub fn hv_gic_config_set_redistributor_base(config: hv_gic_config_t, base: hv_ipa_t) -> hv_return_t;
+    pub fn hv_gic_create(config: hv_gic_config_t) -> hv_return_t;
+    pub fn hv_gic_get_distributor_size(size: *mut usize) -> hv_return_t;
+    pub fn hv_gic_get_redistributor_region_size(size: *mut usize) -> hv_return_t;
+    pub fn hv_gic_get_redistributor_base_alignment(align: *mut usize) -> hv_return_t;
 }
+
+// hv_sys_reg_t == uint16_t. Only the few amber reads/writes are named here.
+pub type hv_sys_reg_t = u16;
+pub const HV_SYS_REG_MPIDR_EL1: hv_sys_reg_t = 0xc005;
+pub const HV_SYS_REG_CNTV_CTL_EL0: hv_sys_reg_t = 0xdf19; // bit0 ENABLE, bit1 IMASK, bit2 ISTATUS
+pub const HV_SYS_REG_CNTV_CVAL_EL0: hv_sys_reg_t = 0xdf1a;
+
+/// Opaque GIC configuration object (struct hv_gic_config_s *).
+pub type hv_gic_config_t = *mut c_void;
 
 /// ESR exception class for a trapped HVC (PSCI calls arrive this way).
 /// EC == 0x16 for HVC executed at EL1. VERIFY against the ARM ARM if unsure.

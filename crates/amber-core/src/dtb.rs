@@ -18,6 +18,9 @@ pub struct DtbParams<'a> {
     pub mem_size: u64,
     pub cmdline: &'a str,
     pub initrd: Option<(u64, u64)>,
+    /// The backend's GIC, if it created one. Some -> a functional GICv3 node;
+    /// None -> the non-backed GICv2 stub that only keeps the tree well-formed.
+    pub gic: Option<crate::GicInfo>,
 }
 
 pub fn build(p: &DtbParams) -> Result<Vec<u8>> {
@@ -67,25 +70,42 @@ pub fn build(p: &DtbParams) -> Result<Vec<u8>> {
     fdt.property_string("method", "hvc").map_err(fdt_err)?;
     fdt.end_node(psci).map_err(fdt_err)?;
 
-    // /intc: GICv2. Present for a well-formed tree; not yet backed in M0.
-    let intc = fdt.begin_node("intc@8000000").map_err(fdt_err)?;
-    fdt.property_string("compatible", "arm,cortex-a15-gic").map_err(fdt_err)?;
-    fdt.property_u32("#interrupt-cells", 3).map_err(fdt_err)?;
-    fdt.property_null("interrupt-controller").map_err(fdt_err)?;
-    fdt.property_array_u64(
-        "reg",
-        &[
-            layout::GIC_DIST_BASE, layout::GIC_DIST_SIZE,
-            layout::GIC_CPU_BASE, layout::GIC_CPU_SIZE,
-        ],
-    )
-    .map_err(fdt_err)?;
-    fdt.property_u32("phandle", GIC_PHANDLE).map_err(fdt_err)?;
-    fdt.end_node(intc).map_err(fdt_err)?;
+    // /intc: the interrupt controller. GICv3 when the backend created one (reg
+    // = distributor + one redistributor region, both sized by the host), else a
+    // non-backed GICv2 stub that only keeps the tree well-formed (the M0 path).
+    if let Some(g) = p.gic {
+        let intc = fdt.begin_node(&format!("intc@{:x}", g.dist_base)).map_err(fdt_err)?;
+        fdt.property_string("compatible", "arm,gic-v3").map_err(fdt_err)?;
+        fdt.property_u32("#interrupt-cells", 3).map_err(fdt_err)?;
+        fdt.property_null("interrupt-controller").map_err(fdt_err)?;
+        fdt.property_array_u64(
+            "reg",
+            &[g.dist_base, g.dist_size, g.redist_base, g.redist_size],
+        )
+        .map_err(fdt_err)?;
+        fdt.property_u32("phandle", GIC_PHANDLE).map_err(fdt_err)?;
+        fdt.end_node(intc).map_err(fdt_err)?;
+    } else {
+        let intc = fdt.begin_node("intc@8000000").map_err(fdt_err)?;
+        fdt.property_string("compatible", "arm,cortex-a15-gic").map_err(fdt_err)?;
+        fdt.property_u32("#interrupt-cells", 3).map_err(fdt_err)?;
+        fdt.property_null("interrupt-controller").map_err(fdt_err)?;
+        fdt.property_array_u64(
+            "reg",
+            &[
+                layout::GIC_DIST_BASE, layout::GIC_DIST_SIZE,
+                layout::GIC_CPU_BASE, layout::GIC_CPU_SIZE,
+            ],
+        )
+        .map_err(fdt_err)?;
+        fdt.property_u32("phandle", GIC_PHANDLE).map_err(fdt_err)?;
+        fdt.end_node(intc).map_err(fdt_err)?;
+    }
 
     // /timer: the architected generic timer. PPIs 13..16, edge-triggered.
     let timer = fdt.begin_node("timer").map_err(fdt_err)?;
     fdt.property_string("compatible", "arm,armv8-timer").map_err(fdt_err)?;
+    fdt.property_u32("interrupt-parent", GIC_PHANDLE).map_err(fdt_err)?;
     // <type ppi flags> per cell triple; 1 = PPI, 0xf08 = level/active-low here.
     fdt.property_array_u32(
         "interrupts",
