@@ -333,6 +333,21 @@ content-addressed base, and clean up the temp tree. Verified: alpine and
 python:3.12-slim built in parallel via the daemon both succeed, two bases cached,
 no leftover temp dirs.
 
+### M2 iteration — offline warm runs (reference→id cache)
+
+The warm path still did a registry round-trip per run (fetch the manifest to
+learn the digest). Added a `reference -> content-id` cache (`amber-cache/refs.json`,
+written atomically): `build(refresh=false)` (what `run` uses) takes the cached id
+and a present base **without any network**; `build(refresh=true)` (what `pull`
+uses) always re-resolves and updates the mapping, so a moved tag is picked up.
+Docker's model: `run` uses the local cache, `pull` refreshes it.
+
+Effect on `amber run alpine -- true` wall time: cold (build + network)
+**3239 ms** → warm-with-network **~1500 ms** → **warm offline ~185 ms** (steady
+~180–190 ms across repeats). The network was ~1.3 s of the old warm path. What
+remains (~185 ms) is host setup + the cold microVM boot itself (~125–130 ms
+guest) — which is exactly what snapshot/fork (M3/M4) is meant to remove.
+
 ---
 
 ## Cross-cutting choices

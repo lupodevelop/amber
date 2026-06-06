@@ -214,31 +214,17 @@ fn cmd_pull(args: &[String]) -> ExitCode {
         eprintln!("usage: amber pull <image>");
         return ExitCode::FAILURE;
     };
-    let cache = Path::new("amber-cache/blobs");
-    let rootfs = Path::new("amber-cache/rootfs");
-    let img = match amber_image::pull_and_flatten(image, cache, rootfs) {
-        Ok(img) => img,
-        Err(e) => {
-            eprintln!("pull failed: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    println!("rootfs: {}", img.rootfs.display());
-    println!("default argv: {:?}", img.config.default_argv());
-    if let Some(wd) = &img.config.working_dir {
-        println!("workdir: {wd}");
-    }
-    println!("env entries: {}", img.config.env.len());
-
-    let base = Path::new("amber-cache/base.sqfs");
-    match amber_image::pack_squashfs(&img.rootfs, base) {
-        Ok(()) => {
-            let sz = std::fs::metadata(base).map(|m| m.len()).unwrap_or(0);
-            println!("base: {} ({} KiB)", base.display(), sz / 1024);
+    // refresh = true: always re-resolve against the registry and update the
+    // reference -> id mapping, so a moved tag is picked up.
+    match amber_image::build(image, Path::new("amber-cache"), true) {
+        Ok(built) => {
+            let sz = std::fs::metadata(&built.base).map(|m| m.len()).unwrap_or(0);
+            println!("base: {} ({} KiB)", built.base.display(), sz / 1024);
+            println!("default argv: {:?}", built.config.default_argv());
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("pack failed: {e}");
+            eprintln!("pull failed: {e}");
             ExitCode::FAILURE
         }
     }
@@ -277,7 +263,7 @@ fn cmd_vm(args: &[String]) -> ExitCode {
 
     // Resolve, pull, flatten, and pack — cached by image content id, so repeated
     // runs of the same image skip straight to boot.
-    let mut built = match amber_image::build(&oci_ref, Path::new("amber-cache")) {
+    let mut built = match amber_image::build(&oci_ref, Path::new("amber-cache"), false) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("build failed: {e}");
