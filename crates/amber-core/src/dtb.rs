@@ -21,8 +21,8 @@ pub struct DtbParams<'a> {
     /// The backend's GIC, if it created one. Some -> a functional GICv3 node;
     /// None -> the non-backed GICv2 stub that only keeps the tree well-formed.
     pub gic: Option<crate::GicInfo>,
-    /// Whether to advertise the virtio-mmio block device node.
-    pub virtio_blk: bool,
+    /// virtio-mmio devices to advertise, as `(base, size, relative-SPI)`.
+    pub virtio: &'a [(u64, u64, u32)],
     /// Random bytes for `/chosen/rng-seed`. The kernel credits these as entropy
     /// at early boot, so crng initializes immediately instead of stalling for
     /// seconds waiting for a source the microVM does not have.
@@ -154,18 +154,16 @@ pub fn build(p: &DtbParams) -> Result<Vec<u8>> {
     .map_err(fdt_err)?;
     fdt.end_node(uart).map_err(fdt_err)?;
 
-    // /virtio_mmio: the block device backing the root filesystem. SPI 2,
-    // level-high, in the device hole below RAM.
-    if p.virtio_blk {
+    // /virtio_mmio: one node per device (block, entropy, ...), each level-high
+    // on its SPI in the device hole below RAM.
+    for &(base, size, spi) in p.virtio {
         let node = fdt
-            .begin_node(&format!("virtio_mmio@{:x}", layout::VIRTIO_BLK_BASE))
+            .begin_node(&format!("virtio_mmio@{base:x}"))
             .map_err(fdt_err)?;
         fdt.property_string("compatible", "virtio,mmio").map_err(fdt_err)?;
-        fdt.property_array_u64("reg", &[layout::VIRTIO_BLK_BASE, layout::VIRTIO_BLK_SIZE])
-            .map_err(fdt_err)?;
+        fdt.property_array_u64("reg", &[base, size]).map_err(fdt_err)?;
         fdt.property_u32("interrupt-parent", GIC_PHANDLE).map_err(fdt_err)?;
-        fdt.property_array_u32("interrupts", &[0, layout::VIRTIO_BLK_SPI, 0x04])
-            .map_err(fdt_err)?;
+        fdt.property_array_u32("interrupts", &[0, spi, 0x04]).map_err(fdt_err)?;
         fdt.end_node(node).map_err(fdt_err)?;
     }
 

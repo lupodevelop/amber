@@ -4,10 +4,33 @@
 
 use crate::bus::{MmioBus, Pl011};
 use crate::hypervisor::{Hypervisor, MmioOp, Vcpu, VmExit};
+use crate::virtio::{BlkDevice, RngDevice, VirtioDevice, VirtioMmio};
 use crate::{dtb, layout, loader, GuestMemory, Result};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+
+/// A virtio-mmio device placed at a window with an assigned interrupt.
+struct VirtioDev {
+    base: u64,
+    size: u64,
+    intid: u32,
+    mmio: VirtioMmio,
+}
+
+impl VirtioDev {
+    fn new(index: usize, dev: Box<dyn VirtioDevice>) -> Self {
+        Self {
+            base: layout::VIRTIO_MMIO_BASE + index as u64 * layout::VIRTIO_MMIO_STRIDE,
+            size: layout::VIRTIO_MMIO_STRIDE,
+            intid: layout::GIC_SPI_BASE + layout::VIRTIO_SPI_BASE + index as u32,
+            mmio: VirtioMmio::new(dev),
+        }
+    }
+    fn contains(&self, ipa: u64) -> bool {
+        ipa >= self.base && ipa < self.base + self.size
+    }
+}
 
 pub struct VmConfig {
     pub mem_size: usize,
@@ -37,7 +60,7 @@ pub struct Vm {
     mem: GuestMemory,
     bus: MmioBus,
     pl011: Pl011,
-    blk: Option<crate::virtio::VirtioBlk>,
+    virtio: Vec<VirtioDev>,
     entry: u64,
     dtb_addr: u64,
     // Kept so the device tree can be built in `run`, once the backend has
@@ -58,16 +81,21 @@ impl Vm {
         let initrd = loader::load_initramfs(&mem, cfg.initrd.as_deref())?;
         let dtb_addr = mem.base() + layout::DTB_OFFSET;
 
-        let blk = match &cfg.disk {
-            Some(path) => Some(crate::virtio::VirtioBlk::open(path)?),
-            None => None,
-        };
+        // Block device first (so it is /dev/vda) if there is a disk, then an
+        // entropy source. Indices set each device's MMIO window and interrupt.
+        let mut virtio: Vec<VirtioDev> = Vec::new();
+        if let Some(path) = &cfg.disk {
+            let i = virtio.len();
+            virtio.push(VirtioDev::new(i, Box::new(BlkDevice::open(path)?)));
+        }
+        let i = virtio.len();
+        virtio.push(VirtioDev::new(i, Box::new(RngDevice::open()?)));
 
         Ok(Self {
             mem,
             bus: MmioBus::default(),
             pl011: Pl011::new(Box::new(std::io::stdout())),
-            blk,
+            virtio,
             entry: kernel.entry,
             dtb_addr,
             mem_size: cfg.mem_size as u64,
@@ -93,7 +121,7 @@ impl Vm {
             mem,
             mut bus,
             pl011,
-            blk,
+            mut virtio,
             entry,
             dtb_addr,
             mem_size,
@@ -103,10 +131,9 @@ impl Vm {
 
         let mut hv = H::create(&mem)?;
 
-        // Give the block device its view of guest RAM (it reads rings/buffers).
-        let mut blk = blk;
-        if let Some(b) = &mut blk {
-            b.attach(mem.ram());
+        // Give each device its view of guest RAM (it reads rings/buffers).
+        for d in &mut virtio {
+            d.mmio.attach(mem.ram());
         }
 
         // Seed the guest's RNG from the host so crng inits at once (no entropy
@@ -116,6 +143,12 @@ impl Vm {
         let _ = std::fs::File::open("/dev/urandom")
             .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut rng_seed));
 
+        // The virtio nodes for the device tree: (base, size, relative SPI).
+        let virtio_nodes: Vec<(u64, u64, u32)> = virtio
+            .iter()
+            .map(|d| (d.base, d.size, d.intid - layout::GIC_SPI_BASE))
+            .collect();
+
         // Build the device tree now that the backend exists: its GIC node must
         // match the interrupt controller the backend just created.
         let blob = dtb::build(&dtb::DtbParams {
@@ -123,7 +156,7 @@ impl Vm {
             cmdline: &cmdline,
             initrd,
             gic: hv.gic_info(),
-            virtio_blk: blk.is_some(),
+            virtio: &virtio_nodes,
             rng_seed: &rng_seed,
         })?;
         mem.write(dtb_addr, &blob)?;
@@ -134,9 +167,6 @@ impl Vm {
         let pl011_lo = layout::PL011_BASE;
         let pl011_hi = layout::PL011_BASE + layout::PL011_SIZE;
         let pl011_intid = layout::GIC_SPI_BASE + layout::PL011_SPI;
-        let virtio_lo = layout::VIRTIO_BLK_BASE;
-        let virtio_hi = layout::VIRTIO_BLK_BASE + layout::VIRTIO_BLK_SIZE;
-        let virtio_intid = layout::GIC_SPI_BASE + layout::VIRTIO_BLK_SPI;
 
         let pl011 = Mutex::new(pl011);
         let running = AtomicBool::new(true);
@@ -152,40 +182,37 @@ impl Vm {
             let mut step = || -> Result<bool> {
                 match vcpu.run()? {
                     VmExit::Mmio { access } => {
-                        let in_pl011 = access.ipa >= pl011_lo && access.ipa < pl011_hi;
-                        let in_virtio = access.ipa >= virtio_lo && access.ipa < virtio_hi;
-                        match access.op {
-                            MmioOp::Write { value, .. } => {
-                                if in_pl011 {
-                                    pl011.lock().unwrap().write(access.ipa - pl011_lo, access.size, value);
-                                } else if in_virtio {
-                                    if let Some(b) = &mut blk {
-                                        b.write(access.ipa - virtio_lo, access.size, value);
-                                    }
-                                } else {
-                                    bus.write(access.ipa, access.size, value);
+                        let ipa = access.ipa;
+                        if ipa >= pl011_lo && ipa < pl011_hi {
+                            let off = ipa - pl011_lo;
+                            match access.op {
+                                MmioOp::Write { value, .. } => {
+                                    pl011.lock().unwrap().write(off, access.size, value);
+                                }
+                                MmioOp::Read { reg } => {
+                                    let v = pl011.lock().unwrap().read(off, access.size);
+                                    vcpu.set_x(reg, v)?;
                                 }
                             }
-                            MmioOp::Read { reg } => {
-                                let v = if in_pl011 {
-                                    pl011.lock().unwrap().read(access.ipa - pl011_lo, access.size)
-                                } else if in_virtio {
-                                    blk.as_mut()
-                                        .map(|b| b.read(access.ipa - virtio_lo, access.size))
-                                        .unwrap_or(0)
-                                } else {
-                                    bus.read(access.ipa, access.size)
-                                };
-                                vcpu.set_x(reg, v)?;
-                            }
-                        }
-                        // An access may have changed a device's interrupt line.
-                        if in_pl011 {
                             let lvl = pl011.lock().unwrap().irq_level();
                             hv.set_irq(pl011_intid, lvl)?;
-                        } else if in_virtio {
-                            if let Some(b) = &blk {
-                                hv.set_irq(virtio_intid, b.irq_level())?;
+                        } else if let Some(d) = virtio.iter_mut().find(|d| d.contains(ipa)) {
+                            let off = ipa - d.base;
+                            match access.op {
+                                MmioOp::Write { value, .. } => d.mmio.write(off, access.size, value),
+                                MmioOp::Read { reg } => {
+                                    let v = d.mmio.read(off, access.size);
+                                    vcpu.set_x(reg, v)?;
+                                }
+                            }
+                            hv.set_irq(d.intid, d.mmio.irq_level())?;
+                        } else {
+                            match access.op {
+                                MmioOp::Write { value, .. } => bus.write(ipa, access.size, value),
+                                MmioOp::Read { reg } => {
+                                    let v = bus.read(ipa, access.size);
+                                    vcpu.set_x(reg, v)?;
+                                }
                             }
                         }
                         // Step past the faulting load/store: arm64 instructions

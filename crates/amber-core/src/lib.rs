@@ -65,11 +65,12 @@ pub mod layout {
     pub const GIC_SPI_BASE: u32 = 32;
     pub const PL011_SPI: u32 = 1;
 
-    /// virtio-mmio block device window and its SPI, placed in the hole above the
-    /// GIC redistributor and below RAM.
-    pub const VIRTIO_BLK_BASE: u64 = 0x0c00_0000;
-    pub const VIRTIO_BLK_SIZE: u64 = 0x0000_0200;
-    pub const VIRTIO_BLK_SPI: u32 = 2;
+    /// virtio-mmio devices sit in the hole above the GIC redistributor and below
+    /// RAM, one `STRIDE`-sized window each. Device i is at `BASE + i*STRIDE` with
+    /// relative SPI `VIRTIO_SPI_BASE + i` (absolute INTID `GIC_SPI_BASE + that`).
+    pub const VIRTIO_MMIO_BASE: u64 = 0x0c00_0000;
+    pub const VIRTIO_MMIO_STRIDE: u64 = 0x0000_0200;
+    pub const VIRTIO_SPI_BASE: u32 = 2;
 }
 
 /// Everything that can go wrong below the seam. Structured, not stringly-typed at

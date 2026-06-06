@@ -1,14 +1,17 @@
-//! A minimal virtio-mmio (version 2, modern) block device, read-only.
+//! virtio-mmio (version 2, modern) transport plus the devices amber emulates.
 //!
-//! Enough to back a guest root filesystem from a host image file: the MMIO
-//! transport registers, one split virtqueue, and the block IN (read) path. The
-//! base is read-only (a squashfs blob); the guest layers a tmpfs overlay on top
-//! for writes, so OUT/flush are not needed. The single interrupt line is
-//! level-triggered off `InterruptStatus`, driven into the GIC by the run loop.
+//! The transport is the register state machine and the split-virtqueue mechanics
+//! — magic/version/feature negotiation, queue setup, walking the available ring
+//! into descriptor buffers, and writing the used ring. A [`VirtioDevice`] plugs
+//! in the device-specific parts: its device id, feature bits, config space, and
+//! how to service one descriptor chain. Today: a read-only block device and an
+//! entropy source. All single-threaded (the vcpu thread); the device reads and
+//! writes guest memory through a [`GuestRam`] view.
 
 use crate::memory::GuestRam;
 use crate::{Error, Result};
 use std::fs::File;
+use std::io::Read;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 
@@ -36,30 +39,48 @@ const QUEUE_DRIVER_HIGH: u64 = 0x094;
 const QUEUE_DEVICE_LOW: u64 = 0x0a0;
 const QUEUE_DEVICE_HIGH: u64 = 0x0a4;
 const CONFIG_GENERATION: u64 = 0x0fc;
-const CONFIG: u64 = 0x100; // device-specific config; blk capacity (u64 sectors)
+const CONFIG: u64 = 0x100;
 
 const VIRTIO_MAGIC: u32 = 0x7472_6976; // "virt"
-const DEVICE_ID_BLOCK: u32 = 2;
 const VENDOR: u32 = 0x616d_6265; // "ambe"
 const QUEUE_MAX: u32 = 256;
 const SECTOR: u64 = 512;
 
-// VIRTIO_F_VERSION_1 is bit 32: required for a modern device. Advertised in the
-// high feature word (DeviceFeaturesSel == 1).
-const FEATURES_HI: u32 = 1; // bit 0 of word 1 == feature bit 32
+// VIRTIO_F_VERSION_1 is feature bit 32 (bit 0 of the high word): required for a
+// modern device. The transport advertises it for every device.
+const FEATURE_VERSION_1_WORD: u32 = 1;
 
-// Split virtqueue descriptor flags.
 const VIRTQ_DESC_F_NEXT: u16 = 1;
 const VIRTQ_DESC_F_WRITE: u16 = 2;
 
-// virtio-blk request types.
-const VIRTIO_BLK_T_IN: u32 = 0;
+/// One descriptor's buffer, as gathered from a chain.
+pub struct Buf {
+    pub addr: u64,
+    pub len: u32,
+    /// True if the device may write it (VIRTQ_DESC_F_WRITE).
+    pub writable: bool,
+}
 
-pub struct VirtioBlk {
-    disk: File,
-    capacity_sectors: u64,
+/// The device-specific half of a virtio-mmio device.
+pub trait VirtioDevice {
+    fn device_id(&self) -> u32;
+    /// Device-type feature bits for 32-bit selector word `sel` (0 = low).
+    fn device_features(&self, _sel: u32) -> u32 {
+        0
+    }
+    /// Config-space dword at byte offset `off` from the config region.
+    fn config(&self, _off: u64) -> u32 {
+        0
+    }
+    /// Service one descriptor chain; return the number of bytes the device wrote
+    /// into guest memory (the used-ring length).
+    fn handle(&mut self, ram: &GuestRam, bufs: &[Buf]) -> u32;
+}
+
+/// The virtio-mmio transport wrapping one device and one virtqueue.
+pub struct VirtioMmio {
+    dev: Box<dyn VirtioDevice>,
     ram: Option<GuestRam>,
-
     device_features_sel: u32,
     status: u32,
     queue_num: u32,
@@ -71,16 +92,10 @@ pub struct VirtioBlk {
     interrupt_status: u32,
 }
 
-impl VirtioBlk {
-    pub fn open(path: &Path) -> Result<Self> {
-        let disk = File::open(path).map_err(|e| Error::Device(format!("open {}: {e}", path.display())))?;
-        let bytes = disk
-            .metadata()
-            .map_err(|e| Error::Device(format!("stat disk: {e}")))?
-            .len();
-        Ok(Self {
-            disk,
-            capacity_sectors: bytes / SECTOR,
+impl VirtioMmio {
+    pub fn new(dev: Box<dyn VirtioDevice>) -> Self {
+        Self {
+            dev,
             ram: None,
             device_features_sel: 0,
             status: 0,
@@ -91,16 +106,13 @@ impl VirtioBlk {
             used: 0,
             last_avail: 0,
             interrupt_status: 0,
-        })
+        }
     }
 
-    /// Attach the guest RAM view the device reads rings and buffers through.
     pub fn attach(&mut self, ram: GuestRam) {
         self.ram = Some(ram);
     }
 
-    /// Level-triggered interrupt line: asserted while a used-buffer notification
-    /// is outstanding, cleared when the driver acks it.
     pub fn irq_level(&self) -> bool {
         self.interrupt_status != 0
     }
@@ -109,22 +121,21 @@ impl VirtioBlk {
         let v = match offset {
             MAGIC => VIRTIO_MAGIC,
             VERSION => 2,
-            DEVICE_ID => DEVICE_ID_BLOCK,
+            DEVICE_ID => self.dev.device_id(),
             VENDOR_ID => VENDOR,
             DEVICE_FEATURES => {
+                let mut f = self.dev.device_features(self.device_features_sel);
                 if self.device_features_sel == 1 {
-                    FEATURES_HI
-                } else {
-                    0
+                    f |= FEATURE_VERSION_1_WORD;
                 }
+                f
             }
             QUEUE_NUM_MAX => QUEUE_MAX,
             QUEUE_READY => self.queue_ready,
             INTERRUPT_STATUS => self.interrupt_status,
             STATUS => self.status,
             CONFIG_GENERATION => 0,
-            CONFIG => self.capacity_sectors as u32, // low 32 bits
-            o if o == CONFIG + 4 => (self.capacity_sectors >> 32) as u32, // high
+            o if o >= CONFIG => self.dev.config(o - CONFIG),
             _ => 0,
         };
         v as u64
@@ -134,11 +145,10 @@ impl VirtioBlk {
         let v = value as u32;
         match offset {
             DEVICE_FEATURES_SEL => self.device_features_sel = v,
-            DRIVER_FEATURES | DRIVER_FEATURES_SEL => {} // accepted, not used
-            QUEUE_SEL => {} // only queue 0 exists
+            DRIVER_FEATURES | DRIVER_FEATURES_SEL | QUEUE_SEL => {}
             QUEUE_NUM => self.queue_num = v,
             QUEUE_READY => self.queue_ready = v,
-            QUEUE_NOTIFY => self.process_queue(),
+            QUEUE_NOTIFY => self.process(),
             INTERRUPT_ACK => self.interrupt_status &= !v,
             STATUS => {
                 self.status = v;
@@ -165,38 +175,31 @@ impl VirtioBlk {
         self.used = 0;
     }
 
-    /// Process every newly-available request, writing results into guest memory
-    /// and the used ring, then raise the used-buffer interrupt.
-    fn process_queue(&mut self) {
+    fn process(&mut self) {
         let Some(ram) = self.ram else { return };
         if self.queue_ready == 0 || self.queue_num == 0 {
             return;
         }
         let qsz = self.queue_num as u16;
-        // avail ring: flags(u16), idx(u16), ring[u16; qsz].
         let avail_idx = ram.read_u16(self.avail + 2);
 
         let mut progressed = false;
         while self.last_avail != avail_idx {
             let slot = self.last_avail % qsz;
             let head = ram.read_u16(self.avail + 4 + 2 * slot as u64);
-            let written = self.handle_request(&ram, head, qsz);
+            let bufs = self.collect_chain(&ram, head, qsz);
+            let written = self.dev.handle(&ram, &bufs);
             self.push_used(&ram, head as u32, written, qsz);
             self.last_avail = self.last_avail.wrapping_add(1);
             progressed = true;
         }
-
         if progressed {
             self.interrupt_status |= 1; // used buffer notification
         }
     }
 
-    /// Walk a descriptor chain: [header(RO), data...(WO), status(WO,1)]. For an
-    /// IN request, fill the data buffers from the disk and write status = OK.
-    /// Returns the number of bytes the device wrote (data + status).
-    fn handle_request(&self, ram: &GuestRam, head: u16, qsz: u16) -> u32 {
-        // Collect the chain.
-        let mut bufs: Vec<(u64, u32, bool)> = Vec::new(); // (addr, len, device_writable)
+    fn collect_chain(&self, ram: &GuestRam, head: u16, qsz: u16) -> Vec<Buf> {
+        let mut bufs = Vec::new();
         let mut i = head;
         loop {
             let d = self.desc + 16 * i as u64;
@@ -204,62 +207,135 @@ impl VirtioBlk {
             let len = ram.read_u32(d + 8);
             let flags = ram.read_u16(d + 12);
             let next = ram.read_u16(d + 14);
-            bufs.push((addr, len, flags & VIRTQ_DESC_F_WRITE != 0));
-            if flags & VIRTQ_DESC_F_NEXT == 0 {
+            bufs.push(Buf {
+                addr,
+                len,
+                writable: flags & VIRTQ_DESC_F_WRITE != 0,
+            });
+            if flags & VIRTQ_DESC_F_NEXT == 0 || bufs.len() > qsz as usize {
                 break;
             }
             i = next;
-            if bufs.len() > qsz as usize {
-                break; // malformed chain guard
-            }
         }
-        if bufs.len() < 2 {
-            return 0;
-        }
-
-        // Header is the first descriptor: type(u32), reserved(u32), sector(u64).
-        let (haddr, _, _) = bufs[0];
-        let req_type = ram.read_u32(haddr);
-        let sector = ram.read_u64(haddr + 8);
-
-        let status_idx = bufs.len() - 1;
-        let mut written: u32 = 0;
-
-        if req_type == VIRTIO_BLK_T_IN {
-            let mut offset = sector * SECTOR;
-            for &(addr, len, writable) in &bufs[1..status_idx] {
-                if !writable {
-                    continue;
-                }
-                let mut buf = vec![0u8; len as usize];
-                self.read_disk(offset, &mut buf);
-                ram.write(addr, &buf);
-                offset += len as u64;
-                written += len;
-            }
-        }
-        // Status byte: 0 == VIRTIO_BLK_S_OK (also our answer for an ignored OUT).
-        let (saddr, _, _) = bufs[status_idx];
-        ram.write(saddr, &[0u8]);
-        written + 1
+        bufs
     }
 
     fn push_used(&self, ram: &GuestRam, id: u32, len: u32, qsz: u16) {
-        // used ring: flags(u16), idx(u16), ring[{id:u32, len:u32}; qsz].
         let idx = ram.read_u16(self.used + 2);
-        let slot = (idx % qsz) as u64;
-        let elem = self.used + 4 + 8 * slot;
+        let elem = self.used + 4 + 8 * (idx % qsz) as u64;
         ram.write_u32(elem, id);
         ram.write_u32(elem + 4, len);
         ram.write_u16(self.used + 2, idx.wrapping_add(1));
     }
+}
 
-    /// Read `buf.len()` bytes from the disk at `offset`, zero-filling past EOF.
+/// virtio-blk, read-only. The base is a read-only image (squashfs); the guest
+/// layers a tmpfs overlay for writes, so only IN (read) is implemented.
+pub struct BlkDevice {
+    disk: File,
+    capacity_sectors: u64,
+}
+
+impl BlkDevice {
+    const DEVICE_ID: u32 = 2;
+    const T_IN: u32 = 0;
+
+    pub fn open(path: &Path) -> Result<Self> {
+        let disk =
+            File::open(path).map_err(|e| Error::Device(format!("open {}: {e}", path.display())))?;
+        let bytes = disk
+            .metadata()
+            .map_err(|e| Error::Device(format!("stat disk: {e}")))?
+            .len();
+        Ok(Self {
+            disk,
+            capacity_sectors: bytes / SECTOR,
+        })
+    }
+
     fn read_disk(&self, offset: u64, buf: &mut [u8]) {
         match self.disk.read_at(buf, offset) {
             Ok(n) if n < buf.len() => buf[n..].fill(0),
             Ok(_) => {}
             Err(_) => buf.fill(0),
         }
+    }
+}
+
+impl VirtioDevice for BlkDevice {
+    fn device_id(&self) -> u32 {
+        Self::DEVICE_ID
+    }
+
+    fn config(&self, off: u64) -> u32 {
+        match off {
+            0 => self.capacity_sectors as u32,
+            4 => (self.capacity_sectors >> 32) as u32,
+            _ => 0,
+        }
+    }
+
+    /// Chain is [header(RO), data...(WO), status(WO,1)]. Fill data from disk for
+    /// an IN request and write status = OK.
+    fn handle(&mut self, ram: &GuestRam, bufs: &[Buf]) -> u32 {
+        if bufs.len() < 2 {
+            return 0;
+        }
+        let req_type = ram.read_u32(bufs[0].addr);
+        let sector = ram.read_u64(bufs[0].addr + 8);
+        let status_idx = bufs.len() - 1;
+        let mut written = 0;
+
+        if req_type == Self::T_IN {
+            let mut offset = sector * SECTOR;
+            for b in &bufs[1..status_idx] {
+                if !b.writable {
+                    continue;
+                }
+                let mut data = vec![0u8; b.len as usize];
+                self.read_disk(offset, &mut data);
+                ram.write(b.addr, &data);
+                offset += b.len as u64;
+                written += b.len;
+            }
+        }
+        ram.write(bufs[status_idx].addr, &[0u8]); // VIRTIO_BLK_S_OK
+        written + 1
+    }
+}
+
+/// virtio-entropy: fills the guest's request buffers with host randomness, so
+/// the guest's crng has a continuous source. (Boot-time seeding is handled
+/// separately by `/chosen/rng-seed`.)
+pub struct RngDevice {
+    src: File,
+}
+
+impl RngDevice {
+    const DEVICE_ID: u32 = 4;
+
+    pub fn open() -> Result<Self> {
+        let src = File::open("/dev/urandom")
+            .map_err(|e| Error::Device(format!("open /dev/urandom: {e}")))?;
+        Ok(Self { src })
+    }
+}
+
+impl VirtioDevice for RngDevice {
+    fn device_id(&self) -> u32 {
+        Self::DEVICE_ID
+    }
+
+    fn handle(&mut self, ram: &GuestRam, bufs: &[Buf]) -> u32 {
+        let mut written = 0;
+        for b in bufs.iter().filter(|b| b.writable) {
+            let mut data = vec![0u8; b.len as usize];
+            if self.src.read_exact(&mut data).is_err() {
+                continue;
+            }
+            ram.write(b.addr, &data);
+            written += b.len;
+        }
+        written
     }
 }

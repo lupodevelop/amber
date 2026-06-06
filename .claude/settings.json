@@ -61,7 +61,9 @@
       "Bash(grep -E 'virtio_mmio|virtio_blk\\\\.ko|squashfs|overlay' modules.dep)",
       "Bash(find kernel *)",
       "Bash(cd /Users/lupodevelop/Git/GitHub/amber *)",
-      "Read(//Users/lupodevelop/.cargo/registry/src/**)"
+      "Read(//Users/lupodevelop/.cargo/registry/src/**)",
+      "Bash(ls kernel/drivers/char/hw_random/)",
+      "Bash(grep -E 'virtio-rng' modules.dep)"
     ]
   }
 }
