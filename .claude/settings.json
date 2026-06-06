@@ -19,7 +19,19 @@
       "Bash(cargo clippy *)",
       "Bash(git init *)",
       "Bash(git add *)",
-      "Bash(git commit -q -m 'M0 skeleton: backend-agnostic arm64 microVM core + HVF backend *)"
+      "Bash(git commit -q -m 'M0 skeleton: backend-agnostic arm64 microVM core + HVF backend *)",
+      "Bash(curl -sSL --max-time 120 -o vmlinuz-virt __TRACKED_VAR__/vmlinuz-virt)",
+      "Bash(curl -sSL --max-time 120 -o initramfs-virt __TRACKED_VAR__/initramfs-virt)",
+      "Bash(xxd -l 64 Image)",
+      "Bash(xxd Image)",
+      "Bash(python3 -)",
+      "Bash(gunzip -c payload.gz)",
+      "Bash(xxd -s 0x38 -l 4 Image)",
+      "Bash(xxd -s 0x08 -l 16 Image)",
+      "Bash(./target/release/amber boot *)",
+      "Bash(echo \"exit code: $?\")",
+      "Bash(sed 's/^/clippy issues: /')",
+      "Bash(git commit -q -m 'Boot M0 to userspace on HVF: fix three bring-up bugs *)"
     ]
   }
 }

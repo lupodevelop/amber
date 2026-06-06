@@ -59,7 +59,7 @@ impl GuestMemory {
     pub fn write(&self, gpa: u64, bytes: &[u8]) -> Result<()> {
         let off = gpa
             .checked_sub(self.base)
-            .filter(|o| (*o as usize).checked_add(bytes.len()).map_or(false, |e| e <= self.len))
+            .filter(|o| (*o as usize).checked_add(bytes.len()).is_some_and(|e| e <= self.len))
             .ok_or_else(|| Error::Loader(format!("write {:#x}+{} out of range", gpa, bytes.len())))?
             as usize;
         unsafe {

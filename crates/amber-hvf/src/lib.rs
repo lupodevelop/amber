@@ -76,12 +76,17 @@ impl HvfVcpu {
 
 impl Vcpu for HvfVcpu {
     fn set_boot_regs(&mut self, entry: u64, dtb: u64) -> Result<()> {
-        // x0 = DTB, x1..x3 = 0, PC = kernel entry. HVF starts the vcpu at EL1
-        // with interrupts masked, which is what the arm64 boot protocol wants.
+        // x0 = DTB, x1..x3 = 0, PC = kernel entry. HVF does NOT start the vcpu at
+        // EL1: a fresh vcpu comes up at EL0t with PC=0, so the kernel's first
+        // instructions would run unprivileged and trap. Set PSTATE explicitly to
+        // EL1h with DAIF masked (0x3c5), which is exactly the state the arm64
+        // Linux boot protocol requires at the kernel entry.
+        const PSTATE_EL1H_DAIF: u64 = 0x3c5;
         self.set_reg(HV_REG_X0, dtb)?;
         self.set_reg(HV_REG_X0 + 1, 0)?;
         self.set_reg(HV_REG_X0 + 2, 0)?;
         self.set_reg(HV_REG_X0 + 3, 0)?;
+        self.set_reg(HV_REG_CPSR, PSTATE_EL1H_DAIF)?;
         self.set_reg(HV_REG_PC, entry)?;
         Ok(())
     }
@@ -100,43 +105,86 @@ impl Vcpu for HvfVcpu {
     }
 
     fn run(&mut self) -> Result<VmExit> {
-        unsafe { check(hv_vcpu_run(self.handle), "hv_vcpu_run")? };
-        let exit = unsafe { *self.exit };
+        // Loop, not recurse: HVC (PSCI) and trapped-sysreg exits are handled
+        // here and resumed in place, and a busy boot does enough of them that
+        // recursion would grow the stack without bound. Only MMIO/Idle/Shutdown/
+        // Fault leave the loop and reach the backend-agnostic run loop in vm.rs.
+        loop {
+            unsafe { check(hv_vcpu_run(self.handle), "hv_vcpu_run")? };
+            let exit = unsafe { *self.exit };
 
-        match exit.reason {
-            HV_EXIT_REASON_EXCEPTION => {
-                let esr = exit.exception.syndrome;
-                let ipa = exit.exception.physical_address;
-                let ec = (esr >> 26) & 0x3f;
+            match exit.reason {
+                HV_EXIT_REASON_EXCEPTION => {
+                    let esr = exit.exception.syndrome;
+                    let ipa = exit.exception.physical_address;
+                    let ec = (esr >> 26) & 0x3f;
 
-                if ec == EC_HVC64 {
-                    // PSCI arrives as HVC. SYSTEM_OFF (func id 0x8400_0008) is the
-                    // one we care about for a clean exit; treat the rest as noop.
-                    let func = self.get_x(0)?;
-                    if func == 0x8400_0008 {
-                        return Ok(VmExit::Shutdown);
+                    if log::log_enabled!(log::Level::Debug) {
+                        let pc = self.pc().unwrap_or(0);
+                        let cpsr = self.reg(HV_REG_CPSR).unwrap_or(0);
+                        let far = exit.exception.virtual_address;
+                        let el = (cpsr >> 2) & 0b11;
+                        log::debug!(
+                            "exit EXCEPTION ec={ec:#x} esr={esr:#x} pc={pc:#x} ipa={ipa:#x} far={far:#x} cpsr={cpsr:#x} EL{el}"
+                        );
                     }
-                    // Unimplemented PSCI call: return NOT_SUPPORTED and continue.
-                    self.set_x(0, (-1i64) as u64)?;
-                    // HVC does not auto-advance PC on HVF; step past it.
-                    let pc = self.pc()?;
-                    self.set_pc(pc + 4)?;
-                    // Re-run by reporting Idle-free: recurse once.
-                    return self.run();
-                }
 
-                let get = |i: u8| self.get_x(i).unwrap_or(0);
-                if let Some(access) = decode_data_abort(esr, ipa, get) {
-                    return Ok(VmExit::Mmio { access });
+                    if ec == EC_WFX {
+                        // Guest WFI/WFE. HVF surfaces it as an exception, not a
+                        // CANCELED/VTIMER idle exit. With no GIC there is no
+                        // interrupt to wake it, so this is the M0 idle ceiling.
+                        return Ok(VmExit::Idle);
+                    }
+
+                    if ec == EC_HVC64 {
+                        // PSCI over the SMC Calling Convention arrives as HVC. HVF
+                        // reports PC already advanced past the HVC (ELR = next
+                        // insn), so we do NOT step it; doing so would skip the
+                        // instruction that loads the result pointer and fault the
+                        // guest. Service the call, write x0, resume.
+                        let func = self.get_x(0)?;
+                        match func {
+                            // SYSTEM_OFF / SYSTEM_RESET: a clean exit for M0.
+                            0x8400_0008 | 0x8400_0009 => return Ok(VmExit::Shutdown),
+                            // PSCI_VERSION -> 1.0 (major in [31:16], minor in [15:0]).
+                            0x8400_0000 => self.set_x(0, 0x0001_0000)?,
+                            // FEATURES, MIGRATE_INFO, CPU_ON on a single-vcpu M0.
+                            _ => self.set_x(0, (-1i64) as u64)?,
+                        }
+                        continue;
+                    }
+
+                    if ec == EC_MSR_TRAP {
+                        // A system register HVF traps but amber does not model yet
+                        // (timer, GIC sysreg interface, assorted feature regs). M0
+                        // has no interrupt controller, so the honest thing is to
+                        // make these inert and keep booting until the guest WFIs
+                        // for a timer tick that will never come: reads yield 0,
+                        // writes are dropped. Unlike HVC, ELR points AT the
+                        // trapping instruction, so we step past it ourselves.
+                        let direction_read = esr & 1 == 1;
+                        let rt = ((esr >> 5) & 0x1f) as u8;
+                        if direction_read && rt != 31 {
+                            self.set_x(rt, 0)?;
+                        }
+                        let pc = self.pc()?;
+                        self.set_pc(pc + 4)?;
+                        continue;
+                    }
+
+                    let get = |i: u8| self.get_x(i).unwrap_or(0);
+                    if let Some(access) = decode_data_abort(esr, ipa, get) {
+                        return Ok(VmExit::Mmio { access });
+                    }
+                    let pc = self.pc().unwrap_or(0);
+                    return Ok(VmExit::Fault { pc, esr, ipa });
                 }
-                let pc = self.pc().unwrap_or(0);
-                Ok(VmExit::Fault { pc, esr, ipa })
-            }
-            HV_EXIT_REASON_VTIMER_ACTIVATED => Ok(VmExit::Idle),
-            HV_EXIT_REASON_CANCELED => Ok(VmExit::Idle),
-            _ => {
-                let pc = self.pc().unwrap_or(0);
-                Ok(VmExit::Fault { pc, esr: 0, ipa: 0 })
+                HV_EXIT_REASON_VTIMER_ACTIVATED => return Ok(VmExit::Idle),
+                HV_EXIT_REASON_CANCELED => return Ok(VmExit::Idle),
+                _ => {
+                    let pc = self.pc().unwrap_or(0);
+                    return Ok(VmExit::Fault { pc, esr: 0, ipa: 0 });
+                }
             }
         }
     }

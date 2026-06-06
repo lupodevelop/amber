@@ -75,3 +75,14 @@ extern "C" {
 /// ESR exception class for a trapped HVC (PSCI calls arrive this way).
 /// EC == 0x16 for HVC executed at EL1. VERIFY against the ARM ARM if unsure.
 pub const EC_HVC64: u64 = 0x16;
+
+/// ESR exception class for a trapped MSR/MRS/System instruction in AArch64.
+/// EC == 0x18. HVF traps sysregs amber does not model yet; the run loop makes
+/// them inert so an M0 boot can reach its no-GIC ceiling instead of faulting.
+pub const EC_MSR_TRAP: u64 = 0x18;
+
+/// ESR exception class for a trapped WFI/WFE. EC == 0x01. HVF delivers a guest
+/// WFI as this exception rather than a CANCELED/VTIMER idle exit, so the run loop
+/// treats it as the idle signal: the guest is parked waiting for an interrupt
+/// that, without a GIC, will not arrive. That is the M0 ceiling.
+pub const EC_WFX: u64 = 0x01;
