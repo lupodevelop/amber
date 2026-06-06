@@ -206,6 +206,31 @@ Added `RngDevice` (device id 4), filling request buffers from the host
 The refactor was validated for free: the block device kept working (still
 `/dev/vda`, now device index 0) through the new transport.
 
+### Why M2 before M3 (a deliberate call)
+
+Investigated M3 (snapshot) first and the facts argued against doing it now:
+HVF has **148** system registers in `hv_sys_reg_t` to save/restore, GIC state is
+an **opaque object** (`hv_gic_state_create` → `get_size` → `get_data`), and the
+guest busybox has **no `devmem`** for an easy snapshot trigger. That is a
+multi-cycle, bring-up-grade effort. More importantly, snapshot's *payoff* (spawn
+in ms) is realized through the warm pool, which lives in the control plane — so
+snapshot has nowhere to land until templates and a pool exist. Chose M2 first:
+the roadmap order, lower risk, and it makes amber a usable tool now.
+
+### M2 slice — amber.toml manifest + run by name
+
+Sliced M2 to the immediately-useful, zero-risk part (deferred the
+daemon/socket/pool, which is scaffolding ahead of its payoff until M4 fork).
+`amber run <name>` now resolves a bare arg against `amber.toml`: if a
+`[template.<name>]` matches, it uses that template's `image`, `ram_cap`
+(→ guest RAM), and `env` (overriding the image's by key); otherwise the arg is a
+plain OCI reference. Pool/budget/timeout/snapshot fields are parsed
+forward-compatibly (and `#![allow(dead_code)]`'d) but not yet acted on.
+
+Verified: `amber run alpine` → alpine:3 with `MemTotal` ≈ 128 MiB; `amber run
+pytools` → python:3.12-slim with `AMBER_TEMPLATE`/`PYTHONUNBUFFERED` set and
+`MemTotal` ≈ 384 MiB. A size parser handles IEC/SI suffixes (`512MiB`, `4GiB`).
+
 ---
 
 ## Cross-cutting choices
