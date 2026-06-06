@@ -61,6 +61,8 @@ fn cmd_run(args: &[String]) -> ExitCode {
         Some(i) => args[i + 1..].to_vec(),
         None => Vec::new(),
     };
+    // Raw mode so keystrokes reach the guest unbuffered (the guest tty echoes).
+    let _raw = RawTerm::enable();
     match daemon::run_client(target, &argv) {
         Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
         Err(e) => {

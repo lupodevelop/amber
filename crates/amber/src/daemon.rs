@@ -6,7 +6,7 @@
 //! model amber wants). `RunOneShot` spawns a child and relays its stdout to the
 //! client; `List`/`Kill`/`Shutdown` manage the fleet.
 
-use crate::proto::{self, read_frame, write_frame, write_reply, Reply, Request, VmInfo, TAG_REPLY, TAG_REQUEST, TAG_STDOUT};
+use crate::proto::{self, read_frame, write_frame, write_reply, Reply, Request, VmInfo, TAG_REPLY, TAG_REQUEST, TAG_STDIN, TAG_STDOUT};
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -99,6 +99,7 @@ fn run_one_shot(
         cmd.arg("--");
         cmd.args(&argv);
     }
+    cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     let mut child = cmd.spawn()?;
 
@@ -108,6 +109,17 @@ fn run_one_shot(
         id.clone(),
         VmInfo { id: id.clone(), reference, pid },
     );
+
+    // Relay client stdin -> child stdin on a side thread (full-duplex socket).
+    if let (Ok(mut reader), Some(mut cin)) = (stream.try_clone(), child.stdin.take()) {
+        thread::spawn(move || {
+            while let Ok(Some((tag, payload))) = read_frame(&mut reader) {
+                if tag == TAG_STDIN && cin.write_all(&payload).and_then(|_| cin.flush()).is_err() {
+                    break;
+                }
+            }
+        });
+    }
 
     // Relay the guest's stdout to the client until the VM exits.
     if let Some(mut out) = child.stdout.take() {
@@ -158,6 +170,24 @@ pub fn run_client(reference: &str, argv: &[String]) -> io::Result<i32> {
         &mut s,
         &Request::RunOneShot { reference: reference.to_string(), argv: argv.to_vec() },
     )?;
+
+    // Forward our stdin to the VM on a side thread; the process exiting on the
+    // terminal Exit reply tears this down.
+    if let Ok(mut wr) = s.try_clone() {
+        thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = unsafe { libc::read(0, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+                if n <= 0 {
+                    break;
+                }
+                if write_frame(&mut wr, TAG_STDIN, &buf[..n as usize]).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
     let mut stdout = io::stdout();
     loop {
         match read_frame(&mut s)? {

@@ -12,6 +12,7 @@ use std::path::PathBuf;
 pub const TAG_REQUEST: u8 = 1;
 pub const TAG_REPLY: u8 = 2;
 pub const TAG_STDOUT: u8 = 3;
+pub const TAG_STDIN: u8 = 4;
 
 /// Default control-socket path. macOS rarely sets `XDG_RUNTIME_DIR`, so fall back
 /// to the temp dir.

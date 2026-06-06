@@ -263,6 +263,23 @@ Deferred (not throwaway-scaffolding yet): warm pool (pays off with M4 fork) and
 interactive stdin *through* the daemon (the fiddly bidirectional relay; one-shot
 stdout streaming works now).
 
+### M2 iteration — interactive stdin through the daemon
+
+Made `amber run` via the daemon fully interactive. The socket is now full-duplex:
+a `TAG_STDIN` frame carries client keystrokes. On the client, after sending the
+request, a side thread forwards `libc::read(0)` to `TAG_STDIN` frames; the main
+thread keeps reading `Stdout`/`Exit`. On the daemon, `run_one_shot` pipes the
+child's stdin and a side thread (on a `try_clone`'d socket) relays incoming
+`TAG_STDIN` into it. The client wraps the call in `RawTerm` so keystrokes reach
+the guest unbuffered.
+
+Care taken on the framing: only one thread writes each socket direction — the
+request is written *before* the stdin thread is spawned, so there's no
+interleaving with frame writes. Side threads are detached and self-terminate on
+disconnect/EOF; the client's blocked `read(0)` thread is reaped by process exit
+on the terminal `Exit`. Verified: `(sleep 7; echo hello-via-daemon) | amber run
+alpine -- sh -c 'read x; echo daemon-got:[$x]'` prints `daemon-got:[hello-via-daemon]`.
+
 ---
 
 ## Cross-cutting choices
