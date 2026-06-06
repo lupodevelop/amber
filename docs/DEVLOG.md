@@ -167,6 +167,24 @@ Device/fifo nodes in layers are skipped (need root; the guest's devtmpfs provide
 
 ---
 
+## Post-M1 cycles
+
+### rng-seed — killing the crng stall
+
+The ~10s `random: crng init done` stall (flagged at M1) turned out to need no
+device at all. The kernel reads `/chosen/rng-seed` from the DTB at early boot and
+credits it as entropy via `add_bootloader_randomness`, so crng inits immediately.
+Added a 64-byte `rng-seed` property filled from the host `/dev/urandom`
+(best-effort; an unseeded boot only stalls, never fails). Result: `crng init
+done` moved to `[0.000000]` and a python run's **guest** boot+run dropped from
+~10s to ~0.18s. The remaining wall time on a cold `amber run` is host-side
+pull+pack, which caching and warm pools address later — not guest boot.
+
+This was the cheaper fix than virtio-rng; a real virtio-rng device is still worth
+adding for continuous entropy, but the boot stall is no longer a reason to.
+
+---
+
 ## Cross-cutting choices
 
 - **Backend seam holds.** Every milestone added capability above the
@@ -181,7 +199,7 @@ Device/fifo nodes in layers are skipped (need root; the guest's devtmpfs provide
 
 ## Open debts
 
-- virtio-rng (kill the crng stall; help spawn latency).
+- virtio-rng for continuous entropy (the boot stall itself is fixed by rng-seed).
 - erofs base instead of squashfs.
 - Bundled built-in kernel → drop module-loading and the Alpine dependency.
 - Working dir is honored; ownership/uid in flattened layers is not (host-side
