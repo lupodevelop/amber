@@ -348,6 +348,25 @@ Effect on `amber run alpine -- true` wall time: cold (build + network)
 remains (~185 ms) is host setup + the cold microVM boot itself (~125–130 ms
 guest) — which is exactly what snapshot/fork (M3/M4) is meant to remove.
 
+### M2 iteration — measure the warm-start breakdown
+
+Before optimizing further, measured where the ~185 ms warm start actually goes
+(opt-in `AMBER_TIME=1`, phases around `build` / `Vm::prepare` / `run`). On a warm
+`amber run alpine -- true`:
+
+```text
+build=0ms   prep=5–9ms   boot+run+teardown=132–173ms   total ≈ 137 ms
+```
+
+The finding redirects the effort: **host overhead is already negligible** (cache
+hit ~0 ms, `prepare` ~7 ms to mmap + load the 34 MB kernel + build/gzip the
+initramfs). The whole warm cost is the **guest kernel boot** itself. So the
+"cheap wins" I'd listed (cache the initramfs, mmap the kernel) would shave ~7 ms
+total — not worth it. The only real levers on spawn latency are the boot: a
+trimmed/built-in kernel (less device probing, no `insmod`) to lower the floor,
+and **snapshot/fork (M3/M4) to skip boot entirely** for single-digit-ms forks.
+Measuring first stopped us from optimizing the 7 ms and missing the 130 ms.
+
 ---
 
 ## Cross-cutting choices

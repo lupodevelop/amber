@@ -261,6 +261,7 @@ fn cmd_vm(args: &[String]) -> ExitCode {
             None => (target.clone(), None, HashMap::new()),
         };
 
+    let t0 = std::time::Instant::now();
     // Resolve, pull, flatten, and pack — cached by image content id, so repeated
     // runs of the same image skip straight to boot.
     let mut built = match amber_image::build(&oci_ref, Path::new("amber-cache"), false) {
@@ -270,6 +271,7 @@ fn cmd_vm(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let t_build = t0.elapsed();
     // Template env overrides the image's, by key.
     for (k, v) in &extra_env {
         let prefix = format!("{k}=");
@@ -311,6 +313,7 @@ fn cmd_vm(args: &[String]) -> ExitCode {
     if let Some(bytes) = mem_size {
         cfg.mem_size = bytes;
     }
+    let t_prep_start = std::time::Instant::now();
     let vm = match Vm::prepare(&cfg) {
         Ok(vm) => vm,
         Err(e) => {
@@ -318,9 +321,23 @@ fn cmd_vm(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let t_prep = t_prep_start.elapsed();
 
     let _raw = RawTerm::enable();
-    match run(vm) {
+    let t_run_start = std::time::Instant::now();
+    let result = run(vm);
+    let t_run = t_run_start.elapsed();
+
+    if std::env::var("AMBER_TIME").is_ok() {
+        eprintln!(
+            "amber timing: build={:.0}ms prep={:.0}ms boot+run+teardown={:.0}ms total={:.0}ms",
+            t_build.as_secs_f64() * 1e3,
+            t_prep.as_secs_f64() * 1e3,
+            t_run.as_secs_f64() * 1e3,
+            (t_build + t_prep + t_run).as_secs_f64() * 1e3,
+        );
+    }
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("run failed: {e}");
