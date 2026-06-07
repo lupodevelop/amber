@@ -75,6 +75,9 @@ pub struct Vm {
     pl011: Pl011,
     virtio: Vec<VirtioDev>,
     snapshot: Option<SnapshotReq>,
+    disk_path: Option<PathBuf>,
+    /// When set, `run` restores this captured state instead of booting a kernel.
+    restore: Option<crate::snapshot::Loaded>,
     entry: u64,
     dtb_addr: u64,
     // Kept so the device tree can be built in `run`, once the backend has
@@ -111,11 +114,45 @@ impl Vm {
             pl011: Pl011::new(Box::new(std::io::stdout())),
             virtio,
             snapshot: cfg.snapshot.clone(),
+            disk_path: cfg.disk.clone(),
+            restore: None,
             entry: kernel.entry,
             dtb_addr,
             mem_size: cfg.mem_size as u64,
             cmdline: cfg.cmdline.clone(),
             initrd,
+        })
+    }
+
+    /// Build a VM from a snapshot directory: load its RAM, re-open its disk and
+    /// devices, and stash the captured GIC + vcpu state for `run` to apply
+    /// instead of booting.
+    pub fn restore_from(dir: &std::path::Path) -> Result<Self> {
+        let loaded = crate::snapshot::read(dir)?;
+        let mem = GuestMemory::new(loaded.meta.mem_base, loaded.meta.mem_size as usize)?;
+        crate::snapshot::load_mem(dir, &mem)?;
+
+        let mut virtio: Vec<VirtioDev> = Vec::new();
+        if let Some(path) = &loaded.meta.disk {
+            let i = virtio.len();
+            virtio.push(VirtioDev::new(i, Box::new(BlkDevice::open(std::path::Path::new(path))?)));
+        }
+        let i = virtio.len();
+        virtio.push(VirtioDev::new(i, Box::new(RngDevice::open()?)));
+
+        Ok(Self {
+            mem,
+            bus: MmioBus::default(),
+            pl011: Pl011::new(Box::new(std::io::stdout())),
+            virtio,
+            snapshot: None,
+            disk_path: loaded.meta.disk.clone().map(PathBuf::from),
+            restore: Some(loaded),
+            entry: 0,
+            dtb_addr: 0,
+            mem_size: 0,
+            cmdline: String::new(),
+            initrd: None,
         })
     }
 
@@ -138,6 +175,8 @@ impl Vm {
             pl011,
             mut virtio,
             snapshot,
+            disk_path,
+            restore,
             entry,
             dtb_addr,
             mem_size,
@@ -152,33 +191,34 @@ impl Vm {
             d.mmio.attach(mem.ram());
         }
 
-        // Seed the guest's RNG from the host so crng inits at once (no entropy
-        // source in a microVM otherwise). Best effort: an unseeded boot just
-        // stalls a little, it does not fail.
-        let mut rng_seed = [0u8; 64];
-        let _ = std::fs::File::open("/dev/urandom")
-            .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut rng_seed));
-
-        // The virtio nodes for the device tree: (base, size, relative SPI).
-        let virtio_nodes: Vec<(u64, u64, u32)> = virtio
-            .iter()
-            .map(|d| (d.base, d.size, d.intid - layout::GIC_SPI_BASE))
-            .collect();
-
-        // Build the device tree now that the backend exists: its GIC node must
-        // match the interrupt controller the backend just created.
-        let blob = dtb::build(&dtb::DtbParams {
-            mem_size,
-            cmdline: &cmdline,
-            initrd,
-            gic: hv.gic_info(),
-            virtio: &virtio_nodes,
-            rng_seed: &rng_seed,
-        })?;
-        mem.write(dtb_addr, &blob)?;
-
         let mut vcpu = hv.create_vcpu(0)?;
-        vcpu.set_boot_regs(entry, dtb_addr)?;
+
+        if let Some(loaded) = &restore {
+            // Restore path: the RAM already holds the booted kernel + DTB; put the
+            // interrupt controller and vcpu back where they were and resume.
+            hv.restore_gic(&loaded.gic)?;
+            vcpu.restore(&loaded.cpu)?;
+        } else {
+            // Boot path: seed entropy, build the device tree to match the GIC,
+            // and set the arm64 boot registers.
+            let mut rng_seed = [0u8; 64];
+            let _ = std::fs::File::open("/dev/urandom")
+                .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut rng_seed));
+            let virtio_nodes: Vec<(u64, u64, u32)> = virtio
+                .iter()
+                .map(|d| (d.base, d.size, d.intid - layout::GIC_SPI_BASE))
+                .collect();
+            let blob = dtb::build(&dtb::DtbParams {
+                mem_size,
+                cmdline: &cmdline,
+                initrd,
+                gic: hv.gic_info(),
+                virtio: &virtio_nodes,
+                rng_seed: &rng_seed,
+            })?;
+            mem.write(dtb_addr, &blob)?;
+            vcpu.set_boot_regs(entry, dtb_addr)?;
+        }
 
         let pl011_lo = layout::PL011_BASE;
         let pl011_hi = layout::PL011_BASE + layout::PL011_SIZE;
@@ -191,6 +231,7 @@ impl Vm {
         let running = &running;
         let mem = &mem;
         let snapshot = snapshot.as_ref();
+        let disk_path = disk_path.as_deref();
         let started = std::time::Instant::now();
 
         std::thread::scope(|s| {
@@ -206,7 +247,7 @@ impl Vm {
                     if started.elapsed() >= req.after {
                         let cpu = vcpu.capture()?;
                         let gic = hv.capture_gic()?;
-                        crate::snapshot::write(&req.dir, mem, &cpu, &gic)?;
+                        crate::snapshot::write(&req.dir, mem, &cpu, &gic, disk_path)?;
                         log::info!("snapshot captured to {}", req.dir.display());
                         return Ok(false);
                     }

@@ -37,6 +37,7 @@ fn main() -> ExitCode {
         Some("rm") => cmd_rm(&args),
         Some("logs") => cmd_logs(&args),
         Some("pull") => cmd_pull(&args),
+        Some("restore") => cmd_restore(&args),
         Some("boot") => cmd_boot(&args),
         _ => {
             eprintln!("usage:");
@@ -397,6 +398,29 @@ fn cmd_vm(args: &[String]) -> ExitCode {
         );
     }
     match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("run failed: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Restore a VM from a snapshot directory and resume it (M3, de-risk).
+fn cmd_restore(args: &[String]) -> ExitCode {
+    let Some(dir) = args.get(2) else {
+        eprintln!("usage: amber restore <snapshot-dir>");
+        return ExitCode::FAILURE;
+    };
+    let vm = match Vm::restore_from(Path::new(dir)) {
+        Ok(vm) => vm,
+        Err(e) => {
+            eprintln!("restore failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let _raw = RawTerm::enable();
+    match run(vm) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("run failed: {e}");

@@ -102,6 +102,13 @@ extern "C" {
     pub fn hv_gic_state_create() -> hv_gic_state_t;
     pub fn hv_gic_state_get_size(state: hv_gic_state_t, size: *mut usize) -> hv_return_t;
     pub fn hv_gic_state_get_data(state: hv_gic_state_t, data: *mut c_void) -> hv_return_t;
+
+    // --- snapshot restore ---
+    pub fn hv_gic_set_state(data: *const c_void, size: usize) -> hv_return_t;
+    pub fn hv_vcpu_set_vtimer_offset(vcpu: hv_vcpu_t, offset: u64) -> hv_return_t;
+    // NOTE: hv_vcpu_set_simd_fp_reg takes the value by NEON vector, which stable
+    // Rust cannot pass across FFI (simd_ffi is nightly). Restoring V0..V31 needs a
+    // small C shim; deferred — the FP file is don't-care for the resume proof.
 }
 
 /// SIMD/FP register id; Q0..Q31 are 0..=31.

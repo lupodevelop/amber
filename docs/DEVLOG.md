@@ -459,6 +459,36 @@ all registers (including the by-value FP set), recompute the vtimer offset acros
 processes, and resume — verifying the guest continues (`tick2 tick3 …`) without a
 reboot.
 
+### Step 2 — restore (resume proven)
+
+`amber restore <dir>`: build a fresh VM, load `mem.bin` into guest RAM, re-open
+the disk/devices, `hv_gic_set_state` the interrupt controller, set the vcpu
+registers (x0–x30, PC, CPSR/FPCR/FPSR, all the writable system registers — the
+read-only ID regs refuse and are skipped), and resume instead of booting. New
+`Vm::restore_from` + a `run` branch; trait methods `restore_gic` / `Vcpu::restore`.
+
+**It works.** A no-`sleep` counter loop captured at `tick21515` restored and
+continued `tick21517 → tick77229` — **55 k more iterations**, no reboot, no boot
+dmesg. RAM, registers, GIC interrupt delivery (console I/O), and execution all
+resume correctly from the frozen instant. This is the headline mechanism
+demonstrated end to end.
+
+Two snags found, one deferred by ABI, one open:
+
+- **FP registers not restored.** `hv_vcpu_set_simd_fp_reg` takes the value as a
+  NEON vector by value, which stable Rust can't pass over FFI (`simd_ffi` is
+  nightly). Capture keeps them; restore needs a tiny C shim — deferred,
+  don't-care for the shell.
+- **Virtual timer doesn't re-arm after restore (open).** A `sleep` loop resumes
+  one tick (the in-flight timer, already due) then hangs: newly-armed vtimer
+  deadlines never fire the interrupt. Isolated with the no-`sleep` test — every
+  non-timer path resumes perfectly. Recomputing the vtimer offset across the
+  process boundary (capture `mach_absolute_time`, derive a new offset so `CNTVCT`
+  stays continuous) and clearing the vtimer mask were necessary but not
+  sufficient; `hv_gic_set_state` seems not to fully re-establish the vGIC's
+  timer-wake wiring. That, plus snapshotting device-emulation state (virtio queue
+  registers live in the host, not guest RAM), is step 3.
+
 ---
 
 ## Cross-cutting choices

@@ -23,6 +23,9 @@ pub struct CpuSnapshot {
     pub fpcr: u64,
     pub fpsr: u64,
     pub vtimer_offset: u64,
+    /// Host monotonic clock (mach ticks) at capture, so the backend can keep the
+    /// guest's virtual counter continuous across the process boundary on restore.
+    pub mono: u64,
     pub sysregs: Vec<(u16, u64)>,
     pub fp: Vec<[u8; 16]>, // V0..V31
 }
@@ -31,6 +34,15 @@ pub struct CpuSnapshot {
 pub struct Meta {
     pub mem_base: u64,
     pub mem_size: u64,
+    /// Host path of the virtio-blk backing image to re-open on restore.
+    pub disk: Option<String>,
+}
+
+/// Everything a snapshot directory holds except the bulk RAM (loaded separately).
+pub struct Loaded {
+    pub meta: Meta,
+    pub cpu: CpuSnapshot,
+    pub gic: Vec<u8>,
 }
 
 fn snap_err<E: std::fmt::Display>(e: E) -> Error {
@@ -38,7 +50,13 @@ fn snap_err<E: std::fmt::Display>(e: E) -> Error {
 }
 
 /// Write a snapshot directory from the captured state.
-pub fn write(dir: &Path, mem: &GuestMemory, cpu: &CpuSnapshot, gic: &[u8]) -> Result<()> {
+pub fn write(
+    dir: &Path,
+    mem: &GuestMemory,
+    cpu: &CpuSnapshot,
+    gic: &[u8],
+    disk: Option<&Path>,
+) -> Result<()> {
     std::fs::create_dir_all(dir).map_err(snap_err)?;
 
     // Raw guest RAM. SAFETY: the region is valid for `len` bytes and the guest is
@@ -47,10 +65,30 @@ pub fn write(dir: &Path, mem: &GuestMemory, cpu: &CpuSnapshot, gic: &[u8]) -> Re
     std::fs::write(dir.join("mem.bin"), ram).map_err(snap_err)?;
     std::fs::write(dir.join("gic.bin"), gic).map_err(snap_err)?;
 
-    let meta = Meta { mem_base: mem.base(), mem_size: mem.len() as u64 };
+    let meta = Meta {
+        mem_base: mem.base(),
+        mem_size: mem.len() as u64,
+        disk: disk.map(|p| p.to_string_lossy().into_owned()),
+    };
     std::fs::write(dir.join("meta.json"), serde_json::to_vec(&meta).map_err(snap_err)?)
         .map_err(snap_err)?;
     std::fs::write(dir.join("cpu.json"), serde_json::to_vec(cpu).map_err(snap_err)?)
         .map_err(snap_err)?;
     Ok(())
+}
+
+/// Read the metadata, cpu state, and GIC blob (not the bulk RAM) from a snapshot.
+pub fn read(dir: &Path) -> Result<Loaded> {
+    let meta = serde_json::from_slice(&std::fs::read(dir.join("meta.json")).map_err(snap_err)?)
+        .map_err(snap_err)?;
+    let cpu = serde_json::from_slice(&std::fs::read(dir.join("cpu.json")).map_err(snap_err)?)
+        .map_err(snap_err)?;
+    let gic = std::fs::read(dir.join("gic.bin")).map_err(snap_err)?;
+    Ok(Loaded { meta, cpu, gic })
+}
+
+/// Load the snapshot's RAM image into `mem`.
+pub fn load_mem(dir: &Path, mem: &GuestMemory) -> Result<()> {
+    let bytes = std::fs::read(dir.join("mem.bin")).map_err(snap_err)?;
+    mem.write(mem.base(), &bytes)
 }

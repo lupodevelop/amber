@@ -93,6 +93,15 @@ impl Hypervisor for HvfVm {
             Ok(buf)
         }
     }
+
+    fn restore_gic(&self, blob: &[u8]) -> Result<()> {
+        unsafe {
+            check(
+                hv_gic_set_state(blob.as_ptr() as *const _, blob.len()),
+                "hv_gic_set_state",
+            )
+        }
+    }
 }
 
 impl HvfVm {
@@ -272,6 +281,7 @@ impl Vcpu for HvfVcpu {
         }))
     }
 
+    #[allow(deprecated)]
     fn capture(&self) -> Result<CpuSnapshot> {
         let mut x = Vec::with_capacity(31);
         for i in 0..31 {
@@ -307,9 +317,47 @@ impl Vcpu for HvfVcpu {
             fpcr: self.reg(HV_REG_FPCR)?,
             fpsr: self.reg(HV_REG_FPSR)?,
             vtimer_offset,
+            mono: unsafe { libc::mach_absolute_time() },
             sysregs,
             fp,
         })
+    }
+
+    fn restore(&mut self, cpu: &CpuSnapshot) -> Result<()> {
+        for (i, &v) in cpu.x.iter().enumerate() {
+            self.set_reg(HV_REG_X0 + i as u32, v)?;
+        }
+        // System registers: set each captured one; many are read-only (ID/feature
+        // regs) and refuse — ignore those, they don't need restoring.
+        for &(id, v) in &cpu.sysregs {
+            unsafe { hv_vcpu_set_sys_reg(self.handle, id, v) };
+        }
+        // SIMD/FP file (V0..V31) is captured but not yet restored: setting it
+        // needs a NEON-vector-by-value call stable Rust can't make over FFI. It is
+        // don't-care for the resume proof (the shell uses no FP).
+
+        // Keep the virtual counter continuous across the process boundary. At
+        // capture CNTVCT == mono - vtimer_offset; pick a new offset so CNTVCT
+        // reads that same value now, then advances. Without this the guest's
+        // timers compare against a counter that jumped, and sleeps never fire.
+        #[allow(deprecated)]
+        let now = unsafe { libc::mach_absolute_time() };
+        let captured_cntvct = cpu.mono.wrapping_sub(cpu.vtimer_offset);
+        let new_offset = now.wrapping_sub(captured_cntvct);
+        unsafe {
+            check(
+                hv_vcpu_set_vtimer_offset(self.handle, new_offset),
+                "set vtimer offset",
+            )?;
+            // Make sure the virtual timer isn't left masked, or it never fires and
+            // guest sleeps hang after resume.
+            check(hv_vcpu_set_vtimer_mask(self.handle, false), "clear vtimer mask")?;
+        }
+        self.set_reg(HV_REG_FPCR, cpu.fpcr)?;
+        self.set_reg(HV_REG_FPSR, cpu.fpsr)?;
+        self.set_reg(HV_REG_CPSR, cpu.cpsr)?;
+        self.set_reg(HV_REG_PC, cpu.pc)?;
+        Ok(())
     }
 
     fn run(&mut self) -> Result<VmExit> {

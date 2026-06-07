@@ -35,6 +35,11 @@ pub trait Hypervisor: Sized {
     fn capture_gic(&self) -> Result<Vec<u8>> {
         Err(crate::Error::Snapshot("backend has no GIC capture".into()))
     }
+
+    /// Restore the interrupt controller from a captured blob (after `create`).
+    fn restore_gic(&self, _blob: &[u8]) -> Result<()> {
+        Err(crate::Error::Snapshot("backend has no GIC restore".into()))
+    }
 }
 
 pub trait Vcpu {
@@ -71,6 +76,11 @@ pub trait Vcpu {
     /// Capture this vcpu's register state for a snapshot (taken while stopped).
     fn capture(&self) -> Result<crate::snapshot::CpuSnapshot> {
         Err(crate::Error::Snapshot("backend has no vcpu capture".into()))
+    }
+
+    /// Restore this vcpu's register state from a snapshot, in place of booting.
+    fn restore(&mut self, _cpu: &crate::snapshot::CpuSnapshot) -> Result<()> {
+        Err(crate::Error::Snapshot("backend has no vcpu restore".into()))
     }
 }
 
