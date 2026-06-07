@@ -425,6 +425,42 @@ has a control plane to land in.
 
 ---
 
+## M3 — snapshot (in progress)
+
+### Step 1 — capture (de-risk the APIs)
+
+Snapshot is the headline (freeze a booted runtime, fork it in ms) but the riskiest
+code so far, so it's being built in steps, capture first. The unknowns were: does
+`hv_gic_state_*` work, do all 112 `hv_sys_reg_t` reads succeed, and the SIMD/FP +
+vtimer capture. Built the capture path and verified all of it.
+
+The on-disk amber is a directory: `mem.bin` (raw guest RAM), `gic.bin` (the
+opaque GIC-state blob from `hv_gic_state_create`→`get_size`→`get_data`),
+`cpu.json` (x0–x30, PC, CPSR, FPCR/FPSR, vtimer offset, all 112 system registers
+as `(id, value)`, V0–V31), and `meta.json` (memory layout). Capture is
+backend-driven via new trait methods `Vcpu::capture` / `Hypervisor::capture_gic`
+(amber-core owns the format and I/O; the register set is HVF-specific). Generated
+the 112-entry sysreg id table from the SDK header rather than hand-listing it.
+
+FFI note: the FP registers are a NEON vector type passed *by value* — an ABI
+hazard — but `hv_vcpu_get_simd_fp_reg` takes an out-pointer, so capture sidesteps
+it with `*mut [u8;16]`; the by-value `set` is a restore-time problem for step 2.
+
+Trigger for now: `AMBER_SNAPSHOT=<dir>` captures at the first run-loop boundary
+after `AMBER_SNAPSHOT_AFTER_MS` (default 2000), then stops. This fires only when
+the guest exits to us (an MMIO/console access), so the test workload echoes a
+counter each second; a precise/idle capture needs `hv_vcpus_exit` (deferred).
+Verified: a guest printing `tick0 tick1` captured at ~1.5 s yields `cpu.json`
+with 112 sysregs + 32 FP regs + a kernel-VA PC, a 126 KB `gic.bin`, and a
+`mem.bin` of exactly the guest RAM size.
+
+Open for step 2 (restore): map `mem.bin` into a fresh VM, `hv_gic_set_state`, set
+all registers (including the by-value FP set), recompute the vtimer offset across
+processes, and resume — verifying the guest continues (`tick2 tick3 …`) without a
+reboot.
+
+---
+
 ## Cross-cutting choices
 
 - **Backend seam holds.** Every milestone added capability above the

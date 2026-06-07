@@ -70,7 +70,13 @@
       "Bash(AMBER_TIME=1 ./target/release/amber run alpine -- true)",
       "Bash(pkill -f 'amber serve')",
       "Bash(perl -0pi -e 's/Request::RunDetached \\\\{ reference, argv \\\\} => \\\\{\\\\n            run_detached\\\\\\(/Request::RunDetached { reference, argv } => {\\\\n            start_detached\\(/' crates/amber/src/daemon.rs)",
-      "Bash(perl -0pi -e 's/^fn run_detached\\\\\\(\\\\n    mut stream: UnixStream,/fn start_detached\\(\\\\n    mut stream: UnixStream,/m' crates/amber/src/daemon.rs)"
+      "Bash(perl -0pi -e 's/^fn run_detached\\\\\\(\\\\n    mut stream: UnixStream,/fn start_detached\\(\\\\n    mut stream: UnixStream,/m' crates/amber/src/daemon.rs)",
+      "Bash(echo \"=== sysreg count + sample ===\")",
+      "Bash(grep -oE 'HV_SYS_REG_[A-Z0-9_]+ +\\(API_AVAILABLE\\\\\\([^\\)]*\\\\\\) +\\)?= 0x[0-9a-fA-F]+' __CMDSUB_OUTPUT__/System/Library/Frameworks/Hypervisor.framework/Headers/hv_vcpu_types.h)",
+      "Bash(python3 - __TRACKED_VAR__/hv_vcpu_types.h)"
+    ],
+    "additionalDirectories": [
+      "/private/tmp/snap"
     ]
   }
 }

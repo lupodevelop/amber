@@ -355,6 +355,18 @@ fn cmd_vm(args: &[String]) -> ExitCode {
     if let Some(bytes) = mem_size {
         cfg.mem_size = bytes;
     }
+    // Snapshot trigger (M3, de-risk): AMBER_SNAPSHOT=<dir> captures the VM after
+    // AMBER_SNAPSHOT_AFTER_MS (default 2000) and stops.
+    if let Ok(dir) = std::env::var("AMBER_SNAPSHOT") {
+        let ms: u64 = std::env::var("AMBER_SNAPSHOT_AFTER_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(2000);
+        cfg.snapshot = Some(amber_core::SnapshotReq {
+            after: std::time::Duration::from_millis(ms),
+            dir: dir.into(),
+        });
+    }
     // Restore earlycon + verbose boot dmesg for debugging (off by default because
     // the dmesg streams char-per-MMIO-exit and roughly doubles boot time).
     if std::env::var("AMBER_VERBOSE").is_ok() {

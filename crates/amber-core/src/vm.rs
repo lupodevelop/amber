@@ -40,6 +40,15 @@ pub struct VmConfig {
     /// Host image file to back the guest's virtio-blk root device (e.g. a
     /// squashfs base). None means no block device.
     pub disk: Option<PathBuf>,
+    /// If set, snapshot the VM to `dir` once it has run for `after`, then stop.
+    pub snapshot: Option<SnapshotReq>,
+}
+
+/// A request to capture a snapshot after the guest has run for a while.
+#[derive(Clone)]
+pub struct SnapshotReq {
+    pub after: std::time::Duration,
+    pub dir: PathBuf,
 }
 
 impl Default for VmConfig {
@@ -55,6 +64,7 @@ impl Default for VmConfig {
             // back for boot debugging).
             cmdline: "console=ttyAMA0 quiet".into(),
             disk: None,
+            snapshot: None,
         }
     }
 }
@@ -64,6 +74,7 @@ pub struct Vm {
     bus: MmioBus,
     pl011: Pl011,
     virtio: Vec<VirtioDev>,
+    snapshot: Option<SnapshotReq>,
     entry: u64,
     dtb_addr: u64,
     // Kept so the device tree can be built in `run`, once the backend has
@@ -99,6 +110,7 @@ impl Vm {
             bus: MmioBus::default(),
             pl011: Pl011::new(Box::new(std::io::stdout())),
             virtio,
+            snapshot: cfg.snapshot.clone(),
             entry: kernel.entry,
             dtb_addr,
             mem_size: cfg.mem_size as u64,
@@ -125,6 +137,7 @@ impl Vm {
             mut bus,
             pl011,
             mut virtio,
+            snapshot,
             entry,
             dtb_addr,
             mem_size,
@@ -176,6 +189,9 @@ impl Vm {
         let hv = &hv;
         let pl011 = &pl011;
         let running = &running;
+        let mem = &mem;
+        let snapshot = snapshot.as_ref();
+        let started = std::time::Instant::now();
 
         std::thread::scope(|s| {
             // Console reader: host stdin -> UART RX -> GIC line -> wake the vcpu.
@@ -183,6 +199,18 @@ impl Vm {
 
             // vcpu loop on this thread.
             let mut step = || -> Result<bool> {
+                // Snapshot point: the guest is stopped between runs, so its RAM
+                // and registers are consistent. Capture once the deadline passes,
+                // then stop (restore is a separate path).
+                if let Some(req) = snapshot {
+                    if started.elapsed() >= req.after {
+                        let cpu = vcpu.capture()?;
+                        let gic = hv.capture_gic()?;
+                        crate::snapshot::write(&req.dir, mem, &cpu, &gic)?;
+                        log::info!("snapshot captured to {}", req.dir.display());
+                        return Ok(false);
+                    }
+                }
                 match vcpu.run()? {
                     VmExit::Mmio { access } => {
                         let ipa = access.ipa;

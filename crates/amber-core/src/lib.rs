@@ -11,12 +11,13 @@ pub mod dtb;
 pub mod hypervisor;
 pub mod loader;
 pub mod memory;
+pub mod snapshot;
 pub mod virtio;
 mod vm;
 
 pub use hypervisor::{Hypervisor, Vcpu};
 pub use memory::GuestMemory;
-pub use vm::{Vm, VmConfig};
+pub use vm::{SnapshotReq, Vm, VmConfig};
 
 /// Where a backend placed its interrupt controller, so the device tree can
 /// advertise the matching addresses. Today only GICv3 (HVF now, KVM at M8). The
@@ -91,6 +92,8 @@ pub enum Error {
     GuestFault { pc: u64, esr: u64, ipa: u64 },
     /// A device backend failed (e.g. opening a disk image).
     Device(String),
+    /// Capturing or restoring a snapshot failed.
+    Snapshot(String),
 }
 
 impl std::fmt::Display for Error {
@@ -105,6 +108,7 @@ impl std::fmt::Display for Error {
                 "unhandled guest fault: pc={pc:#x} esr={esr:#x} ipa={ipa:#x}"
             ),
             Error::Device(m) => write!(f, "device error: {m}"),
+            Error::Snapshot(m) => write!(f, "snapshot error: {m}"),
         }
     }
 }

@@ -28,6 +28,8 @@ pub const HV_MEMORY_EXEC: u64 = 1 << 2;
 pub type hv_reg_t = u32;
 pub const HV_REG_X0: hv_reg_t = 0;
 pub const HV_REG_PC: hv_reg_t = 31; // VERIFY
+pub const HV_REG_FPCR: hv_reg_t = 32;
+pub const HV_REG_FPSR: hv_reg_t = 33;
 pub const HV_REG_CPSR: hv_reg_t = 34; // VERIFY
 
 // hv_exit_reason_t. VERIFY all four against hv_vcpu_types.h.
@@ -91,7 +93,21 @@ extern "C" {
     pub fn hv_gic_get_spi_interrupt_range(base: *mut u32, count: *mut u32) -> hv_return_t;
     // Set a shared peripheral interrupt's level by absolute INTID.
     pub fn hv_gic_set_spi(intid: u32, level: bool) -> hv_return_t;
+
+    // --- snapshot capture ---
+    // SIMD/FP registers Q0..Q31, 16 bytes each. The `value` out-pointer makes the
+    // ABI a plain 16-byte write (no NEON-vector-by-value hazard); used for capture.
+    pub fn hv_vcpu_get_simd_fp_reg(vcpu: hv_vcpu_t, reg: hv_simd_fp_reg_t, value: *mut [u8; 16]) -> hv_return_t;
+    // GIC state is an opaque object: create a snapshot, query its size, copy bytes.
+    pub fn hv_gic_state_create() -> hv_gic_state_t;
+    pub fn hv_gic_state_get_size(state: hv_gic_state_t, size: *mut usize) -> hv_return_t;
+    pub fn hv_gic_state_get_data(state: hv_gic_state_t, data: *mut c_void) -> hv_return_t;
 }
+
+/// SIMD/FP register id; Q0..Q31 are 0..=31.
+pub type hv_simd_fp_reg_t = u32;
+/// Opaque GIC state object (struct hv_gic_state_s *).
+pub type hv_gic_state_t = *mut c_void;
 
 // hv_sys_reg_t == uint16_t. Only the few amber reads/writes are named here.
 pub type hv_sys_reg_t = u16;

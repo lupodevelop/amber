@@ -30,6 +30,11 @@ pub trait Hypervisor: Sized {
     fn set_irq(&self, _intid: u32, _level: bool) -> Result<()> {
         Ok(())
     }
+
+    /// Capture the interrupt controller's state as an opaque blob for a snapshot.
+    fn capture_gic(&self) -> Result<Vec<u8>> {
+        Err(crate::Error::Snapshot("backend has no GIC capture".into()))
+    }
 }
 
 pub trait Vcpu {
@@ -61,6 +66,11 @@ pub trait Vcpu {
     /// means no armed timer (park until another event, e.g. console input).
     fn pending_timer_ns(&self) -> Result<Option<u64>> {
         Ok(None)
+    }
+
+    /// Capture this vcpu's register state for a snapshot (taken while stopped).
+    fn capture(&self) -> Result<crate::snapshot::CpuSnapshot> {
+        Err(crate::Error::Snapshot("backend has no vcpu capture".into()))
     }
 }
 

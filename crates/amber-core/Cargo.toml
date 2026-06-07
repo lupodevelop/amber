@@ -9,3 +9,5 @@ repository.workspace = true
 libc.workspace = true
 vm-fdt.workspace = true
 log.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

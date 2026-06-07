@@ -3,8 +3,10 @@
 //! raw HVF exit into the shared `VmExit` vocabulary.
 
 mod ffi;
+mod sysregs;
 
 use amber_core::hypervisor::{decode_data_abort, Hypervisor, Vcpu, VmExit};
+use amber_core::snapshot::CpuSnapshot;
 use amber_core::{Error, GicInfo, GuestMemory, Result};
 use ffi::*;
 
@@ -72,6 +74,24 @@ impl Hypervisor for HvfVm {
 
     fn set_irq(&self, intid: u32, level: bool) -> Result<()> {
         unsafe { check(hv_gic_set_spi(intid, level), "hv_gic_set_spi") }
+    }
+
+    fn capture_gic(&self) -> Result<Vec<u8>> {
+        unsafe {
+            let state = hv_gic_state_create();
+            if state.is_null() {
+                return Err(Error::Snapshot("hv_gic_state_create returned null".into()));
+            }
+            let mut size = 0usize;
+            check(hv_gic_state_get_size(state, &mut size), "gic state size")?;
+            let mut buf = vec![0u8; size];
+            check(
+                hv_gic_state_get_data(state, buf.as_mut_ptr() as *mut _),
+                "gic state data",
+            )?;
+            // `state` is an os_object; leak it (snapshot is a one-time event).
+            Ok(buf)
+        }
     }
 }
 
@@ -250,6 +270,46 @@ impl Vcpu for HvfVcpu {
         } else {
             mach_ticks_to_ns(cval - now)
         }))
+    }
+
+    fn capture(&self) -> Result<CpuSnapshot> {
+        let mut x = Vec::with_capacity(31);
+        for i in 0..31 {
+            x.push(self.reg(HV_REG_X0 + i)?);
+        }
+        let mut vtimer_offset = 0u64;
+        unsafe {
+            check(hv_vcpu_get_vtimer_offset(self.handle, &mut vtimer_offset), "vtimer offset")?;
+        }
+
+        // System registers: read every one HVF exposes; skip any that refuse
+        // (some are conditionally present), recording (id, value) verbatim.
+        let mut sysregs = Vec::with_capacity(sysregs::SYS_REGS.len());
+        for &(id, _name) in sysregs::SYS_REGS {
+            let mut v = 0u64;
+            if unsafe { hv_vcpu_get_sys_reg(self.handle, id, &mut v) } == HV_SUCCESS {
+                sysregs.push((id, v));
+            }
+        }
+
+        // SIMD/FP file V0..V31.
+        let mut fp = Vec::with_capacity(32);
+        for q in 0..32u32 {
+            let mut v = [0u8; 16];
+            unsafe { hv_vcpu_get_simd_fp_reg(self.handle, q, &mut v) };
+            fp.push(v);
+        }
+
+        Ok(CpuSnapshot {
+            x,
+            pc: self.reg(HV_REG_PC)?,
+            cpsr: self.reg(HV_REG_CPSR)?,
+            fpcr: self.reg(HV_REG_FPCR)?,
+            fpsr: self.reg(HV_REG_FPSR)?,
+            vtimer_offset,
+            sysregs,
+            fp,
+        })
     }
 
     fn run(&mut self) -> Result<VmExit> {
