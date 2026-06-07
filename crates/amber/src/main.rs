@@ -477,6 +477,7 @@ mod guest {
     pub const MODULES: &[&str] = &[
         "drivers/virtio/virtio_mmio.ko",
         "drivers/block/virtio_blk.ko",
+        "drivers/virtio/virtio_balloon.ko",
         "drivers/char/hw_random/rng-core.ko",
         "drivers/char/hw_random/virtio-rng.ko",
         "fs/squashfs/squashfs.ko",

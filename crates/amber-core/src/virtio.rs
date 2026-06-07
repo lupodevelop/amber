@@ -72,39 +72,46 @@ pub trait VirtioDevice {
     fn config(&self, _off: u64) -> u32 {
         0
     }
-    /// Service one descriptor chain; return the number of bytes the device wrote
-    /// into guest memory (the used-ring length).
-    fn handle(&mut self, ram: &GuestRam, bufs: &[Buf]) -> u32;
+    /// How many virtqueues this device has.
+    fn num_queues(&self) -> usize {
+        1
+    }
+    /// Service one descriptor chain on `queue`; return the number of bytes the
+    /// device wrote into guest memory (the used-ring length).
+    fn handle(&mut self, queue: usize, ram: &GuestRam, bufs: &[Buf]) -> u32;
 }
 
-/// The virtio-mmio transport wrapping one device and one virtqueue.
+#[derive(Default, Clone, Copy)]
+struct Queue {
+    num: u32,
+    ready: u32,
+    desc: u64,
+    avail: u64,
+    used: u64,
+    last_avail: u16,
+}
+
+/// The virtio-mmio transport wrapping one device and its virtqueues.
 pub struct VirtioMmio {
     dev: Box<dyn VirtioDevice>,
     ram: Option<GuestRam>,
     device_features_sel: u32,
     status: u32,
-    queue_num: u32,
-    queue_ready: u32,
-    desc: u64,
-    avail: u64,
-    used: u64,
-    last_avail: u16,
+    queue_sel: usize,
+    queues: Vec<Queue>,
     interrupt_status: u32,
 }
 
 impl VirtioMmio {
     pub fn new(dev: Box<dyn VirtioDevice>) -> Self {
+        let n = dev.num_queues().max(1);
         Self {
             dev,
             ram: None,
             device_features_sel: 0,
             status: 0,
-            queue_num: 0,
-            queue_ready: 0,
-            desc: 0,
-            avail: 0,
-            used: 0,
-            last_avail: 0,
+            queue_sel: 0,
+            queues: vec![Queue::default(); n],
             interrupt_status: 0,
         }
     }
@@ -118,6 +125,7 @@ impl VirtioMmio {
     }
 
     pub fn read(&mut self, offset: u64, _size: u8) -> u64 {
+        let q = self.queues.get(self.queue_sel).copied().unwrap_or_default();
         let v = match offset {
             MAGIC => VIRTIO_MAGIC,
             VERSION => 2,
@@ -130,8 +138,15 @@ impl VirtioMmio {
                 }
                 f
             }
-            QUEUE_NUM_MAX => QUEUE_MAX,
-            QUEUE_READY => self.queue_ready,
+            // A selected queue that exists has the max size; past the end, 0.
+            QUEUE_NUM_MAX => {
+                if self.queue_sel < self.queues.len() {
+                    QUEUE_MAX
+                } else {
+                    0
+                }
+            }
+            QUEUE_READY => q.ready,
             INTERRUPT_STATUS => self.interrupt_status,
             STATUS => self.status,
             CONFIG_GENERATION => 0,
@@ -143,12 +158,14 @@ impl VirtioMmio {
 
     pub fn write(&mut self, offset: u64, _size: u8, value: u64) {
         let v = value as u32;
+        let sel = self.queue_sel;
         match offset {
             DEVICE_FEATURES_SEL => self.device_features_sel = v,
-            DRIVER_FEATURES | DRIVER_FEATURES_SEL | QUEUE_SEL => {}
-            QUEUE_NUM => self.queue_num = v,
-            QUEUE_READY => self.queue_ready = v,
-            QUEUE_NOTIFY => self.process(),
+            DRIVER_FEATURES | DRIVER_FEATURES_SEL => {}
+            QUEUE_SEL => self.queue_sel = v as usize,
+            QUEUE_NUM => self.with_queue(sel, |q| q.num = v),
+            QUEUE_READY => self.with_queue(sel, |q| q.ready = v),
+            QUEUE_NOTIFY => self.process(v as usize),
             INTERRUPT_ACK => self.interrupt_status &= !v,
             STATUS => {
                 self.status = v;
@@ -156,77 +173,83 @@ impl VirtioMmio {
                     self.reset();
                 }
             }
-            QUEUE_DESC_LOW => self.desc = (self.desc & !0xffff_ffff) | v as u64,
-            QUEUE_DESC_HIGH => self.desc = (self.desc & 0xffff_ffff) | ((v as u64) << 32),
-            QUEUE_DRIVER_LOW => self.avail = (self.avail & !0xffff_ffff) | v as u64,
-            QUEUE_DRIVER_HIGH => self.avail = (self.avail & 0xffff_ffff) | ((v as u64) << 32),
-            QUEUE_DEVICE_LOW => self.used = (self.used & !0xffff_ffff) | v as u64,
-            QUEUE_DEVICE_HIGH => self.used = (self.used & 0xffff_ffff) | ((v as u64) << 32),
+            QUEUE_DESC_LOW => self.with_queue(sel, |q| q.desc = (q.desc & !0xffff_ffff) | v as u64),
+            QUEUE_DESC_HIGH => self.with_queue(sel, |q| q.desc = (q.desc & 0xffff_ffff) | ((v as u64) << 32)),
+            QUEUE_DRIVER_LOW => self.with_queue(sel, |q| q.avail = (q.avail & !0xffff_ffff) | v as u64),
+            QUEUE_DRIVER_HIGH => self.with_queue(sel, |q| q.avail = (q.avail & 0xffff_ffff) | ((v as u64) << 32)),
+            QUEUE_DEVICE_LOW => self.with_queue(sel, |q| q.used = (q.used & !0xffff_ffff) | v as u64),
+            QUEUE_DEVICE_HIGH => self.with_queue(sel, |q| q.used = (q.used & 0xffff_ffff) | ((v as u64) << 32)),
             _ => {}
         }
     }
 
-    fn reset(&mut self) {
-        self.queue_ready = 0;
-        self.last_avail = 0;
-        self.interrupt_status = 0;
-        self.desc = 0;
-        self.avail = 0;
-        self.used = 0;
+    fn with_queue(&mut self, sel: usize, f: impl FnOnce(&mut Queue)) {
+        if let Some(q) = self.queues.get_mut(sel) {
+            f(q);
+        }
     }
 
-    fn process(&mut self) {
+    fn reset(&mut self) {
+        self.interrupt_status = 0;
+        for q in &mut self.queues {
+            *q = Queue::default();
+        }
+    }
+
+    fn process(&mut self, qidx: usize) {
         let Some(ram) = self.ram else { return };
-        if self.queue_ready == 0 || self.queue_num == 0 {
+        let Some(mut q) = self.queues.get(qidx).copied() else { return };
+        if q.ready == 0 || q.num == 0 {
             return;
         }
-        let qsz = self.queue_num as u16;
-        let avail_idx = ram.read_u16(self.avail + 2);
+        let qsz = q.num as u16;
+        let avail_idx = ram.read_u16(q.avail + 2);
 
         let mut progressed = false;
-        while self.last_avail != avail_idx {
-            let slot = self.last_avail % qsz;
-            let head = ram.read_u16(self.avail + 4 + 2 * slot as u64);
-            let bufs = self.collect_chain(&ram, head, qsz);
-            let written = self.dev.handle(&ram, &bufs);
-            self.push_used(&ram, head as u32, written, qsz);
-            self.last_avail = self.last_avail.wrapping_add(1);
+        while q.last_avail != avail_idx {
+            let slot = q.last_avail % qsz;
+            let head = ram.read_u16(q.avail + 4 + 2 * slot as u64);
+            let bufs = collect_chain(&ram, q.desc, head, qsz);
+            let written = self.dev.handle(qidx, &ram, &bufs);
+            push_used(&ram, q.used, head as u32, written, qsz);
+            q.last_avail = q.last_avail.wrapping_add(1);
             progressed = true;
         }
+        self.queues[qidx].last_avail = q.last_avail;
         if progressed {
             self.interrupt_status |= 1; // used buffer notification
         }
     }
+}
 
-    fn collect_chain(&self, ram: &GuestRam, head: u16, qsz: u16) -> Vec<Buf> {
-        let mut bufs = Vec::new();
-        let mut i = head;
-        loop {
-            let d = self.desc + 16 * i as u64;
-            let addr = ram.read_u64(d);
-            let len = ram.read_u32(d + 8);
-            let flags = ram.read_u16(d + 12);
-            let next = ram.read_u16(d + 14);
-            bufs.push(Buf {
-                addr,
-                len,
-                writable: flags & VIRTQ_DESC_F_WRITE != 0,
-            });
-            if flags & VIRTQ_DESC_F_NEXT == 0 || bufs.len() > qsz as usize {
-                break;
-            }
-            i = next;
+fn collect_chain(ram: &GuestRam, desc: u64, head: u16, qsz: u16) -> Vec<Buf> {
+    let mut bufs = Vec::new();
+    let mut i = head;
+    loop {
+        let d = desc + 16 * i as u64;
+        let addr = ram.read_u64(d);
+        let len = ram.read_u32(d + 8);
+        let flags = ram.read_u16(d + 12);
+        let next = ram.read_u16(d + 14);
+        bufs.push(Buf {
+            addr,
+            len,
+            writable: flags & VIRTQ_DESC_F_WRITE != 0,
+        });
+        if flags & VIRTQ_DESC_F_NEXT == 0 || bufs.len() > qsz as usize {
+            break;
         }
-        bufs
+        i = next;
     }
+    bufs
+}
 
-    fn push_used(&self, ram: &GuestRam, id: u32, len: u32, qsz: u16) {
-        let idx = ram.read_u16(self.used + 2);
-        let elem = self.used + 4 + 8 * (idx % qsz) as u64;
-        ram.write_u32(elem, id);
-        ram.write_u32(elem + 4, len);
-        ram.write_u16(self.used + 2, idx.wrapping_add(1));
-    }
+fn push_used(ram: &GuestRam, used: u64, id: u32, len: u32, qsz: u16) {
+    let idx = ram.read_u16(used + 2);
+    let elem = used + 4 + 8 * (idx % qsz) as u64;
+    ram.write_u32(elem, id);
+    ram.write_u32(elem + 4, len);
+    ram.write_u16(used + 2, idx.wrapping_add(1));
 }
 
 /// virtio-blk, read-only. The base is a read-only image (squashfs); the guest
@@ -277,7 +300,7 @@ impl VirtioDevice for BlkDevice {
 
     /// Chain is [header(RO), data...(WO), status(WO,1)]. Fill data from disk for
     /// an IN request and write status = OK.
-    fn handle(&mut self, ram: &GuestRam, bufs: &[Buf]) -> u32 {
+    fn handle(&mut self, _queue: usize, ram: &GuestRam, bufs: &[Buf]) -> u32 {
         if bufs.len() < 2 {
             return 0;
         }
@@ -326,7 +349,7 @@ impl VirtioDevice for RngDevice {
         Self::DEVICE_ID
     }
 
-    fn handle(&mut self, ram: &GuestRam, bufs: &[Buf]) -> u32 {
+    fn handle(&mut self, _queue: usize, ram: &GuestRam, bufs: &[Buf]) -> u32 {
         let mut written = 0;
         for b in bufs.iter().filter(|b| b.writable) {
             let mut data = vec![0u8; b.len as usize];
@@ -337,5 +360,56 @@ impl VirtioDevice for RngDevice {
             written += b.len;
         }
         written
+    }
+}
+
+/// virtio-balloon, free-page-reporting only. The guest proactively hands the host
+/// ranges of its free RAM on the reporting queue; we `madvise` the host pages
+/// reusable so the VM's real footprint shrinks back toward what the guest
+/// actually uses — the cheapest RAM-coexistence lever (MEMORY.md). We never
+/// inflate (num_pages stays 0), so the guest keeps all its RAM; only genuinely
+/// free pages are dropped from the host.
+pub struct BalloonDevice;
+
+impl BalloonDevice {
+    const DEVICE_ID: u32 = 5;
+    // Features (low word): only free-page reporting (bit 5).
+    const F_REPORTING: u32 = 1 << 5;
+    // With only F_REPORTING the queues are inflate(0), deflate(1), reporting(2).
+    const REPORTING_VQ: usize = 2;
+    // macOS: mark pages reusable and immediately drop them from the resident set.
+    const MADV_FREE_REUSABLE: i32 = 7;
+}
+
+impl VirtioDevice for BalloonDevice {
+    fn device_id(&self) -> u32 {
+        Self::DEVICE_ID
+    }
+
+    fn device_features(&self, sel: u32) -> u32 {
+        if sel == 0 {
+            Self::F_REPORTING
+        } else {
+            0
+        }
+    }
+
+    fn num_queues(&self) -> usize {
+        3
+    }
+
+    /// On the reporting queue each descriptor is a range of free guest RAM; hand
+    /// the backing host pages back to the OS. Inflate/deflate are unused (we set
+    /// no target), so they just complete.
+    fn handle(&mut self, queue: usize, ram: &GuestRam, bufs: &[Buf]) -> u32 {
+        if queue == Self::REPORTING_VQ {
+            for b in bufs {
+                let len = b.len as usize;
+                if let Some(p) = ram.host_ptr_at(b.addr, len) {
+                    unsafe { libc::madvise(p as *mut libc::c_void, len, Self::MADV_FREE_REUSABLE) };
+                }
+            }
+        }
+        0
     }
 }

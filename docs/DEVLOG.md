@@ -560,6 +560,34 @@ the cap reserves 256 but the live footprint is 139 MiB (touched guest pages + th
 34 MB kernel image + amber overhead). This is the measurement that the next step
 (free-page reporting) will visibly shrink.
 
+### Step 3 — virtio-balloon free-page reporting (active reclaim)
+
+The cheapest reclaim lever (MEMORY.md), and the one buildable without an
+amberd↔child control channel: it's **guest-driven**, handled entirely inside the
+VM process. The guest's balloon driver, with `VIRTIO_BALLOON_F_REPORTING`,
+proactively hands the host ranges of its *free* RAM on a reporting queue; the
+device `madvise`s the backing host pages (macOS `MADV_FREE_REUSABLE`) so they
+leave the resident set. We never inflate (`num_pages` stays 0), so the guest
+keeps all its RAM — only genuinely free pages are dropped.
+
+This needed a real device-model extension: the virtio-mmio transport was
+**single-queue**, but balloon has three (inflate/deflate/reporting). Generalised
+`VirtioMmio` to N queues selected by `QueueSel`, each with its own
+desc/avail/used/ready state, and added `VirtioDevice::num_queues` + a queue index
+to `handle`. blk and rng (one queue each) were unaffected — the block device kept
+booting `/dev/vda` through the new transport.
+
+`BalloonDevice` (device id 5) advertises only `F_REPORTING`; on the reporting
+queue it `madvise`s each reported range via a new `GuestRam::host_ptr_at`. Loaded
+`virtio_balloon.ko` in the bootstrap initramfs.
+
+Demonstrated end to end: a VM that `dd`s 120 MiB into its tmpfs overlay then
+deletes it: RSS **145 MiB (boot) → 264 MiB (allocated) → 52 MiB (freed)**. The
+guest gave the RAM back and the host reclaimed it — real footprint shrank below
+even the boot baseline (boot-time free pages were reported too). Combined with
+step 2's accounting, this is the coexistence story working: cap reserves the
+ceiling for admission, while the real footprint stays small and elastic.
+
 ---
 
 ## Cross-cutting choices

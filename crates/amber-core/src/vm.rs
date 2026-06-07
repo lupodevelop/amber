@@ -4,7 +4,7 @@
 
 use crate::bus::{MmioBus, Pl011};
 use crate::hypervisor::{Hypervisor, MmioOp, Vcpu, VmExit};
-use crate::virtio::{BlkDevice, RngDevice, VirtioDevice, VirtioMmio};
+use crate::virtio::{BalloonDevice, BlkDevice, RngDevice, VirtioDevice, VirtioMmio};
 use crate::{dtb, layout, loader, GuestMemory, Result};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -107,6 +107,8 @@ impl Vm {
         }
         let i = virtio.len();
         virtio.push(VirtioDev::new(i, Box::new(RngDevice::open()?)));
+        let i = virtio.len();
+        virtio.push(VirtioDev::new(i, Box::new(BalloonDevice)));
 
         Ok(Self {
             mem,
@@ -139,6 +141,8 @@ impl Vm {
         }
         let i = virtio.len();
         virtio.push(VirtioDev::new(i, Box::new(RngDevice::open()?)));
+        let i = virtio.len();
+        virtio.push(VirtioDev::new(i, Box::new(BalloonDevice)));
 
         Ok(Self {
             mem,

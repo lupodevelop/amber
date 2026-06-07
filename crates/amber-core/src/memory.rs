@@ -96,6 +96,13 @@ impl GuestRam {
         (off.checked_add(n)? <= self.len).then_some(off)
     }
 
+    /// Host pointer for a guest-physical range, if it lies within RAM. Used by
+    /// the balloon to `madvise` guest-reported free pages.
+    pub fn host_ptr_at(&self, gpa: u64, len: usize) -> Option<*mut u8> {
+        let off = self.offset(gpa, len)?;
+        Some(unsafe { self.host.add(off) })
+    }
+
     pub fn read(&self, gpa: u64, buf: &mut [u8]) -> bool {
         match self.offset(gpa, buf.len()) {
             Some(off) => unsafe {
