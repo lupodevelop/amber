@@ -16,9 +16,13 @@ build journal (bugs, decisions, measurements) is in [`docs/DEVLOG.md`](docs/DEVL
 | M0.5 | GICv3 + architected timer; interactive PL011 console (RX/TX) |
 | M1 | `amber run <image>`: pull OCI, flatten, squashfs base + tmpfs overlay, virtio-blk, virtio-rng |
 | M2 | `amber.toml` templates; `amberd` daemon over a unix socket; `run`/`ps`/`rm`/`logs`; image cache; `-d` detached |
+| M3 | snapshot **capture + restore**: a VM resumes mid-execution from disk (the periodic-timer re-arm is an HVF gap — see DEVLOG; clean on KVM) |
+| M5 | RAM coexistence: fleet `ram_budget` + admission control; real RSS accounting; **virtio-balloon free-page reporting** (the guest returns free RAM, the host reclaims it) |
 
 Warm spawn is ~**80 ms** (`amber run alpine -- true`), of which host overhead is
-~5 ms — the rest is the guest kernel boot. Cold (first pull) is ~3 s.
+~5 ms — the rest is the guest kernel boot. Cold (first pull) is ~3 s. A VM's real
+footprint is elastic: free pages are returned to the host (e.g. 264 MiB → 52 MiB
+after the guest frees memory).
 
 ## Build
 
@@ -45,10 +49,15 @@ amber run pytools -- pytest -q
 # a persistent daemon + fleet
 amber up                       # start amberd (warms nothing yet)
 amber run -d alpine -- sh -c 'sleep 300'   # detached, prints a VM id
-amber ps                       # ID / PID / AGE / IMAGE
+amber ps                       # ID / PID / AGE / CAP / RSS / IMAGE
 amber logs <id>                # the VM's captured output
 amber rm <id>                  # kill it
+amber budget                   # fleet RAM budget, reserved vs real, vs machine
 amber down                     # stop amberd (reaps all VMs)
+
+# snapshot (M3): capture a running VM, restore it later (resumes mid-execution)
+AMBER_SNAPSHOT=/tmp/snap amber run alpine -- sh -c 'while true; do echo .; sleep 1; done'
+amber restore /tmp/snap
 ```
 
 `amber run` routes through `amberd` if one is up (interactive console, full

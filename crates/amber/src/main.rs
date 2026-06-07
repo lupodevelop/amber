@@ -107,7 +107,7 @@ fn cmd_budget() -> ExitCode {
         return ExitCode::FAILURE;
     }
     match daemon::budget() {
-        Ok((budget, used, rss)) => {
+        Ok((budget, used, rss, machine)) => {
             let mib = |b: u64| b / (1024 * 1024);
             if budget == 0 {
                 println!("budget: unlimited    reserved: {} MiB    real: {} MiB", mib(used), mib(rss));
@@ -118,6 +118,13 @@ fn cmd_budget() -> ExitCode {
                     mib(used),
                     mib(budget.saturating_sub(used)),
                     mib(rss)
+                );
+            }
+            if machine > 0 {
+                println!(
+                    "machine: {} MiB    left for model+host: {} MiB",
+                    mib(machine),
+                    mib(machine.saturating_sub(if budget == 0 { rss } else { budget }))
                 );
             }
             ExitCode::SUCCESS

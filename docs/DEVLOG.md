@@ -588,6 +588,22 @@ even the boot baseline (boot-time free pages were reported too). Combined with
 step 2's accounting, this is the coexistence story working: cap reserves the
 ceiling for admission, while the real footprint stays small and elastic.
 
+### Step 4 — budget vs the machine
+
+Tied the budget to the host: `amber budget` now reads `hw.memsize` and shows the
+fleet ceiling against total RAM and the headroom left for the resident model —
+e.g. `budget 4096 MiB of 16384 MiB machine, 12288 MiB left for model+host`. This
+is the thesis made legible: the fleet is capped at a *fraction* of the machine on
+purpose, and the rest is the model's. (A tagged, never-reclaimed model *region*
+is the remaining refinement; today the headroom is implicit in `budget <
+machine`.)
+
+**M5 on HVF, achievable levers, done:** admission control, real-RSS accounting,
+and free-page reporting (passive reclaim). The two remaining levers need other
+milestones: active balloon *under pressure* needs an amberd↔child control channel
+(M7-shaped), and pool eviction needs the warm pool (M4, which is gated on the
+snapshot timer / KVM).
+
 ---
 
 ## Cross-cutting choices

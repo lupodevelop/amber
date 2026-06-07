@@ -56,6 +56,17 @@ fn ram_budget() -> Option<u64> {
         .map(|b| b as u64)
 }
 
+/// Total host RAM in bytes (via `sysctl hw.memsize`; 0 if unavailable).
+fn machine_ram() -> u64 {
+    Command::new("sysctl")
+        .args(["-n", "hw.memsize"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
 /// Real resident memory of a process, in bytes (via `ps`; 0 if unavailable).
 fn rss_bytes(pid: u32) -> u64 {
     if pid == 0 {
@@ -198,7 +209,10 @@ fn handle(
             };
             let used: u64 = pids.iter().map(|(ram, _)| ram).sum();
             let rss: u64 = pids.iter().map(|(_, pid)| rss_bytes(*pid)).sum();
-            write_reply(&mut stream, &Reply::Budget { budget: ram_budget().unwrap_or(0), used, rss })?;
+            write_reply(
+                &mut stream,
+                &Reply::Budget { budget: ram_budget().unwrap_or(0), used, rss, machine: machine_ram() },
+            )?;
         }
         Request::Kill { id } => {
             // Signal the owner thread; it kills and reaps the child it owns.
@@ -496,10 +510,10 @@ pub fn run_detached(reference: &str, argv: &[String]) -> io::Result<String> {
     }
 }
 
-/// The fleet RAM budget, cap-based usage, and real RSS in bytes (0 = unlimited).
-pub fn budget() -> io::Result<(u64, u64, u64)> {
+/// Fleet RAM budget, cap-based usage, real RSS, and host RAM, in bytes.
+pub fn budget() -> io::Result<(u64, u64, u64, u64)> {
     match request(&Request::Budget)? {
-        Reply::Budget { budget, used, rss } => Ok((budget, used, rss)),
+        Reply::Budget { budget, used, rss, machine } => Ok((budget, used, rss, machine)),
         Reply::Error { message } => Err(io::Error::other(message)),
         _ => Err(io::Error::other("unexpected reply")),
     }
