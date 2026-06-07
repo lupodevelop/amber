@@ -107,16 +107,17 @@ fn cmd_budget() -> ExitCode {
         return ExitCode::FAILURE;
     }
     match daemon::budget() {
-        Ok((budget, used)) => {
+        Ok((budget, used, rss)) => {
             let mib = |b: u64| b / (1024 * 1024);
             if budget == 0 {
-                println!("budget: unlimited    used: {} MiB", mib(used));
+                println!("budget: unlimited    reserved: {} MiB    real: {} MiB", mib(used), mib(rss));
             } else {
                 println!(
-                    "budget: {} MiB    used: {} MiB    free: {} MiB",
+                    "budget: {} MiB    reserved: {} MiB    free: {} MiB    real: {} MiB",
                     mib(budget),
                     mib(used),
-                    mib(budget.saturating_sub(used))
+                    mib(budget.saturating_sub(used)),
+                    mib(rss)
                 );
             }
             ExitCode::SUCCESS
@@ -211,14 +212,15 @@ fn cmd_ps() -> ExitCode {
     match daemon::list() {
         Ok(vms) => {
             let now = proto::now_secs();
-            println!("{:<8} {:<8} {:<6} {:<8} IMAGE", "ID", "PID", "AGE", "MEM");
+            println!("{:<8} {:<8} {:<6} {:<8} {:<8} IMAGE", "ID", "PID", "AGE", "CAP", "RSS");
             for v in vms {
                 println!(
-                    "{:<8} {:<8} {:<6} {:<8} {}",
+                    "{:<8} {:<8} {:<6} {:<8} {:<8} {}",
                     v.id,
                     v.pid,
                     fmt_age(now.saturating_sub(v.started)),
                     format!("{}M", v.ram_bytes / (1024 * 1024)),
+                    format!("{}M", v.rss_bytes / (1024 * 1024)),
                     v.reference
                 );
             }

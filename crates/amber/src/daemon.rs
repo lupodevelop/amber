@@ -56,8 +56,19 @@ fn ram_budget() -> Option<u64> {
         .map(|b| b as u64)
 }
 
-fn ram_used(reg: &Registry) -> u64 {
-    reg.lock().unwrap().values().map(|e| e.info.ram_bytes).sum()
+/// Real resident memory of a process, in bytes (via `ps`; 0 if unavailable).
+fn rss_bytes(pid: u32) -> u64 {
+    if pid == 0 {
+        return 0;
+    }
+    Command::new("ps")
+        .args(["-o", "rss=", "-p", &pid.to_string()])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(|kb| kb * 1024)
+        .unwrap_or(0)
 }
 
 /// Atomically admit and reserve a slot for a new VM, or refuse to protect the
@@ -92,6 +103,7 @@ fn reserve(
                 pid: 0,
                 started: proto::now_secs(),
                 ram_bytes: requested,
+                rss_bytes: 0,
             },
             kill: kill.clone(),
         },
@@ -172,13 +184,21 @@ fn handle(
 
     match req {
         Request::List => {
-            let vms = reg.lock().unwrap().values().map(|e| e.info.clone()).collect();
+            // Snapshot under the lock, then sample RSS (a subprocess) unlocked.
+            let mut vms: Vec<VmInfo> = reg.lock().unwrap().values().map(|e| e.info.clone()).collect();
+            for v in &mut vms {
+                v.rss_bytes = rss_bytes(v.pid);
+            }
             write_reply(&mut stream, &Reply::Vms { vms })?;
         }
         Request::Budget => {
-            let budget = ram_budget().unwrap_or(0);
-            let used = ram_used(&reg);
-            write_reply(&mut stream, &Reply::Budget { budget, used })?;
+            let pids: Vec<(u64, u32)> = {
+                let g = reg.lock().unwrap();
+                g.values().map(|e| (e.info.ram_bytes, e.info.pid)).collect()
+            };
+            let used: u64 = pids.iter().map(|(ram, _)| ram).sum();
+            let rss: u64 = pids.iter().map(|(_, pid)| rss_bytes(*pid)).sum();
+            write_reply(&mut stream, &Reply::Budget { budget: ram_budget().unwrap_or(0), used, rss })?;
         }
         Request::Kill { id } => {
             // Signal the owner thread; it kills and reaps the child it owns.
@@ -476,10 +496,10 @@ pub fn run_detached(reference: &str, argv: &[String]) -> io::Result<String> {
     }
 }
 
-/// The fleet RAM budget and usage in bytes (`budget` 0 = unlimited).
-pub fn budget() -> io::Result<(u64, u64)> {
+/// The fleet RAM budget, cap-based usage, and real RSS in bytes (0 = unlimited).
+pub fn budget() -> io::Result<(u64, u64, u64)> {
     match request(&Request::Budget)? {
-        Reply::Budget { budget, used } => Ok((budget, used)),
+        Reply::Budget { budget, used, rss } => Ok((budget, used, rss)),
         Reply::Error { message } => Err(io::Error::other(message)),
         _ => Err(io::Error::other("unexpected reply")),
     }

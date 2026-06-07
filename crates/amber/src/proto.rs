@@ -58,8 +58,10 @@ pub enum Reply {
     Started { id: String },
     /// The live VM list.
     Vms { vms: Vec<VmInfo> },
-    /// The fleet RAM budget and current usage, in bytes (`budget` 0 = unlimited).
-    Budget { budget: u64, used: u64 },
+    /// The fleet RAM budget and usage, in bytes (`budget` 0 = unlimited). `used`
+    /// is the cap-based reservation (what admission counts); `rss` is the real
+    /// resident footprint of the live VMs.
+    Budget { budget: u64, used: u64, rss: u64 },
     /// Admission refused to protect the budget. All values in bytes.
     BudgetExceeded { budget: u64, used: u64, requested: u64 },
     /// Generic acknowledgement.
@@ -77,6 +79,8 @@ pub struct VmInfo {
     pub started: u64,
     /// RAM this VM is accounted at against the fleet budget, in bytes.
     pub ram_bytes: u64,
+    /// Real resident memory of the VM process, sampled when listed (0 otherwise).
+    pub rss_bytes: u64,
 }
 
 /// Current Unix time in whole seconds.

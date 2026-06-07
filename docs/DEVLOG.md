@@ -548,6 +548,18 @@ outside the lock.
 This is admission control only — the *reclaim* levers (free-page reporting,
 balloon, pool eviction) come next. Pool eviction waits for M4; the others don't.
 
+### Step 2 — real RSS accounting
+
+Admission counts each VM's `ram_cap` (a reservation), but the *real* footprint is
+smaller — and showing that is half the coexistence story (and the DESIGN's "idle
+overhead per VM" number). The daemon now samples each VM process's resident set
+(via `ps -o rss=`, sampled outside the registry lock) and reports it: `ps` shows
+`CAP` (reserved) next to `RSS` (real), and `amber budget` shows `reserved` vs
+`real`. Verified: a `ram_cap = 256MiB` Alpine VM shows `CAP 256M / RSS 139M` —
+the cap reserves 256 but the live footprint is 139 MiB (touched guest pages + the
+34 MB kernel image + amber overhead). This is the measurement that the next step
+(free-page reporting) will visibly shrink.
+
 ---
 
 ## Cross-cutting choices
