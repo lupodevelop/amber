@@ -36,6 +36,7 @@ fn main() -> ExitCode {
         Some("ps") => cmd_ps(),
         Some("rm") => cmd_rm(&args),
         Some("logs") => cmd_logs(&args),
+        Some("budget") => cmd_budget(),
         Some("pull") => cmd_pull(&args),
         Some("restore") => cmd_restore(&args),
         Some("boot") => cmd_boot(&args),
@@ -95,6 +96,33 @@ fn cmd_run(args: &[String]) -> ExitCode {
         Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
         Err(e) => {
             eprintln!("run failed: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn cmd_budget() -> ExitCode {
+    if !daemon::running() {
+        eprintln!("no amberd (run 'amber up')");
+        return ExitCode::FAILURE;
+    }
+    match daemon::budget() {
+        Ok((budget, used)) => {
+            let mib = |b: u64| b / (1024 * 1024);
+            if budget == 0 {
+                println!("budget: unlimited    used: {} MiB", mib(used));
+            } else {
+                println!(
+                    "budget: {} MiB    used: {} MiB    free: {} MiB",
+                    mib(budget),
+                    mib(used),
+                    mib(budget.saturating_sub(used))
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("budget failed: {e}");
             ExitCode::FAILURE
         }
     }
@@ -183,9 +211,16 @@ fn cmd_ps() -> ExitCode {
     match daemon::list() {
         Ok(vms) => {
             let now = proto::now_secs();
-            println!("{:<8} {:<8} {:<6} IMAGE", "ID", "PID", "AGE");
+            println!("{:<8} {:<8} {:<6} {:<8} IMAGE", "ID", "PID", "AGE", "MEM");
             for v in vms {
-                println!("{:<8} {:<8} {:<6} {}", v.id, v.pid, fmt_age(now.saturating_sub(v.started)), v.reference);
+                println!(
+                    "{:<8} {:<8} {:<6} {:<8} {}",
+                    v.id,
+                    v.pid,
+                    fmt_age(now.saturating_sub(v.started)),
+                    format!("{}M", v.ram_bytes / (1024 * 1024)),
+                    v.reference
+                );
             }
             ExitCode::SUCCESS
         }

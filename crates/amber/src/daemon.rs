@@ -31,6 +31,81 @@ struct VmEntry {
 
 type Registry = Arc<Mutex<HashMap<String, VmEntry>>>;
 
+/// Default per-VM RAM when no template `ram_cap` applies (matches `VmConfig`).
+const DEFAULT_MEM_BYTES: u64 = 512 * 1024 * 1024;
+
+// ---- budget (M5 admission control) ----
+
+/// RAM a VM is accounted at: its template's `ram_cap`, else the default.
+fn vm_ram_bytes(target: &str) -> u64 {
+    crate::manifest::Manifest::load()
+        .as_ref()
+        .and_then(|m| m.template(target))
+        .and_then(|t| t.ram_cap.as_deref())
+        .and_then(crate::manifest::parse_size)
+        .map(|b| b as u64)
+        .unwrap_or(DEFAULT_MEM_BYTES)
+}
+
+/// The fleet RAM ceiling from `[fleet].ram_budget`, if set.
+fn ram_budget() -> Option<u64> {
+    crate::manifest::Manifest::load()
+        .and_then(|m| m.fleet.ram_budget)
+        .as_deref()
+        .and_then(crate::manifest::parse_size)
+        .map(|b| b as u64)
+}
+
+fn ram_used(reg: &Registry) -> u64 {
+    reg.lock().unwrap().values().map(|e| e.info.ram_bytes).sum()
+}
+
+/// Atomically admit and reserve a slot for a new VM, or refuse to protect the
+/// budget. The check and the registry insert happen under one lock so concurrent
+/// admissions can't both pass and overcommit. Returns the reserved `(id, kill)`
+/// (the entry's pid is 0 until the child is spawned), or `(budget, used,
+/// requested)` on refusal.
+fn reserve(
+    reg: &Registry,
+    counter: &AtomicU64,
+    reference: &str,
+) -> std::result::Result<(String, Arc<AtomicBool>), (u64, u64, u64)> {
+    // File I/O for the manifest stays outside the lock.
+    let requested = vm_ram_bytes(reference);
+    let budget = ram_budget();
+
+    let mut g = reg.lock().unwrap();
+    if let Some(budget) = budget {
+        let used: u64 = g.values().map(|e| e.info.ram_bytes).sum();
+        if used + requested > budget {
+            return Err((budget, used, requested));
+        }
+    }
+    let id = format!("vm{}", counter.fetch_add(1, Ordering::Relaxed) + 1);
+    let kill = Arc::new(AtomicBool::new(false));
+    g.insert(
+        id.clone(),
+        VmEntry {
+            info: VmInfo {
+                id: id.clone(),
+                reference: reference.to_string(),
+                pid: 0,
+                started: proto::now_secs(),
+                ram_bytes: requested,
+            },
+            kill: kill.clone(),
+        },
+    );
+    Ok((id, kill))
+}
+
+/// Record a reserved VM's pid once its worker has spawned.
+fn set_pid(reg: &Registry, id: &str, pid: u32) {
+    if let Some(e) = reg.lock().unwrap().get_mut(id) {
+        e.info.pid = pid;
+    }
+}
+
 // ---- daemon ----
 
 pub fn serve() -> io::Result<()> {
@@ -100,6 +175,11 @@ fn handle(
             let vms = reg.lock().unwrap().values().map(|e| e.info.clone()).collect();
             write_reply(&mut stream, &Reply::Vms { vms })?;
         }
+        Request::Budget => {
+            let budget = ram_budget().unwrap_or(0);
+            let used = ram_used(&reg);
+            write_reply(&mut stream, &Reply::Budget { budget, used })?;
+        }
         Request::Kill { id } => {
             // Signal the owner thread; it kills and reaps the child it owns.
             let found = reg.lock().unwrap().get(&id).map(|e| e.kill.clone());
@@ -147,7 +227,14 @@ fn start_detached(
     reference: String,
     argv: Vec<String>,
 ) -> io::Result<()> {
-    let id = format!("vm{}", counter.fetch_add(1, Ordering::Relaxed) + 1);
+    let (id, kill) = match reserve(&reg, &counter, &reference) {
+        Ok(x) => x,
+        Err((budget, used, requested)) => {
+            write_reply(&mut stream, &Reply::BudgetExceeded { budget, used, requested })?;
+            return Ok(());
+        }
+    };
+
     let dir = logs_dir();
     std::fs::create_dir_all(&dir)?;
     let out = std::fs::File::create(dir.join(format!("{id}.log")))?;
@@ -161,17 +248,14 @@ fn start_detached(
         cmd.args(&argv);
     }
     cmd.stdin(Stdio::null()).stdout(out).stderr(err);
-    let mut child = cmd.spawn()?;
-
-    let pid = child.id();
-    let kill = Arc::new(AtomicBool::new(false));
-    reg.lock().unwrap().insert(
-        id.clone(),
-        VmEntry {
-            info: VmInfo { id: id.clone(), reference, pid, started: proto::now_secs() },
-            kill: kill.clone(),
-        },
-    );
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            reg.lock().unwrap().remove(&id); // release the reservation
+            return Err(e);
+        }
+    };
+    set_pid(&reg, &id, child.id());
 
     // Background supervisor: reap on exit or kill, then deregister.
     let reg2 = reg.clone();
@@ -205,6 +289,14 @@ fn run_one_shot(
     reference: String,
     argv: Vec<String>,
 ) -> io::Result<()> {
+    let (id, kill) = match reserve(&reg, &counter, &reference) {
+        Ok(x) => x,
+        Err((budget, used, requested)) => {
+            write_reply(&mut stream, &Reply::BudgetExceeded { budget, used, requested })?;
+            return Ok(());
+        }
+    };
+
     // Spawn the per-VM worker process (same binary, internal subcommand).
     let exe = std::env::current_exe()?;
     let mut cmd = Command::new(exe);
@@ -215,18 +307,14 @@ fn run_one_shot(
     }
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
-    let mut child = cmd.spawn()?;
-
-    let id = format!("vm{}", counter.fetch_add(1, Ordering::Relaxed) + 1);
-    let pid = child.id();
-    let kill = Arc::new(AtomicBool::new(false));
-    reg.lock().unwrap().insert(
-        id.clone(),
-        VmEntry {
-            info: VmInfo { id: id.clone(), reference, pid, started: proto::now_secs() },
-            kill: kill.clone(),
-        },
-    );
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            reg.lock().unwrap().remove(&id); // release the reservation
+            return Err(e);
+        }
+    };
+    set_pid(&reg, &id, child.id());
 
     // `client_gone` is set when either relay sees the client disconnect, so the
     // supervisor below kills an otherwise-orphaned VM.
@@ -365,6 +453,9 @@ pub fn run_client(reference: &str, argv: &[String]) -> io::Result<i32> {
                 return match serde_json::from_slice::<Reply>(&payload)? {
                     Reply::Exit { code } => Ok(code),
                     Reply::Error { message } => Err(io::Error::other(message)),
+                    Reply::BudgetExceeded { budget, used, requested } => {
+                        Err(io::Error::other(budget_msg(budget, used, requested)))
+                    }
                     _ => Ok(0),
                 };
             }
@@ -377,9 +468,31 @@ pub fn run_client(reference: &str, argv: &[String]) -> io::Result<i32> {
 pub fn run_detached(reference: &str, argv: &[String]) -> io::Result<String> {
     match request(&Request::RunDetached { reference: reference.to_string(), argv: argv.to_vec() })? {
         Reply::Started { id } => Ok(id),
+        Reply::BudgetExceeded { budget, used, requested } => {
+            Err(io::Error::other(budget_msg(budget, used, requested)))
+        }
         Reply::Error { message } => Err(io::Error::other(message)),
         _ => Err(io::Error::other("unexpected reply")),
     }
+}
+
+/// The fleet RAM budget and usage in bytes (`budget` 0 = unlimited).
+pub fn budget() -> io::Result<(u64, u64)> {
+    match request(&Request::Budget)? {
+        Reply::Budget { budget, used } => Ok((budget, used)),
+        Reply::Error { message } => Err(io::Error::other(message)),
+        _ => Err(io::Error::other("unexpected reply")),
+    }
+}
+
+fn budget_msg(budget: u64, used: u64, requested: u64) -> String {
+    let mib = |b: u64| b / (1024 * 1024);
+    format!(
+        "BudgetExceeded: budget {} MiB, in use {} MiB, requested {} MiB",
+        mib(budget),
+        mib(used),
+        mib(requested)
+    )
 }
 
 /// Print a VM's captured log to our stdout.

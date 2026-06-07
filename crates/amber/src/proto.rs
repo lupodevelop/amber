@@ -41,6 +41,8 @@ pub enum Request {
     Logs { id: String },
     /// List live VMs.
     List,
+    /// Report the fleet RAM budget and usage.
+    Budget,
     /// Kill a VM by id.
     Kill { id: String },
     /// Stop the daemon.
@@ -56,6 +58,10 @@ pub enum Reply {
     Started { id: String },
     /// The live VM list.
     Vms { vms: Vec<VmInfo> },
+    /// The fleet RAM budget and current usage, in bytes (`budget` 0 = unlimited).
+    Budget { budget: u64, used: u64 },
+    /// Admission refused to protect the budget. All values in bytes.
+    BudgetExceeded { budget: u64, used: u64, requested: u64 },
     /// Generic acknowledgement.
     Ok,
     /// A structured error.
@@ -69,6 +75,8 @@ pub struct VmInfo {
     pub pid: u32,
     /// Unix epoch seconds when the VM was started, for `ps` age.
     pub started: u64,
+    /// RAM this VM is accounted at against the fleet budget, in bytes.
+    pub ram_bytes: u64,
 }
 
 /// Current Unix time in whole seconds.

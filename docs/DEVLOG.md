@@ -521,6 +521,35 @@ fresh process, resume mid-execution — is proven.
 
 ---
 
+## M5 — RAM coexistence (in progress)
+
+Chosen as the next milestone because the spawn half is in good shape but snapshot
+(M3) and fork (M4) both hit the same HVF vtimer wall, while M5 — "the fleet stays
+under a RAM budget and never starves the resident model" — is the *other half of
+the thesis*, is independent of snapshot/fork, and is buildable now on HVF.
+
+### Step 1 — budget accounting + admission control
+
+`amberd` now enforces `[fleet].ram_budget`. Each VM is accounted at its template's
+`ram_cap` (default 512 MiB); the daemon tracks the live sum and **refuses
+admission** when a new VM would breach the ceiling, returning a structured
+`BudgetExceeded { budget, used, requested }`. Added `amber budget` (shows
+budget/used/free) and a `MEM` column to `ps`. Verified: with a 768 MiB budget and
+256 MiB VMs, three are admitted, the fourth is refused with the structured error,
+and `rm`-ing one frees room for the next.
+
+Audit caught a real concurrency bug: the first cut checked `used` and inserted the
+registry entry under two separate locks, so two concurrent admissions could both
+pass and overcommit. Fixed with an atomic `reserve()` — the budget check and the
+registry insert happen under one lock, reserving the slot (pid filled in after the
+worker spawns); a failed spawn releases the reservation. Manifest file I/O stays
+outside the lock.
+
+This is admission control only — the *reclaim* levers (free-page reporting,
+balloon, pool eviction) come next. Pool eviction waits for M4; the others don't.
+
+---
+
 ## Cross-cutting choices
 
 - **Backend seam holds.** Every milestone added capability above the
