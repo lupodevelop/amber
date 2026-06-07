@@ -489,6 +489,36 @@ Two snags found, one deferred by ABI, one open:
   timer-wake wiring. That, plus snapshotting device-emulation state (virtio queue
   registers live in the host, not guest RAM), is step 3.
 
+### Step 3 — the vtimer, researched
+
+Took the advice to research before guessing further, and it was decisive. Apple's
+HVF has **known open bugs** for the vGIC + vtimer (FB21649319), and QEMU's HVF
+platform-vGIC support is recent and experimental. The key find was a QEMU commit
+that **reverted syncing `CNTV_CTL_EL0`/`CNTV_CVAL_EL0`** on HVF "because it breaks
+VM save/restore", and QEMU's current `hvf.c` confirms the model: on restore the
+virtual timer is re-established **only** through `hv_vcpu_set_vtimer_offset`, and
+`CNTV_CTL/CVAL` are deliberately **not** written back; with the in-kernel vGIC,
+HVF owns the timer→GIC delivery and the WFI wake.
+
+Matched that exactly and characterised the behaviour:
+
+- Writing `CNTV_CVAL`/`CNTV_CTL` on restore → the stale compare value on the new
+  timeline makes the timer fire continuously → kernel **busy-spins at ~99%**.
+- Not writing them (offset-only, the QEMU model) → the guest **halts cleanly at
+  ~0%** but the periodic tick does not re-arm, so a `sleep` doesn't return.
+- The vtimer offset is recomputed for counter continuity (capture
+  `mach_absolute_time`; `offset = now - captured_cntvct`), and the mask is cleared.
+
+So step 3's outcome is a **characterised, research-backed limitation, not a
+mystery**: on HVF after restore, non-timer execution resumes perfectly (proven:
+17304→53617 ticks of a busy loop), and a timer-waiting guest halts cleanly rather
+than spinning. Fully resuming the periodic tick needs either an HVF detail Apple
+hasn't exposed (their own bug) or the **KVM backend (M8)**, where the timer has a
+complete, documented save/restore surface (`CNTVOFF`, granular vGIC state) — the
+path Firecracker uses. Device-emulation-state capture (virtio queues) remains a
+separate follow-up. The headline mechanism — freeze RAM+GIC+vcpu, restore into a
+fresh process, resume mid-execution — is proven.
+
 ---
 
 ## Cross-cutting choices

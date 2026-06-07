@@ -293,9 +293,24 @@ impl Vm {
                         vcpu.set_pc(pc + 4)?;
                         Ok(true)
                     }
-                    // With a GIC the hypervisor handles WFI internally; an Idle
-                    // exit only arrives from an explicit cancel. Nothing to do.
-                    VmExit::Idle => Ok(true),
+                    // On a fresh boot the hypervisor handles WFI internally and
+                    // this never fires. After a restore it can surface here, so
+                    // park until the virtual timer is due (capped, so console
+                    // input still gets in) instead of busy-spinning.
+                    VmExit::Idle => {
+                        let ns = match vcpu.pending_timer_ns() {
+                            Ok(Some(n)) => n.min(50_000_000),
+                            _ => 50_000_000,
+                        };
+                        if ns > 0 {
+                            let ts = libc::timespec {
+                                tv_sec: (ns / 1_000_000_000) as libc::time_t,
+                                tv_nsec: (ns % 1_000_000_000) as _,
+                            };
+                            unsafe { libc::nanosleep(&ts, std::ptr::null_mut()) };
+                        }
+                        Ok(true)
+                    }
                     VmExit::Shutdown => {
                         log::info!("guest requested shutdown");
                         Ok(false)

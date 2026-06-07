@@ -327,32 +327,43 @@ impl Vcpu for HvfVcpu {
         for (i, &v) in cpu.x.iter().enumerate() {
             self.set_reg(HV_REG_X0 + i as u32, v)?;
         }
-        // System registers: set each captured one; many are read-only (ID/feature
-        // regs) and refuse — ignore those, they don't need restoring.
-        for &(id, v) in &cpu.sysregs {
-            unsafe { hv_vcpu_set_sys_reg(self.handle, id, v) };
-        }
-        // SIMD/FP file (V0..V31) is captured but not yet restored: setting it
-        // needs a NEON-vector-by-value call stable Rust can't make over FFI. It is
-        // don't-care for the resume proof (the shell uses no FP).
 
-        // Keep the virtual counter continuous across the process boundary. At
-        // capture CNTVCT == mono - vtimer_offset; pick a new offset so CNTVCT
-        // reads that same value now, then advances. Without this the guest's
-        // timers compare against a counter that jumped, and sleeps never fire.
+        // Set the virtual-timer offset FIRST so the counter is continuous across
+        // the process boundary: at capture CNTVCT == mono - vtimer_offset; pick a
+        // new offset so CNTVCT reads that same value now, then advances. The
+        // guest's CNTV_CVAL is an absolute value on this timeline, so it is only
+        // meaningful once the offset is right — hence the ordering (setting CVAL
+        // against the default offset first is what wedged the timer).
         #[allow(deprecated)]
         let now = unsafe { libc::mach_absolute_time() };
         let captured_cntvct = cpu.mono.wrapping_sub(cpu.vtimer_offset);
         let new_offset = now.wrapping_sub(captured_cntvct);
         unsafe {
-            check(
-                hv_vcpu_set_vtimer_offset(self.handle, new_offset),
-                "set vtimer offset",
-            )?;
-            // Make sure the virtual timer isn't left masked, or it never fires and
-            // guest sleeps hang after resume.
+            check(hv_vcpu_set_vtimer_offset(self.handle, new_offset), "set vtimer offset")?;
             check(hv_vcpu_set_vtimer_mask(self.handle, false), "clear vtimer mask")?;
         }
+
+        // System registers: set each captured one. Read-only ID/feature regs
+        // refuse and are skipped. Do NOT write the virtual-timer compare/control
+        // (CNTV_CVAL/CNTV_CTL): with HVF's in-kernel vGIC, pinning the stale
+        // compare value on a fresh timeline wedges the timer (a stale CVAL fires
+        // continuously -> busy-spin; a fresh one never fires). QEMU's HVF backend
+        // reached the same conclusion and restores the vtimer only through
+        // hv_vcpu_set_vtimer_offset (above). NOTE: with this, the periodic timer
+        // tick does not yet resume on HVF after restore — a known HVF-specific
+        // gap (clean save/restore is the KVM path, M8). Non-timer execution
+        // resumes correctly.
+        for &(id, v) in &cpu.sysregs {
+            if id == HV_SYS_REG_CNTV_CTL_EL0 || id == HV_SYS_REG_CNTV_CVAL_EL0 {
+                continue;
+            }
+            unsafe { hv_vcpu_set_sys_reg(self.handle, id, v) };
+        }
+
+        // SIMD/FP file (V0..V31) is captured but not yet restored: setting it
+        // needs a NEON-vector-by-value call stable Rust can't make over FFI. It is
+        // don't-care for the resume proof (the shell uses no FP).
+
         self.set_reg(HV_REG_FPCR, cpu.fpcr)?;
         self.set_reg(HV_REG_FPSR, cpu.fpsr)?;
         self.set_reg(HV_REG_CPSR, cpu.cpsr)?;
