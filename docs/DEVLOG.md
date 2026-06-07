@@ -519,6 +519,46 @@ path Firecracker uses. Device-emulation-state capture (virtio queues) remains a
 separate follow-up. The headline mechanism — freeze RAM+GIC+vcpu, restore into a
 fresh process, resume mid-execution — is proven.
 
+### Step 4 — the vtimer wall, mapped to the floor
+
+Came back to the post-restore vtimer to settle whether it is fixable on HVF or
+genuinely needs KVM. Dumping the symbols in `Hypervisor.framework` turned up a
+seam the opaque blob hides: HVF exports **public, per-vcpu, granular GIC register
+accessors** — `hv_gic_get/set_{distributor,redistributor,icc,ich,icv}_reg` (all in
+`hv_gic.h`), reaching the redistributor PPI bits and the ICH list/active-priority
+registers that the `hv_gic_state` blob round-trips as one chunk. That re-opened
+the question, and a long instrumented session mapped the wall precisely:
+
+- **Restoring `CNTV_CVAL`/`CNTV_CTL` after the offset** (the M3-step-3 skip) makes
+  the one in-flight timer fire after restore — a `sleep` loop snapshotted mid-tick
+  prints exactly one more line — and **does not** busy-spin, because ordering the
+  offset write first keeps `CVAL`'s remaining delta correct. But the periodic tick
+  still dies after that one fire.
+- After that fire the guest parks at a **single fixed kernel PC** (an idle WFI),
+  `CPSR.I=1`. HVF handles WFI **internally** (the M0.5 finding) — it never
+  surfaces as `EC_WFX` — and it will **not** wake that parked vcpu from: a directly
+  injected PPI 27 (`GICR_ISPENDR0` bit 27), a vtimer mask toggle, a forced
+  `hv_vcpus_exit` "kick" + PC nudge, or even a real PL011 SPI raised on its line.
+  HVF wakes a parked WFI only from its **own** internal vtimer event, which is
+  dormant after a restore. No public call re-arms it.
+- The clean structural fix is to **trap WFI** and own the idle in userspace
+  (compute the deadline from `CNTV_CVAL`, park the host thread, then advance PC and
+  inject) — the same shape as the M0-era `EC_WFX` path. On HVF that needs
+  `HCR_EL2.TWI`. `HV_SYS_REG_HCR_EL2` is in the sysreg enum, but
+  `hv_vcpu_set_sys_reg` on it returns **`HV_UNSUPPORTED` (0xfae9400f)** — HVF does
+  not let the host write it, and there is no WFI-trap knob in `hv_vcpu_config`
+  either.
+
+So the conclusion is now exhaustive, not inferred: **with HVF's in-kernel vGIC the
+post-restore periodic vtimer is unreachable from any public API.** And the reason
+ties the whole thing together — HVF only handles WFI internally *because* the vGIC
+is present (M0, before the vGIC, delivered WFI as `EC_WFX`). So the correct
+trap-and-emulate-idle fix and the **software-GIC** path are the *same* project:
+drop `hv_gic`, emulate GICv3 (distributor/redistributor MMIO + the `ICC_*` sysreg
+interface) ourselves, and WFI traps natively again — at which point we own idle and
+timer injection and snapshot/restore/fork work on Mac. That is the next real lever
+for M3/M4 here; until then the KVM backend (M8) remains the other clean path.
+
 ---
 
 ## M5 — RAM coexistence (in progress)
