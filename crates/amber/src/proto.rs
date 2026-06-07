@@ -33,8 +33,12 @@ pub fn socket_path() -> PathBuf {
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "op")]
 pub enum Request {
-    /// Cast a VM, run argv, stream output, discard.
+    /// Cast a VM, run argv, stream I/O, discard.
     RunOneShot { reference: String, argv: Vec<String> },
+    /// Cast a VM that keeps running in the background; output goes to its log.
+    RunDetached { reference: String, argv: Vec<String> },
+    /// Stream a VM's captured log.
+    Logs { id: String },
     /// List live VMs.
     List,
     /// Kill a VM by id.
@@ -48,6 +52,8 @@ pub enum Request {
 pub enum Reply {
     /// Terminal reply for RunOneShot: the guest process exit code.
     Exit { code: i32 },
+    /// A detached VM was started, with its id.
+    Started { id: String },
     /// The live VM list.
     Vms { vms: Vec<VmInfo> },
     /// Generic acknowledgement.

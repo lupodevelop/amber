@@ -35,12 +35,13 @@ fn main() -> ExitCode {
         Some("down") => cmd_down(),
         Some("ps") => cmd_ps(),
         Some("rm") => cmd_rm(&args),
+        Some("logs") => cmd_logs(&args),
         Some("pull") => cmd_pull(&args),
         Some("boot") => cmd_boot(&args),
         _ => {
             eprintln!("usage:");
-            eprintln!("  amber run <image|template> [-- <argv>...]");
-            eprintln!("  amber up | down | ps | rm <id>");
+            eprintln!("  amber run [-d] <image|template> [-- <argv>...]");
+            eprintln!("  amber up | down | ps | rm <id> | logs <id>");
             eprintln!("  amber pull <image>");
             eprintln!("  amber boot <kernel-Image> [initramfs] [disk]");
             ExitCode::FAILURE
@@ -48,25 +49,65 @@ fn main() -> ExitCode {
     }
 }
 
-/// Route `run`: through amberd if reachable, else in-process.
+/// Route `run`: `-d` detaches (daemon only); otherwise through amberd if
+/// reachable (interactive), else in-process.
 fn cmd_run(args: &[String]) -> ExitCode {
-    if !daemon::running() {
-        return cmd_vm(args);
-    }
-    let Some(target) = args.get(2) else {
-        eprintln!("usage: amber run <image|template> [-- <argv>...]");
-        return ExitCode::FAILURE;
+    // Split flags/target (before `--`) from the command argv (after it).
+    let split = args.iter().position(|a| a == "--");
+    let head = match split {
+        Some(i) => &args[2..i],
+        None => &args[2..],
     };
-    let argv: Vec<String> = match args.iter().position(|a| a == "--") {
+    let argv: Vec<String> = match split {
         Some(i) => args[i + 1..].to_vec(),
         None => Vec::new(),
     };
+    let detached = head.iter().any(|a| a == "-d" || a == "--detach");
+    let Some(target) = head.iter().find(|a| !a.starts_with('-')) else {
+        eprintln!("usage: amber run [-d] <image|template> [-- <argv>...]");
+        return ExitCode::FAILURE;
+    };
+
+    if detached {
+        if !daemon::running() {
+            eprintln!("-d needs amberd (run 'amber up')");
+            return ExitCode::FAILURE;
+        }
+        return match daemon::run_detached(target, &argv) {
+            Ok(id) => {
+                println!("{id}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("run failed: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    if !daemon::running() {
+        return cmd_vm(args);
+    }
     // Raw mode so keystrokes reach the guest unbuffered (the guest tty echoes).
     let _raw = RawTerm::enable();
     match daemon::run_client(target, &argv) {
         Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
         Err(e) => {
             eprintln!("run failed: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn cmd_logs(args: &[String]) -> ExitCode {
+    let Some(id) = args.get(2) else {
+        eprintln!("usage: amber logs <id>");
+        return ExitCode::FAILURE;
+    };
+    match daemon::logs(id) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("logs failed: {e}");
             ExitCode::FAILURE
         }
     }

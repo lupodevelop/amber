@@ -390,6 +390,22 @@ Small Docker-shaped polish: `VmInfo` gained a `started` (epoch seconds) stamped
 when the daemon registers a VM, and `amber ps` shows an `AGE` column
 (`5s`/`3m`/`2h`). Verified it grows across calls.
 
+### M2 iteration — detached run + logs
+
+Until now every VM was tied to a client connection, so `ps`/`rm`/`age` only ever
+saw VMs with someone attached. Added `amber run -d` (detached): the daemon spawns
+the VM with stdin `/dev/null` and stdout/stderr to `amber-cache/logs/<id>.log`, a
+background supervisor reaps it on exit/kill, and the client gets the id back
+immediately. `amber logs <id>` streams that log (works during and after the run).
+Now the whole `ps`/`logs`/`rm`/`age` suite is meaningful for long-running
+sandboxes. The `run` flag parsing was reworked to split `-d`/target (before `--`)
+from the command argv (after it).
+
+Audit of this iteration caught one: `amber down` exited the daemon but **orphaned
+detached VMs** (their `__vm` children kept running). Fixed: `Shutdown` SIGKILLs
+every registered VM before exiting. Verified: a detached `sleep 60` VM is reaped
+by `down`, no stray `__vm` left.
+
 ---
 
 ## Cross-cutting choices

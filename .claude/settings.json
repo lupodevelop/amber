@@ -68,7 +68,9 @@
       "Bash(grep -vE '^\\\\s*\\\\*|^/\\\\*|^\\\\s*$')",
       "Bash(./target/release/amber run *)",
       "Bash(AMBER_TIME=1 ./target/release/amber run alpine -- true)",
-      "Bash(pkill -f 'amber serve')"
+      "Bash(pkill -f 'amber serve')",
+      "Bash(perl -0pi -e 's/Request::RunDetached \\\\{ reference, argv \\\\} => \\\\{\\\\n            run_detached\\\\\\(/Request::RunDetached { reference, argv } => {\\\\n            start_detached\\(/' crates/amber/src/daemon.rs)",
+      "Bash(perl -0pi -e 's/^fn run_detached\\\\\\(\\\\n    mut stream: UnixStream,/fn start_detached\\(\\\\n    mut stream: UnixStream,/m' crates/amber/src/daemon.rs)"
     ]
   }
 }

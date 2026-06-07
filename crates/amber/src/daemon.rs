@@ -113,6 +113,10 @@ fn handle(
         }
         Request::Shutdown => {
             write_reply(&mut stream, &Reply::Ok)?;
+            // Kill every VM before exiting so detached ones aren't orphaned.
+            for e in reg.lock().unwrap().values() {
+                unsafe { libc::kill(e.info.pid as i32, libc::SIGKILL) };
+            }
             let _ = std::fs::remove_file(sock);
             log::info!("amberd shutting down");
             std::process::exit(0);
@@ -120,6 +124,76 @@ fn handle(
         Request::RunOneShot { reference, argv } => {
             run_one_shot(stream, reg, counter, reference, argv)?;
         }
+        Request::RunDetached { reference, argv } => {
+            start_detached(stream, reg, counter, reference, argv)?;
+        }
+        Request::Logs { id } => {
+            stream_logs(stream, &id)?;
+        }
+    }
+    Ok(())
+}
+
+fn logs_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from("amber-cache/logs")
+}
+
+/// Start a VM that keeps running after the client leaves; its stdout/stderr go to
+/// `amber-cache/logs/<id>.log`. Replies with the id immediately.
+fn start_detached(
+    mut stream: UnixStream,
+    reg: Registry,
+    counter: Arc<AtomicU64>,
+    reference: String,
+    argv: Vec<String>,
+) -> io::Result<()> {
+    let id = format!("vm{}", counter.fetch_add(1, Ordering::Relaxed) + 1);
+    let dir = logs_dir();
+    std::fs::create_dir_all(&dir)?;
+    let out = std::fs::File::create(dir.join(format!("{id}.log")))?;
+    let err = out.try_clone()?;
+
+    let exe = std::env::current_exe()?;
+    let mut cmd = Command::new(exe);
+    cmd.arg("__vm").arg(&reference);
+    if !argv.is_empty() {
+        cmd.arg("--");
+        cmd.args(&argv);
+    }
+    cmd.stdin(Stdio::null()).stdout(out).stderr(err);
+    let mut child = cmd.spawn()?;
+
+    let pid = child.id();
+    let kill = Arc::new(AtomicBool::new(false));
+    reg.lock().unwrap().insert(
+        id.clone(),
+        VmEntry {
+            info: VmInfo { id: id.clone(), reference, pid, started: proto::now_secs() },
+            kill: kill.clone(),
+        },
+    );
+
+    // Background supervisor: reap on exit or kill, then deregister.
+    let reg2 = reg.clone();
+    let id2 = id.clone();
+    thread::spawn(move || {
+        let never = AtomicBool::new(false);
+        let _ = supervise(&mut child, &kill, &never);
+        reg2.lock().unwrap().remove(&id2);
+    });
+
+    write_reply(&mut stream, &Reply::Started { id })?;
+    Ok(())
+}
+
+fn stream_logs(mut stream: UnixStream, id: &str) -> io::Result<()> {
+    let path = logs_dir().join(format!("{id}.log"));
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            write_frame(&mut stream, TAG_STDOUT, &bytes)?;
+            write_reply(&mut stream, &Reply::Ok)?;
+        }
+        Err(_) => write_reply(&mut stream, &Reply::Error { message: format!("no logs for {id}") })?,
     }
     Ok(())
 }
@@ -295,6 +369,34 @@ pub fn run_client(reference: &str, argv: &[String]) -> io::Result<i32> {
                 };
             }
             _ => return Ok(0),
+        }
+    }
+}
+
+/// Start a detached VM; returns its id.
+pub fn run_detached(reference: &str, argv: &[String]) -> io::Result<String> {
+    match request(&Request::RunDetached { reference: reference.to_string(), argv: argv.to_vec() })? {
+        Reply::Started { id } => Ok(id),
+        Reply::Error { message } => Err(io::Error::other(message)),
+        _ => Err(io::Error::other("unexpected reply")),
+    }
+}
+
+/// Print a VM's captured log to our stdout.
+pub fn logs(id: &str) -> io::Result<()> {
+    let mut s = connect().ok_or_else(|| io::Error::other("no amberd"))?;
+    proto::write_request(&mut s, &Request::Logs { id: id.to_string() })?;
+    let mut stdout = io::stdout();
+    loop {
+        match read_frame(&mut s)? {
+            Some((TAG_STDOUT, bytes)) => stdout.write_all(&bytes)?,
+            Some((TAG_REPLY, payload)) => {
+                return match serde_json::from_slice::<Reply>(&payload)? {
+                    Reply::Error { message } => Err(io::Error::other(message)),
+                    _ => Ok(()),
+                };
+            }
+            _ => return Ok(()),
         }
     }
 }
