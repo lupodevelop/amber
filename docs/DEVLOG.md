@@ -406,6 +406,23 @@ detached VMs** (their `__vm` children kept running). Fixed: `Shutdown` SIGKILLs
 every registered VM before exiting. Verified: a detached `sleep 60` VM is reaped
 by `down`, no stray `__vm` left.
 
+### M2 wrap — top-level README
+
+Wrote a top-level `README.md` documenting the implementation as it stands
+(status table, build+codesign, the real CLI, `amber.toml`, the `AMBER_TIME`/
+`AMBER_VERBOSE` knobs, crate layout). Smoke-tested every documented command
+end-to-end (`run`, template env, `-d`, `ps`, `logs`, `rm`, `down`) so the doc
+matches the code.
+
+**M2 is functionally complete:** manifest + templates, the `amberd` supervisor
+(one process per VM) over an owner-only unix socket, interactive and detached
+runs with I/O relay, `ps`/`logs`/`rm`/age, an audit pass, and the image cache +
+quiet boot that cut warm spawn to ~80 ms. Remaining roadmap items are either
+marginal in the current design (`reload` — workers re-read the manifest already)
+or need a guest control channel (`exec`, M7 vsock). The data-justified next big
+lever for spawn latency is **M3 snapshot/fork** (skip the ~75 ms boot), which now
+has a control plane to land in.
+
 ---
 
 ## Cross-cutting choices
