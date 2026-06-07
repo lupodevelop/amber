@@ -4,11 +4,12 @@
 
 use crate::bus::{MmioBus, Pl011};
 use crate::hypervisor::{Hypervisor, MmioOp, Vcpu, VmExit};
-use crate::virtio::{BalloonDevice, BlkDevice, RngDevice, VirtioDevice, VirtioMmio};
+use crate::virtio::{BalloonDevice, BalloonHandle, BlkDevice, RngDevice, VirtioDevice, VirtioMmio};
 use crate::{dtb, layout, loader, GuestMemory, Result};
+use std::os::fd::RawFd;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// A virtio-mmio device placed at a window with an assigned interrupt.
 struct VirtioDev {
@@ -32,6 +33,18 @@ impl VirtioDev {
     }
 }
 
+/// Append a virtio-balloon device and return a handle to drive it plus its INTID.
+fn push_balloon(virtio: &mut Vec<VirtioDev>) -> (BalloonHandle, u32) {
+    let target = Arc::new(AtomicU64::new(0));
+    let dirty = Arc::new(AtomicBool::new(false));
+    let i = virtio.len();
+    let dev = BalloonDevice::new(target, dirty);
+    let handle = dev.handle();
+    let intid = layout::GIC_SPI_BASE + layout::VIRTIO_SPI_BASE + i as u32;
+    virtio.push(VirtioDev::new(i, Box::new(dev)));
+    (handle, intid)
+}
+
 pub struct VmConfig {
     pub mem_size: usize,
     pub kernel: Vec<u8>,
@@ -42,6 +55,8 @@ pub struct VmConfig {
     pub disk: Option<PathBuf>,
     /// If set, snapshot the VM to `dir` once it has run for `after`, then stop.
     pub snapshot: Option<SnapshotReq>,
+    /// A control-channel fd (from amberd) carrying balloon targets, etc.
+    pub control_fd: Option<RawFd>,
 }
 
 /// A request to capture a snapshot after the guest has run for a while.
@@ -65,6 +80,7 @@ impl Default for VmConfig {
             cmdline: "console=ttyAMA0 quiet".into(),
             disk: None,
             snapshot: None,
+            control_fd: None,
         }
     }
 }
@@ -74,6 +90,8 @@ pub struct Vm {
     bus: MmioBus,
     pl011: Pl011,
     virtio: Vec<VirtioDev>,
+    balloon: Option<(BalloonHandle, u32)>,
+    control_fd: Option<RawFd>,
     snapshot: Option<SnapshotReq>,
     disk_path: Option<PathBuf>,
     /// When set, `run` restores this captured state instead of booting a kernel.
@@ -107,14 +125,15 @@ impl Vm {
         }
         let i = virtio.len();
         virtio.push(VirtioDev::new(i, Box::new(RngDevice::open()?)));
-        let i = virtio.len();
-        virtio.push(VirtioDev::new(i, Box::new(BalloonDevice)));
+        let balloon = push_balloon(&mut virtio);
 
         Ok(Self {
             mem,
             bus: MmioBus::default(),
             pl011: Pl011::new(Box::new(std::io::stdout())),
             virtio,
+            balloon: Some(balloon),
+            control_fd: cfg.control_fd,
             snapshot: cfg.snapshot.clone(),
             disk_path: cfg.disk.clone(),
             restore: None,
@@ -141,14 +160,15 @@ impl Vm {
         }
         let i = virtio.len();
         virtio.push(VirtioDev::new(i, Box::new(RngDevice::open()?)));
-        let i = virtio.len();
-        virtio.push(VirtioDev::new(i, Box::new(BalloonDevice)));
+        let balloon = push_balloon(&mut virtio);
 
         Ok(Self {
             mem,
             bus: MmioBus::default(),
             pl011: Pl011::new(Box::new(std::io::stdout())),
             virtio,
+            balloon: Some(balloon),
+            control_fd: None,
             snapshot: None,
             disk_path: loaded.meta.disk.clone().map(PathBuf::from),
             restore: Some(loaded),
@@ -178,6 +198,8 @@ impl Vm {
             mut bus,
             pl011,
             mut virtio,
+            balloon,
+            control_fd,
             snapshot,
             disk_path,
             restore,
@@ -238,9 +260,17 @@ impl Vm {
         let disk_path = disk_path.as_deref();
         let started = std::time::Instant::now();
 
+        let balloon = balloon.as_ref();
         std::thread::scope(|s| {
             // Console reader: host stdin -> UART RX -> GIC line -> wake the vcpu.
             s.spawn(move || console_reader(hv, pl011, pl011_intid, running));
+
+            // Control reader: a control-channel target -> balloon inflate. Moving
+            // the target and raising the device's config interrupt makes the guest
+            // give pages back (active reclaim). Only when amberd passed a fd.
+            if let (Some(fd), Some((handle, intid))) = (control_fd, balloon) {
+                s.spawn(move || control_reader(hv, fd, handle, *intid, running));
+            }
 
             // vcpu loop on this thread.
             let mut step = || -> Result<bool> {
@@ -375,5 +405,33 @@ fn console_reader<H: Hypervisor>(
             p.irq_level()
         };
         let _ = hv.set_irq(intid, level);
+    }
+}
+
+/// Read balloon targets (8-byte LE MiB values) from the control fd and apply them:
+/// move the device target and raise its config-change interrupt so the guest
+/// inflates. Polls so it can notice shutdown and let the scope join.
+fn control_reader<H: Hypervisor>(
+    hv: &H,
+    fd: RawFd,
+    balloon: &BalloonHandle,
+    intid: u32,
+    running: &AtomicBool,
+) {
+    let mut buf = [0u8; 8];
+    while running.load(Ordering::Relaxed) {
+        let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+        let n = unsafe { libc::poll(&mut pfd, 1, 100) };
+        if n <= 0 {
+            continue;
+        }
+        let r = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        if r != 8 {
+            break; // EOF/short read: amberd closed the channel
+        }
+        let mib = u64::from_le_bytes(buf);
+        balloon.target_pages.store(mib * 256, Ordering::Relaxed); // 1 MiB = 256 * 4 KiB
+        balloon.config_dirty.store(true, Ordering::Relaxed);
+        let _ = hv.set_irq(intid, true);
     }
 }

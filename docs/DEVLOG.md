@@ -604,6 +604,29 @@ milestones: active balloon *under pressure* needs an amberd↔child control chan
 (M7-shaped), and pool eviction needs the warm pool (M4, which is gated on the
 snapshot timer / KVM).
 
+### Step 5 — active balloon + the control channel
+
+Built the amberd↔child control channel — the piece M5's host-driven reclaim and
+M7's `exec` both need — and used it for balloon inflation. When amberd spawns a VM
+it makes a `socketpair`, `dup2`s the child end to fd 3 (named via
+`AMBER_CONTROL_FD`), keeps its own end in the registry, and drops the child's. The
+worker's `Vm::run` spawns a `control_reader` thread that polls fd 3 for 8-byte LE
+targets; on one it moves the balloon's target, sets the config-dirty flag, and
+raises the balloon's GIC line — which wakes the guest if parked. The transport now
+surfaces the config-change interrupt (bit 1 of `InterruptStatus`, cleared on ack),
+and the balloon's `config` exposes `num_pages` from a shared `AtomicU64`. The
+inflate queue reads the guest's handed-back 4 KiB PFNs and `madvise`s them.
+
+`amber balloon <id> <MiB>` drives it. Demonstrated: an idle 512 MiB VM logging
+`MemFree` every second sat at ~459 MB free; `amber balloon vm2 200` dropped it to
+~253 MB within a second (−206 MB) — the guest inflated on command and handed the
+pages to the host. So M5 now has all three reclaim levers working: admission (the
+backstop), free-page reporting (passive), and the balloon (active, host-driven).
+
+The control channel generalises: it's a length-agnostic byte pipe per VM, ready
+to carry `exec`/`write_file` for M7 (which still needs a guest-side agent), not
+just balloon targets.
+
 ---
 
 ## Cross-cutting choices

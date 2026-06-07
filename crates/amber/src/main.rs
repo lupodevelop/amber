@@ -37,6 +37,7 @@ fn main() -> ExitCode {
         Some("rm") => cmd_rm(&args),
         Some("logs") => cmd_logs(&args),
         Some("budget") => cmd_budget(),
+        Some("balloon") => cmd_balloon(&args),
         Some("pull") => cmd_pull(&args),
         Some("restore") => cmd_restore(&args),
         Some("boot") => cmd_boot(&args),
@@ -96,6 +97,23 @@ fn cmd_run(args: &[String]) -> ExitCode {
         Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
         Err(e) => {
             eprintln!("run failed: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn cmd_balloon(args: &[String]) -> ExitCode {
+    let (Some(id), Some(mib)) = (args.get(2), args.get(3).and_then(|s| s.parse::<u64>().ok())) else {
+        eprintln!("usage: amber balloon <id> <MiB>");
+        return ExitCode::FAILURE;
+    };
+    match daemon::balloon(id, mib) {
+        Ok(()) => {
+            println!("balloon {id}: reclaiming toward {mib} MiB");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("balloon failed: {e}");
             ExitCode::FAILURE
         }
     }
@@ -400,6 +418,8 @@ fn cmd_vm(args: &[String]) -> ExitCode {
     if let Some(bytes) = mem_size {
         cfg.mem_size = bytes;
     }
+    // Control channel from amberd (balloon targets, etc.), if it passed one.
+    cfg.control_fd = std::env::var("AMBER_CONTROL_FD").ok().and_then(|s| s.parse().ok());
     // Snapshot trigger (M3, de-risk): AMBER_SNAPSHOT=<dir> captures the VM after
     // AMBER_SNAPSHOT_AFTER_MS (default 2000) and stops.
     if let Ok(dir) = std::env::var("AMBER_SNAPSHOT") {

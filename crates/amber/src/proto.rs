@@ -43,6 +43,8 @@ pub enum Request {
     List,
     /// Report the fleet RAM budget and usage.
     Budget,
+    /// Ask a VM's balloon to reclaim toward `mib` MiB (active reclaim).
+    Balloon { id: String, mib: u64 },
     /// Kill a VM by id.
     Kill { id: String },
     /// Stop the daemon.

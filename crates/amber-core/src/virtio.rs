@@ -14,6 +14,8 @@ use std::fs::File;
 use std::io::Read;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 
 // virtio-mmio register offsets (modern).
 const MAGIC: u64 = 0x000;
@@ -76,6 +78,13 @@ pub trait VirtioDevice {
     fn num_queues(&self) -> usize {
         1
     }
+    /// Whether the device's config space changed and a config-change interrupt is
+    /// pending (e.g. the balloon target was moved from another thread).
+    fn config_changed(&self) -> bool {
+        false
+    }
+    /// Acknowledge the pending config-change interrupt.
+    fn ack_config(&self) {}
     /// Service one descriptor chain on `queue`; return the number of bytes the
     /// device wrote into guest memory (the used-ring length).
     fn handle(&mut self, queue: usize, ram: &GuestRam, bufs: &[Buf]) -> u32;
@@ -121,7 +130,7 @@ impl VirtioMmio {
     }
 
     pub fn irq_level(&self) -> bool {
-        self.interrupt_status != 0
+        self.interrupt_status != 0 || self.dev.config_changed()
     }
 
     pub fn read(&mut self, offset: u64, _size: u8) -> u64 {
@@ -147,7 +156,10 @@ impl VirtioMmio {
                 }
             }
             QUEUE_READY => q.ready,
-            INTERRUPT_STATUS => self.interrupt_status,
+            // bit 0 = used-buffer notification, bit 1 = config change.
+            INTERRUPT_STATUS => {
+                self.interrupt_status | if self.dev.config_changed() { 2 } else { 0 }
+            }
             STATUS => self.status,
             CONFIG_GENERATION => 0,
             o if o >= CONFIG => self.dev.config(o - CONFIG),
@@ -166,7 +178,12 @@ impl VirtioMmio {
             QUEUE_NUM => self.with_queue(sel, |q| q.num = v),
             QUEUE_READY => self.with_queue(sel, |q| q.ready = v),
             QUEUE_NOTIFY => self.process(v as usize),
-            INTERRUPT_ACK => self.interrupt_status &= !v,
+            INTERRUPT_ACK => {
+                self.interrupt_status &= !v;
+                if v & 2 != 0 {
+                    self.dev.ack_config();
+                }
+            }
             STATUS => {
                 self.status = v;
                 if v == 0 {
@@ -363,22 +380,54 @@ impl VirtioDevice for RngDevice {
     }
 }
 
-/// virtio-balloon, free-page-reporting only. The guest proactively hands the host
-/// ranges of its free RAM on the reporting queue; we `madvise` the host pages
-/// reusable so the VM's real footprint shrinks back toward what the guest
-/// actually uses — the cheapest RAM-coexistence lever (MEMORY.md). We never
-/// inflate (num_pages stays 0), so the guest keeps all its RAM; only genuinely
-/// free pages are dropped from the host.
-pub struct BalloonDevice;
+/// A handle to a balloon's target and config-change flag, shared with whatever
+/// drives reclaim (the control thread). Setting the target and flag, then raising
+/// the device's interrupt, makes the guest inflate toward the new target.
+#[derive(Clone)]
+pub struct BalloonHandle {
+    pub target_pages: Arc<AtomicU64>,
+    pub config_dirty: Arc<AtomicBool>,
+}
+
+/// virtio-balloon with both free-page reporting (passive reclaim) and inflation
+/// (active reclaim under pressure). On the reporting queue the guest hands over
+/// ranges of its free RAM; on the inflate queue, after the host raises the target
+/// via [`BalloonHandle`], the guest hands over page-frame numbers it gave up.
+/// Both paths `madvise` the backing host pages reusable, shrinking the VM's real
+/// footprint — the RAM-coexistence levers from MEMORY.md.
+pub struct BalloonDevice {
+    target_pages: Arc<AtomicU64>,
+    config_dirty: Arc<AtomicBool>,
+}
 
 impl BalloonDevice {
     const DEVICE_ID: u32 = 5;
-    // Features (low word): only free-page reporting (bit 5).
+    // Features (low word): free-page reporting (bit 5). Inflate/deflate are core.
     const F_REPORTING: u32 = 1 << 5;
-    // With only F_REPORTING the queues are inflate(0), deflate(1), reporting(2).
+    // With only F_REPORTING: inflate(0), deflate(1), reporting(2).
+    const INFLATE_VQ: usize = 0;
     const REPORTING_VQ: usize = 2;
+    // Balloon page-frame numbers are in 4 KiB units, regardless of guest page size.
+    const BALLOON_PAGE: u64 = 4096;
     // macOS: mark pages reusable and immediately drop them from the resident set.
     const MADV_FREE_REUSABLE: i32 = 7;
+
+    pub fn new(target_pages: Arc<AtomicU64>, config_dirty: Arc<AtomicBool>) -> Self {
+        Self { target_pages, config_dirty }
+    }
+
+    pub fn handle(&self) -> BalloonHandle {
+        BalloonHandle {
+            target_pages: self.target_pages.clone(),
+            config_dirty: self.config_dirty.clone(),
+        }
+    }
+
+    fn madvise(ram: &GuestRam, gpa: u64, len: usize) {
+        if let Some(p) = ram.host_ptr_at(gpa, len) {
+            unsafe { libc::madvise(p as *mut libc::c_void, len, Self::MADV_FREE_REUSABLE) };
+        }
+    }
 }
 
 impl VirtioDevice for BalloonDevice {
@@ -398,17 +447,44 @@ impl VirtioDevice for BalloonDevice {
         3
     }
 
-    /// On the reporting queue each descriptor is a range of free guest RAM; hand
-    /// the backing host pages back to the OS. Inflate/deflate are unused (we set
-    /// no target), so they just complete.
+    /// Config space: `num_pages` (offset 0) is the inflate target the guest reads.
+    fn config(&self, off: u64) -> u32 {
+        match off {
+            0 => self.target_pages.load(Ordering::Relaxed) as u32,
+            _ => 0,
+        }
+    }
+
+    fn config_changed(&self) -> bool {
+        self.config_dirty.load(Ordering::Relaxed)
+    }
+
+    fn ack_config(&self) {
+        self.config_dirty.store(false, Ordering::Relaxed);
+    }
+
     fn handle(&mut self, queue: usize, ram: &GuestRam, bufs: &[Buf]) -> u32 {
-        if queue == Self::REPORTING_VQ {
-            for b in bufs {
-                let len = b.len as usize;
-                if let Some(p) = ram.host_ptr_at(b.addr, len) {
-                    unsafe { libc::madvise(p as *mut libc::c_void, len, Self::MADV_FREE_REUSABLE) };
+        match queue {
+            // Inflate: each buffer is an array of little-endian 4 KiB PFNs the
+            // guest is handing back; drop the backing host pages.
+            Self::INFLATE_VQ => {
+                for b in bufs {
+                    let n = b.len / 4;
+                    for i in 0..n as u64 {
+                        let pfn = ram.read_u32(b.addr + 4 * i) as u64;
+                        Self::madvise(ram, pfn * Self::BALLOON_PAGE, Self::BALLOON_PAGE as usize);
+                    }
                 }
             }
+            // Reporting: each descriptor is a range of free guest RAM.
+            Self::REPORTING_VQ => {
+                for b in bufs {
+                    Self::madvise(ram, b.addr, b.len as usize);
+                }
+            }
+            // Deflate (and anything else): the guest is taking pages back; they
+            // fault in on next write, nothing to do here.
+            _ => {}
         }
         0
     }

@@ -16,6 +16,7 @@ use std::net::Shutdown;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -27,6 +28,8 @@ use std::time::Duration;
 struct VmEntry {
     info: VmInfo,
     kill: Arc<AtomicBool>,
+    /// amberd's end of the control channel to the VM (balloon targets, etc.).
+    control: Option<UnixStream>,
 }
 
 type Registry = Arc<Mutex<HashMap<String, VmEntry>>>;
@@ -117,16 +120,36 @@ fn reserve(
                 rss_bytes: 0,
             },
             kill: kill.clone(),
+            control: None,
         },
     );
     Ok((id, kill))
 }
 
-/// Record a reserved VM's pid once its worker has spawned.
-fn set_pid(reg: &Registry, id: &str, pid: u32) {
+/// Record a reserved VM's pid and control channel once its worker has spawned.
+fn set_runtime(reg: &Registry, id: &str, pid: u32, control: UnixStream) {
     if let Some(e) = reg.lock().unwrap().get_mut(id) {
         e.info.pid = pid;
+        e.control = Some(control);
     }
+}
+
+/// Wire a control channel into a child command: a socketpair whose child end is
+/// dup'd to fd 3 (named via `AMBER_CONTROL_FD`). Returns amberd's end and the
+/// child's end (drop the child's end after spawning).
+fn attach_control(cmd: &mut Command) -> io::Result<(UnixStream, UnixStream)> {
+    let (host, child) = UnixStream::pair()?;
+    let child_fd = child.as_raw_fd();
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::dup2(child_fd, 3) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    cmd.env("AMBER_CONTROL_FD", "3");
+    Ok((host, child))
 }
 
 // ---- daemon ----
@@ -214,6 +237,22 @@ fn handle(
                 &Reply::Budget { budget: ram_budget().unwrap_or(0), used, rss, machine: machine_ram() },
             )?;
         }
+        Request::Balloon { id, mib } => {
+            let reply = {
+                let g = reg.lock().unwrap();
+                match g.get(&id).and_then(|e| e.control.as_ref()) {
+                    Some(ctl) => {
+                        let mut w: &UnixStream = ctl;
+                        match w.write_all(&mib.to_le_bytes()).and_then(|_| w.flush()) {
+                            Ok(()) => Reply::Ok,
+                            Err(e) => Reply::Error { message: format!("control write: {e}") },
+                        }
+                    }
+                    None => Reply::Error { message: format!("no such vm: {id}") },
+                }
+            };
+            write_reply(&mut stream, &reply)?;
+        }
         Request::Kill { id } => {
             // Signal the owner thread; it kills and reaps the child it owns.
             let found = reg.lock().unwrap().get(&id).map(|e| e.kill.clone());
@@ -282,6 +321,13 @@ fn start_detached(
         cmd.args(&argv);
     }
     cmd.stdin(Stdio::null()).stdout(out).stderr(err);
+    let (ctl_host, ctl_child) = match attach_control(&mut cmd) {
+        Ok(p) => p,
+        Err(e) => {
+            reg.lock().unwrap().remove(&id);
+            return Err(e);
+        }
+    };
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -289,7 +335,8 @@ fn start_detached(
             return Err(e);
         }
     };
-    set_pid(&reg, &id, child.id());
+    drop(ctl_child); // only the child holds its end now
+    set_runtime(&reg, &id, child.id(), ctl_host);
 
     // Background supervisor: reap on exit or kill, then deregister.
     let reg2 = reg.clone();
@@ -341,6 +388,13 @@ fn run_one_shot(
     }
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
+    let (ctl_host, ctl_child) = match attach_control(&mut cmd) {
+        Ok(p) => p,
+        Err(e) => {
+            reg.lock().unwrap().remove(&id);
+            return Err(e);
+        }
+    };
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -348,7 +402,8 @@ fn run_one_shot(
             return Err(e);
         }
     };
-    set_pid(&reg, &id, child.id());
+    drop(ctl_child); // only the child holds its end now
+    set_runtime(&reg, &id, child.id(), ctl_host);
 
     // `client_gone` is set when either relay sees the client disconnect, so the
     // supervisor below kills an otherwise-orphaned VM.
@@ -553,6 +608,15 @@ pub fn list() -> io::Result<Vec<VmInfo>> {
         Reply::Vms { vms } => Ok(vms),
         Reply::Error { message } => Err(io::Error::other(message)),
         _ => Ok(Vec::new()),
+    }
+}
+
+/// Ask a VM's balloon to reclaim toward `mib` MiB.
+pub fn balloon(id: &str, mib: u64) -> io::Result<()> {
+    match request(&Request::Balloon { id: id.to_string(), mib })? {
+        Reply::Ok => Ok(()),
+        Reply::Error { message } => Err(io::Error::other(message)),
+        _ => Ok(()),
     }
 }
 
