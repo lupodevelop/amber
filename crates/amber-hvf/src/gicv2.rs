@@ -155,6 +155,59 @@ impl GicV2 {
         }
     }
 
+    // --- snapshot -----------------------------------------------------------
+
+    /// Serialize the full controller state to a flat blob (snapshot). The software
+    /// GIC has no opaque host object, so its state round-trips as plain bytes — and
+    /// because we deliver interrupts ourselves, the restored timer just works.
+    pub fn capture(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(3 + NUM_INTID * 6 + 64);
+        v.push(self.dist_enabled as u8);
+        v.push(self.cpu_enabled as u8);
+        v.push(self.pmr);
+        for a in [&self.enabled, &self.pending, &self.active, &self.level, &self.edge] {
+            v.extend(a.iter().map(|&x| x as u8));
+        }
+        v.extend_from_slice(&self.priority);
+        v.push(self.running.len().min(255) as u8);
+        v.extend_from_slice(&self.running[..self.running.len().min(255)]);
+        v
+    }
+
+    /// Load state produced by [`capture`]. Tolerant of a short blob (missing bytes
+    /// read as 0), so a forward-compatible reader never panics.
+    pub fn restore(&mut self, b: &[u8]) {
+        let mut c = 0usize;
+        let mut next = || {
+            let x = b.get(c).copied().unwrap_or(0);
+            c += 1;
+            x
+        };
+        self.dist_enabled = next() != 0;
+        self.cpu_enabled = next() != 0;
+        self.pmr = next();
+        for i in 0..NUM_INTID {
+            self.enabled[i] = next() != 0;
+        }
+        for i in 0..NUM_INTID {
+            self.pending[i] = next() != 0;
+        }
+        for i in 0..NUM_INTID {
+            self.active[i] = next() != 0;
+        }
+        for i in 0..NUM_INTID {
+            self.level[i] = next() != 0;
+        }
+        for i in 0..NUM_INTID {
+            self.edge[i] = next() != 0;
+        }
+        for i in 0..NUM_INTID {
+            self.priority[i] = next();
+        }
+        let n = next() as usize;
+        self.running = (0..n).map(|_| next()).collect();
+    }
+
     // --- distributor MMIO ---------------------------------------------------
 
     pub fn dist_read(&self, off: u64, size: u8) -> u64 {

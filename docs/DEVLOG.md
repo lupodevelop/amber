@@ -611,9 +611,36 @@ periodic virtual timer works because we deliver it; no HVF parked-WFI is involve
 The cost is per-entry work (a `CNTV_CTL` read + a mutex + the inject syscall before
 each `hv_vcpu_run`) and console latency bounded by the Idle park (≤50 ms), both
 acceptable and optimisable later. The foundation the whole vtimer detour was for is
-now real and on by choice. Next: the actual payoff — capture/restore under swgic,
-where the periodic tick should survive the process boundary that the vGIC could
-not.
+now real and on by choice.
+
+### Step 7 — the payoff: the timer survives a restore
+
+Capture/restore under swgic. The software GIC has no opaque host object, so its
+whole state round-trips as a flat ~1.5 KB blob (`capture`/`restore` on `GicV2`)
+instead of the vGIC's 126 KB `hv_gic_state`. `capture_gic`/`restore_gic` route to
+it in swgic mode; the vcpu restore also writes back `CNTV_CVAL`/`CNTV_CTL` (the
+vGIC path skips them to avoid the busy-spin, but here HVF's vtimer is masked and we
+read the compare value ourselves, so the guest's deadline must be restored).
+
+And it works — the thing the entire detour was for:
+
+```text
+capture at TICK 3 (mid-sleep)  →  restore  →  TICK 4,5,6,7,8,9,10,11,12,13,14,15…
+```
+
+A `sleep` loop snapshotted mid-tick restores into a fresh process and the periodic
+timer **keeps firing**, one tick per second, indefinitely — where the in-kernel
+vGIC delivered exactly one stale tick and then hung forever. The reason is the
+whole point of the software GIC: we don't depend on any HVF-internal timer event or
+a parked-WFI wake; we poll the guest's `CNTV` each entry and inject INTID 27
+through a GIC whose state we fully own and restore. **M3 (snapshot/restore) is now
+functionally complete on Apple Silicon without KVM**, and M4 (fork from a warm
+template) is unblocked behind the same `AMBER_GIC=sw` switch.
+
+One footgun to close later: a swgic snapshot and a vGIC snapshot have incompatible
+`gic.bin` formats, and `meta.json` does not yet record which, so a restore must use
+the same `AMBER_GIC` mode it was captured with. Recording the GIC kind in the
+snapshot and refusing a mismatch is the obvious guard.
 
 ---
 

@@ -110,6 +110,11 @@ impl Hypervisor for HvfVm {
     }
 
     fn capture_gic(&self) -> Result<Vec<u8>> {
+        // Software GIC: its state is plain bytes (and, unlike the vGIC, the
+        // restored timer survives because we deliver it ourselves).
+        if let Some(gic) = &self.swgic {
+            return Ok(gic.lock().unwrap().capture());
+        }
         unsafe {
             let state = hv_gic_state_create();
             if state.is_null() {
@@ -128,6 +133,10 @@ impl Hypervisor for HvfVm {
     }
 
     fn restore_gic(&self, blob: &[u8]) -> Result<()> {
+        if let Some(gic) = &self.swgic {
+            gic.lock().unwrap().restore(blob);
+            return Ok(());
+        }
         unsafe {
             check(
                 hv_gic_set_state(blob.as_ptr() as *const _, blob.len()),
@@ -451,17 +460,20 @@ impl Vcpu for HvfVcpu {
         }
 
         // System registers: set each captured one. Read-only ID/feature regs
-        // refuse and are skipped. Do NOT write the virtual-timer compare/control
-        // (CNTV_CVAL/CNTV_CTL): with HVF's in-kernel vGIC, pinning the stale
-        // compare value on a fresh timeline wedges the timer (a stale CVAL fires
-        // continuously -> busy-spin; a fresh one never fires). QEMU's HVF backend
-        // reached the same conclusion and restores the vtimer only through
-        // hv_vcpu_set_vtimer_offset (above). NOTE: with this, the periodic timer
-        // tick does not yet resume on HVF after restore — a known HVF-specific
-        // gap (clean save/restore is the KVM path, M8). Non-timer execution
-        // resumes correctly.
+        // refuse and are skipped. The virtual-timer compare/control
+        // (CNTV_CVAL/CNTV_CTL) is the subtle one:
+        //  - vGIC mode: do NOT write them. Pinning the stale compare value on a
+        //    fresh timeline wedges HVF's internal timer (stale CVAL fires
+        //    continuously -> busy-spin; a fresh one never fires), and HVF owns the
+        //    timer→GIC delivery anyway, so the periodic tick does not resume — the
+        //    known HVF gap that motivated the software GIC.
+        //  - swgic mode: DO write them. We keep HVF's vtimer masked and deliver the
+        //    timer ourselves by polling CNTV each entry, so the guest's compare
+        //    value must be restored for the deadline to be read correctly. This is
+        //    what makes the periodic tick survive a restore here.
+        let restore_cntv = self.swgic.is_some();
         for &(id, v) in &cpu.sysregs {
-            if id == HV_SYS_REG_CNTV_CTL_EL0 || id == HV_SYS_REG_CNTV_CVAL_EL0 {
+            if !restore_cntv && (id == HV_SYS_REG_CNTV_CTL_EL0 || id == HV_SYS_REG_CNTV_CVAL_EL0) {
                 continue;
             }
             unsafe { hv_vcpu_set_sys_reg(self.handle, id, v) };
