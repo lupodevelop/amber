@@ -93,6 +93,14 @@ extern "C" {
     pub fn hv_gic_get_spi_interrupt_range(base: *mut u32, count: *mut u32) -> hv_return_t;
     // Set a shared peripheral interrupt's level by absolute INTID.
     pub fn hv_gic_set_spi(intid: u32, level: bool) -> hv_return_t;
+    // Raise/lower the vcpu's IRQ (or FIQ) line directly. The software GICv2 uses
+    // this to deliver interrupts without an in-kernel vGIC. NOTE: HVF clears the
+    // pending interrupt after each hv_vcpu_run, so it must be set before every run.
+    pub fn hv_vcpu_set_pending_interrupt(
+        vcpu: hv_vcpu_t,
+        irq_type: hv_interrupt_type_t,
+        pending: bool,
+    ) -> hv_return_t;
 
     // --- snapshot capture ---
     // SIMD/FP registers Q0..Q31, 16 bytes each. The `value` out-pointer makes the
@@ -121,6 +129,10 @@ pub type hv_sys_reg_t = u16;
 pub const HV_SYS_REG_MPIDR_EL1: hv_sys_reg_t = 0xc005;
 pub const HV_SYS_REG_CNTV_CTL_EL0: hv_sys_reg_t = 0xdf19; // bit0 ENABLE, bit1 IMASK, bit2 ISTATUS
 pub const HV_SYS_REG_CNTV_CVAL_EL0: hv_sys_reg_t = 0xdf1a;
+
+// hv_interrupt_type_t: IRQ = 0, FIQ = 1.
+pub type hv_interrupt_type_t = u32;
+pub const HV_INTERRUPT_TYPE_IRQ: hv_interrupt_type_t = 0;
 
 /// Opaque GIC configuration object (struct hv_gic_config_s *).
 pub type hv_gic_config_t = *mut c_void;

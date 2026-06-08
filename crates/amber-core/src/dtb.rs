@@ -84,7 +84,15 @@ pub fn build(p: &DtbParams) -> Result<Vec<u8>> {
     // non-backed GICv2 stub that only keeps the tree well-formed (the M0 path).
     if let Some(g) = p.gic {
         let intc = fdt.begin_node(&format!("intc@{:x}", g.dist_base)).map_err(fdt_err)?;
-        fdt.property_string("compatible", "arm,gic-v3").map_err(fdt_err)?;
+        // GICv3: distributor + redistributor. GICv2 (amber's software GIC):
+        // distributor + CPU interface (the `redist_*` region), as a
+        // cortex-a15-gic the kernel's gic-v2 driver binds. GICv2 advertises 3
+        // interrupt cells too (type, number, flags), matching the timer node.
+        let compatible = match g.kind {
+            crate::GicKind::V3 => "arm,gic-v3",
+            crate::GicKind::V2 => "arm,cortex-a15-gic",
+        };
+        fdt.property_string("compatible", compatible).map_err(fdt_err)?;
         fdt.property_u32("#interrupt-cells", 3).map_err(fdt_err)?;
         fdt.property_null("interrupt-controller").map_err(fdt_err)?;
         fdt.property_array_u64(

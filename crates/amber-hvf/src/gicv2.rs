@@ -36,7 +36,6 @@ mod gicd {
     pub const ITARGETSR: u64 = 0x800;
     pub const ICFGR: u64 = 0xc00;
     pub const SGIR: u64 = 0xf00;
-    pub const END: u64 = 0x1000;
 }
 
 /// CPU-interface register offsets (within the GICC MMIO window).
@@ -153,15 +152,6 @@ impl GicV2 {
         if i < NUM_INTID {
             self.level[i] = high;
             self.edge[i] = false;
-        }
-    }
-
-    /// Make an INTID pending as an edge (e.g. injecting the virtual timer PPI when
-    /// it is due). Idempotent: sets the latched bit.
-    pub fn set_pending(&mut self, intid: u32) {
-        let i = intid as usize;
-        if i < NUM_INTID {
-            self.pending[i] = true;
         }
     }
 
@@ -370,11 +360,6 @@ fn extract(reg: u64, off: u64, size: u8) -> u64 {
     (reg >> shift) & mask
 }
 
-/// Does `off` fall in the distributor window [0, 0x1000)?
-pub fn in_dist(off: u64) -> bool {
-    off < gicd::END
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -434,7 +419,7 @@ mod tests {
         g.edge[ppi as usize] = true;
         g.dist_write(gicd::IPRIORITYR + ppi as u64, 1, 0x80);
         g.dist_write(gicd::ISENABLER, 4, 1 << ppi); // PPI 27 in the first ISENABLER
-        g.set_pending(ppi);
+        g.dist_write(gicd::ISPENDR, 4, 1 << ppi); // make it pending via GICD_ISPENDR
         assert!(g.irq_pending());
         assert_eq!(g.cpu_read(gicc::IAR, 4) as u32, ppi);
         // Edge latch consumed by the acknowledge.

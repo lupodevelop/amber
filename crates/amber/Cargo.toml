@@ -19,6 +19,11 @@ toml = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+[features]
+# Forward to the backend's software-GICv2 mode (macOS arm64 only); selected at
+# runtime with AMBER_GIC=sw. Build: `cargo build -p amber --features swgic`.
+swgic = ["amber-hvf/swgic"]
+
 # The HVF backend is linked into the binary only on macOS arm64. main.rs already
 # cfg-gates the call site, so off-target the binary builds without it.
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]

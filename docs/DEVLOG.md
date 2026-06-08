@@ -579,10 +579,41 @@ level vs edge (devices are level and follow their line; the timer PPI and SGIs a
 edge), a PMR + running-priority preemption gate, and the IAR/EOIR acknowledge
 cycle. No HVF calls in it, so it unit-tests without a hypervisor: the
 enable→pend→ack→EOI cycle, PMR masking, edge-latch consumption, and priority
-ordering all pass. Next: wire it into the HVF backend (skip `hv_gic_create`, route
-GICD/GICC MMIO and `VTIMER_ACTIVATED` through it, raise the IRQ line before
-`hv_vcpu_run`), emit the GICv2 DTB node, and boot to a shell on it — then the
-timer and snapshot-survival that motivated all this.
+ordering all pass.
+
+### Step 6 — wired into HVF, boots to a shell with a live timer
+
+Plumbed the software GIC through the backend behind `--features swgic` +
+`AMBER_GIC=sw` (default stays the in-kernel vGIC, unchanged and regression-tested).
+In swgic mode `HvfVm::create` skips `hv_gic_create` and holds a shared
+`Arc<Mutex<GicV2>>`; `GicInfo` gained a `kind` (V2/V3) so the DTB emits the
+`arm,cortex-a15-gic` node (distributor + CPU interface) instead of `arm,gic-v3`.
+The vcpu run loop does the rest:
+
+- **Injection.** Before every `hv_vcpu_run`, raise the vcpu IRQ line via
+  `hv_vcpu_set_pending_interrupt(IRQ, gic.irq_pending())` — it is auto-cleared each
+  run, so it is re-evaluated each iteration.
+- **GICD/GICC MMIO.** Data aborts in the GIC windows are serviced against the
+  software GIC in-process and resumed (PC stepped), never surfacing to `vm.rs`.
+- **The timer.** Keep HVF's vtimer masked and drive INTID 27's line ourselves from
+  the guest's `CNTV_CTL` (enabled, unmasked, ISTATUS) before each entry — so a
+  re-armed timer is picked up without any HVF timer event at all.
+- **WFI.** With no vGIC it traps as `EC_WFX` again (the M0 behaviour); step past it
+  and surface Idle, and `vm.rs` parks until the timer is due exactly as before.
+
+Result, first boot on the software GIC: the guest comes up, `/proc/interrupts`
+shows `27 GIC-0 arch_timer` and `33 GIC-0 uart-pl011` (our INTIDs, our
+controller), and it powers down cleanly. And the headline check — a `sleep` loop,
+the exact thing that hangs after a restore on the vGIC — runs perfectly:
+`TICK 1..5` at uptimes `0.07, 1.08, 2.08, 3.08, 4.09`, real one-second gaps. The
+periodic virtual timer works because we deliver it; no HVF parked-WFI is involved.
+
+The cost is per-entry work (a `CNTV_CTL` read + a mutex + the inject syscall before
+each `hv_vcpu_run`) and console latency bounded by the Idle park (≤50 ms), both
+acceptable and optimisable later. The foundation the whole vtimer detour was for is
+now real and on by choice. Next: the actual payoff — capture/restore under swgic,
+where the periodic tick should survive the process boundary that the vGIC could
+not.
 
 ---
 

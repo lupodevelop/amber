@@ -12,3 +12,10 @@ repository.workspace = true
 amber-core.workspace = true
 libc.workspace = true
 log.workspace = true
+
+[features]
+# Software GICv2 backend: skip the in-kernel vGIC and emulate the GIC in
+# userspace, which restores native WFI trapping and a working post-restore
+# virtual timer. Off by default (the in-kernel vGIC is faster); select at runtime
+# with AMBER_GIC=sw once built in.
+swgic = []

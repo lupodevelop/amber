@@ -6,10 +6,18 @@ mod ffi;
 mod gicv2;
 mod sysregs;
 
-use amber_core::hypervisor::{decode_data_abort, Hypervisor, Vcpu, VmExit};
+use amber_core::hypervisor::{decode_data_abort, Hypervisor, MmioAccess, MmioOp, Vcpu, VmExit};
 use amber_core::snapshot::CpuSnapshot;
-use amber_core::{Error, GicInfo, GuestMemory, Result};
+use amber_core::{Error, GicInfo, GicKind, GuestMemory, Result};
 use ffi::*;
+use gicv2::GicV2;
+use std::sync::{Arc, Mutex};
+
+/// Whether to use the software GICv2 instead of the in-kernel vGIC. Compiled in
+/// only with the `swgic` feature, then selected at runtime with `AMBER_GIC=sw`.
+fn swgic_mode() -> bool {
+    cfg!(feature = "swgic") && std::env::var("AMBER_GIC").as_deref() == Ok("sw")
+}
 
 fn check(ret: hv_return_t, what: &str) -> Result<()> {
     if ret == HV_SUCCESS {
@@ -29,6 +37,10 @@ fn align_up(x: u64, a: u64) -> u64 {
 
 pub struct HvfVm {
     gic: GicInfo,
+    /// The software GICv2, when running in `swgic` mode; None means the in-kernel
+    /// vGIC. Shared (Arc/Mutex) because `set_irq` is called from the console reader
+    /// thread while the vcpu thread reads/writes it in the run loop.
+    swgic: Option<Arc<Mutex<GicV2>>>,
 }
 
 impl Hypervisor for HvfVm {
@@ -47,8 +59,23 @@ impl Hypervisor for HvfVm {
                 "hv_vm_map",
             )?;
         }
-        let gic = Self::create_gic()?;
-        Ok(HvfVm { gic })
+        if swgic_mode() {
+            // Software GICv2: no in-kernel vGIC. The distributor and CPU interface
+            // live at the QEMU `virt` GICv2 addresses; both are emulated MMIO.
+            use amber_core::layout::{GIC_CPU_BASE, GIC_CPU_SIZE, GIC_DIST_BASE, GIC_DIST_SIZE};
+            log::info!("GICv2 (software): dist {GIC_DIST_BASE:#x}, cpu {GIC_CPU_BASE:#x}");
+            let gic = GicInfo {
+                dist_base: GIC_DIST_BASE,
+                dist_size: GIC_DIST_SIZE,
+                redist_base: GIC_CPU_BASE,
+                redist_size: GIC_CPU_SIZE,
+                kind: GicKind::V2,
+            };
+            Ok(HvfVm { gic, swgic: Some(Arc::new(Mutex::new(GicV2::new()))) })
+        } else {
+            let gic = Self::create_gic()?;
+            Ok(HvfVm { gic, swgic: None })
+        }
     }
 
     fn create_vcpu(&mut self, _id: u8) -> Result<HvfVcpu> {
@@ -66,7 +93,7 @@ impl Hypervisor for HvfVm {
                 "set MPIDR_EL1",
             )?;
         }
-        Ok(HvfVcpu { handle, exit })
+        Ok(HvfVcpu { handle, exit, swgic: self.swgic.clone(), vtimer_masked: false })
     }
 
     fn gic_info(&self) -> Option<GicInfo> {
@@ -74,7 +101,12 @@ impl Hypervisor for HvfVm {
     }
 
     fn set_irq(&self, intid: u32, level: bool) -> Result<()> {
-        unsafe { check(hv_gic_set_spi(intid, level), "hv_gic_set_spi") }
+        if let Some(gic) = &self.swgic {
+            gic.lock().unwrap().set_level(intid, level);
+            Ok(())
+        } else {
+            unsafe { check(hv_gic_set_spi(intid, level), "hv_gic_set_spi") }
+        }
     }
 
     fn capture_gic(&self) -> Result<Vec<u8>> {
@@ -184,6 +216,7 @@ impl HvfVm {
             dist_size: dist_size as u64,
             redist_base,
             redist_size: redist_size as u64,
+            kind: GicKind::V3,
         })
     }
 }
@@ -199,6 +232,11 @@ impl Drop for HvfVm {
 pub struct HvfVcpu {
     handle: hv_vcpu_t,
     exit: *mut hv_vcpu_exit_t,
+    /// Shared software GICv2 in `swgic` mode (None for the in-kernel vGIC).
+    swgic: Option<Arc<Mutex<GicV2>>>,
+    /// Whether HVF's virtual timer is currently masked. In `swgic` mode we keep it
+    /// masked and drive the timer line ourselves; the flag avoids redundant calls.
+    vtimer_masked: bool,
 }
 
 impl HvfVcpu {
@@ -215,7 +253,75 @@ impl HvfVcpu {
         unsafe { check(hv_vcpu_get_sys_reg(self.handle, reg, &mut v), "get_sys")? };
         Ok(v)
     }
+
+    /// Before each guest entry in swgic mode: keep HVF's vtimer masked (we own the
+    /// timer), drive the virtual-timer line (PPI 27) from the guest's CNTV, and
+    /// raise the vcpu IRQ line iff the software GIC has a deliverable interrupt.
+    /// `hv_vcpu_set_pending_interrupt` is cleared after every run, so this re-asserts
+    /// it each iteration.
+    fn swgic_prep(&mut self) -> Result<()> {
+        let Some(gic) = self.swgic.clone() else { return Ok(()) };
+        if !self.vtimer_masked {
+            unsafe { check(hv_vcpu_set_vtimer_mask(self.handle, true), "vtimer mask")? };
+            self.vtimer_masked = true;
+        }
+        // Virtual timer output: enabled (bit0), not masked (bit1), fired (bit2).
+        let ctl = self.get_sys(HV_SYS_REG_CNTV_CTL_EL0).unwrap_or(0);
+        let due = ctl & 0b001 != 0 && ctl & 0b010 == 0 && ctl & 0b100 != 0;
+        let pend = {
+            let mut g = gic.lock().unwrap();
+            g.set_level(VTIMER_INTID, due);
+            g.irq_pending()
+        };
+        unsafe {
+            check(
+                hv_vcpu_set_pending_interrupt(self.handle, HV_INTERRUPT_TYPE_IRQ, pend),
+                "set pending irq",
+            )
+        }
+    }
+
+    /// Service a GICD/GICC MMIO access against the software GIC. Returns true if the
+    /// address was in the GIC (caller steps PC and resumes); false otherwise (or in
+    /// vGIC mode), so the access falls through to the run loop's device model.
+    fn swgic_mmio(&mut self, access: &MmioAccess) -> Result<bool> {
+        let Some(gic) = self.swgic.clone() else { return Ok(false) };
+        use amber_core::layout::{GIC_CPU_BASE, GIC_CPU_SIZE, GIC_DIST_BASE, GIC_DIST_SIZE};
+        let ipa = access.ipa;
+        let (off, is_cpu) = if ipa >= GIC_DIST_BASE && ipa < GIC_DIST_BASE + GIC_DIST_SIZE {
+            (ipa - GIC_DIST_BASE, false)
+        } else if ipa >= GIC_CPU_BASE && ipa < GIC_CPU_BASE + GIC_CPU_SIZE {
+            (ipa - GIC_CPU_BASE, true)
+        } else {
+            return Ok(false);
+        };
+        let mut g = gic.lock().unwrap();
+        match access.op {
+            MmioOp::Read { reg } => {
+                let v = if is_cpu {
+                    g.cpu_read(off, access.size)
+                } else {
+                    g.dist_read(off, access.size)
+                };
+                drop(g);
+                if reg != 31 {
+                    self.set_x(reg, v)?;
+                }
+            }
+            MmioOp::Write { value, .. } => {
+                if is_cpu {
+                    g.cpu_write(off, access.size, value);
+                } else {
+                    g.dist_write(off, access.size, value);
+                }
+            }
+        }
+        Ok(true)
+    }
 }
+
+/// The EL1 virtual timer is PPI 11, i.e. GIC INTID 27.
+const VTIMER_INTID: u32 = 27;
 
 /// Convert a mach-timebase tick count to nanoseconds. CNTVCT/CNTV_CVAL on Apple
 /// Silicon share `mach_absolute_time`'s timebase, so the ratio applies directly.
@@ -378,6 +484,7 @@ impl Vcpu for HvfVcpu {
         // recursion would grow the stack without bound. Only MMIO/Idle/Shutdown/
         // Fault leave the loop and reach the backend-agnostic run loop in vm.rs.
         loop {
+            self.swgic_prep()?;
             unsafe { check(hv_vcpu_run(self.handle), "hv_vcpu_run")? };
             let exit = unsafe { *self.exit };
 
@@ -401,6 +508,13 @@ impl Vcpu for HvfVcpu {
                         // Guest WFI/WFE: surface as Idle so the run loop can park
                         // until the timer is due or console input arrives, then
                         // resume. The deadline comes from `pending_timer_ns`.
+                        // In swgic mode WFI really traps here (no in-kernel vGIC),
+                        // and ELR points AT the WFI, so step past it or the guest
+                        // re-executes the same WFI on resume.
+                        if self.swgic.is_some() {
+                            let pc = self.pc()?;
+                            self.set_pc(pc + 4)?;
+                        }
                         return Ok(VmExit::Idle);
                     }
 
@@ -442,16 +556,26 @@ impl Vcpu for HvfVcpu {
 
                     let get = |i: u8| self.get_x(i).unwrap_or(0);
                     if let Some(access) = decode_data_abort(esr, ipa, get) {
+                        // GICD/GICC accesses are handled in-process by the software
+                        // GIC and resumed; everything else is a device the run loop
+                        // models, so surface it.
+                        if self.swgic_mmio(&access)? {
+                            let pc = self.pc()?;
+                            self.set_pc(pc + 4)?;
+                            continue;
+                        }
                         return Ok(VmExit::Mmio { access });
                     }
                     let pc = self.pc().unwrap_or(0);
                     return Ok(VmExit::Fault { pc, esr, ipa });
                 }
                 HV_EXIT_REASON_VTIMER_ACTIVATED => {
-                    // With the vGIC the timer is wired internally and this exit
-                    // should not occur; if it does, clear the mask HVF auto-set
-                    // and keep running rather than treating it as idle.
-                    unsafe { check(hv_vcpu_set_vtimer_mask(self.handle, false), "vtimer unmask")? };
+                    // swgic keeps the vtimer masked and drives the timer line from
+                    // CNTV itself, so this should not fire; re-mask if it does.
+                    // With the in-kernel vGIC the timer is wired internally and
+                    // this is likewise unexpected — clear the auto-set mask and run.
+                    let mask = self.swgic.is_some();
+                    unsafe { check(hv_vcpu_set_vtimer_mask(self.handle, mask), "vtimer mask")? };
                     continue;
                 }
                 HV_EXIT_REASON_CANCELED => return Ok(VmExit::Idle),

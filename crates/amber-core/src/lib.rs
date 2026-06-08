@@ -26,8 +26,19 @@ pub use vm::{SnapshotReq, Vm, VmConfig};
 pub struct GicInfo {
     pub dist_base: u64,
     pub dist_size: u64,
+    /// Second region: the redistributor (GICv3) or the CPU interface (GICv2),
+    /// per `kind`.
     pub redist_base: u64,
     pub redist_size: u64,
+    pub kind: GicKind,
+}
+
+/// Which GIC architecture the backend presents. GICv3 is the in-kernel vGIC;
+/// GICv2 is amber's software interrupt controller (second region = CPU interface).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GicKind {
+    V2,
+    V3,
 }
 
 /// The guest-physical memory map. The QEMU `virt` layout, which is the reference

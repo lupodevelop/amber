@@ -75,7 +75,18 @@
       "Bash(grep -oE 'HV_SYS_REG_[A-Z0-9_]+ +\\(API_AVAILABLE\\\\\\([^\\)]*\\\\\\) +\\)?= 0x[0-9a-fA-F]+' __CMDSUB_OUTPUT__/System/Library/Frameworks/Hypervisor.framework/Headers/hv_vcpu_types.h)",
       "Bash(python3 - __TRACKED_VAR__/hv_vcpu_types.h)",
       "WebFetch(domain:www.mail-archive.com)",
-      "WebFetch(domain:raw.githubusercontent.com)"
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(HV=/System/Library/Frameworks/Hypervisor.framework/Hypervisor *)",
+      "Read(//System/Library/Frameworks/Hypervisor.framework/**)",
+      "Bash(echo \"build: $\\(cargo build --release 2>&1)",
+      "Read(//tmp/**)",
+      "Bash(timeout 12 ./target/release/amber restore /tmp/amber-snap-test)",
+      "Bash(echo \"=== exit: $? \\(124=timeout\\) ===\")",
+      "Bash(echo \"=== exit: $? ===\")",
+      "Bash(git checkout *)",
+      "Bash(cargo test *)",
+      "Bash(perl -0pi -e 's/range\\\\\\(o, gicd::IPRIORITYR, 4\\\\\\)/range\\(o, gicd::IPRIORITYR, 64\\)/g; s/range\\\\\\(o, gicd::ITARGETSR, 4\\\\\\)/range\\(o, gicd::ITARGETSR, 64\\)/g; s/range\\\\\\(off, gicd::IPRIORITYR, 4\\\\\\)/range\\(off, gicd::IPRIORITYR, 64\\)/g' crates/amber-hvf/src/gicv2.rs)",
+      "Bash(echo \"done: $\\(cargo build --release -p amber --features swgic 2>&1)"
     ],
     "additionalDirectories": [
       "/private/tmp/snap",
