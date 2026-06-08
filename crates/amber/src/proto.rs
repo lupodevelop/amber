@@ -45,6 +45,9 @@ pub enum Request {
     Budget,
     /// Ask a VM's balloon to reclaim toward `mib` MiB (active reclaim).
     Balloon { id: String, mib: u64 },
+    /// Fork a VM from a warm template (a snapshot directory): hand off a
+    /// pre-staged paused worker if the pool has one, else stage one now.
+    Fork { template: String },
     /// Kill a VM by id.
     Kill { id: String },
     /// Stop the daemon.

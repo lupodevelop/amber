@@ -92,6 +92,10 @@ pub struct Vm {
     virtio: Vec<VirtioDev>,
     balloon: Option<(BalloonHandle, u32)>,
     control_fd: Option<RawFd>,
+    /// Warm-pool gate: when set, `run` finishes the restore, signals readiness on
+    /// the control fd, and blocks for a one-byte "go" before resuming the guest —
+    /// so the expensive work is pre-staged and a fork is just the go.
+    paused: bool,
     snapshot: Option<SnapshotReq>,
     disk_path: Option<PathBuf>,
     /// When set, `run` restores this captured state instead of booting a kernel.
@@ -134,6 +138,7 @@ impl Vm {
             virtio,
             balloon: Some(balloon),
             control_fd: cfg.control_fd,
+            paused: false,
             snapshot: cfg.snapshot.clone(),
             disk_path: cfg.disk.clone(),
             restore: None,
@@ -170,6 +175,7 @@ impl Vm {
             virtio,
             balloon: Some(balloon),
             control_fd: None,
+            paused: false,
             snapshot: None,
             disk_path: loaded.meta.disk.clone().map(PathBuf::from),
             restore: Some(loaded),
@@ -183,6 +189,15 @@ impl Vm {
 
     pub fn memory(&self) -> &GuestMemory {
         &self.mem
+    }
+
+    /// Attach a control fd and (optionally) arm the warm-pool pause gate. Used by
+    /// the daemon when pre-staging a pooled fork: the worker restores, signals
+    /// ready on `fd`, and waits for a go byte before the guest's first instruction.
+    pub fn with_control(mut self, fd: RawFd, paused: bool) -> Self {
+        self.control_fd = Some(fd);
+        self.paused = paused;
+        self
     }
 
     /// Boot and run on backend `H` until shutdown or a fatal fault.
@@ -201,6 +216,7 @@ impl Vm {
             mut virtio,
             balloon,
             control_fd,
+            paused,
             snapshot,
             disk_path,
             restore,
@@ -256,6 +272,26 @@ impl Vm {
             })?;
             mem.write(dtb_addr, &blob)?;
             vcpu.set_boot_regs(entry, dtb_addr)?;
+        }
+
+        // Warm-pool gate. All the costly work (VM + GIC + register restore) is now
+        // done; if this is a pooled fork, signal the daemon we are ready and block
+        // for a one-byte "go" before the guest runs. A fork is then just this
+        // handshake, not a spawn. (The same control fd carries balloon targets
+        // afterward, read by the control thread below — the go byte comes first.)
+        if paused {
+            if let Some(fd) = control_fd {
+                let ready = [1u8];
+                unsafe { libc::write(fd, ready.as_ptr() as *const libc::c_void, 1) };
+                let mut go = [0u8; 1];
+                loop {
+                    let n = unsafe { libc::read(fd, go.as_mut_ptr() as *mut libc::c_void, 1) };
+                    // 1 = released; 0 = daemon gone (proceed); -1 = retry on EINTR.
+                    if n >= 0 || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                        break;
+                    }
+                }
+            }
         }
 
         let pl011_lo = layout::PL011_BASE;

@@ -802,10 +802,35 @@ It works, and the numbers are the point:
 The remaining ~55 ms is process spawn + `hv_vm_create`/`hv_vm_map` + the register
 restore, all per-fork and inherent to the one-process-per-VM model. The lever that
 takes fork into single-digit ms is a **warm pool**: keep N forks pre-spawned and
-paused so a request is a handoff, not a spawn — the M4 piece still to build, now on
-a working CoW fork. (Templates and forks must use `AMBER_GIC=sw`: the periodic
-timer only survives a restore on the software GIC, and the snapshot's `gic_kind`
-guard enforces the match.)
+paused so a request is a handoff, not a spawn — built next, on this working CoW
+fork. (Templates and forks must use `AMBER_GIC=sw`: the periodic timer only
+survives a restore on the software GIC, and the snapshot's `gic_kind` guard
+enforces the match.)
+
+### Warm pool — the handoff, not the spawn
+
+The pool moves the restore off the request's critical path. A **pause gate** in the
+run loop is the enabler: after a worker finishes the costly work (CoW map + GIC +
+register restore) but *before* the guest's first instruction, if it was launched
+paused it writes a ready byte to its control channel and blocks for a one-byte go.
+The daemon keeps a per-template pool of these pre-staged, warmed workers; a `Fork`
+request pops one and just sends the go (a ~free server-side handoff), then refills
+the pool in the background. If the pool is empty it stages one inline (the cold
+path). Pooled forks are ordinary registry VMs — they show in `ps`, count against
+the budget, and are reaped by `down`/`rm` — just parked at the gate. The control
+channel carries the go byte first, then the existing 8-byte balloon targets, so one
+socket serves both.
+
+`amber fork <template>` drives it. Measured against a ~13–15 ms client round-trip
+floor (`amber ps`): a **cold** fork (empty pool, restore inline) is ~20 ms; a
+**warm** fork (pre-staged) is ~8–11 ms — i.e. at the floor, the restore fully
+hidden. Three warm forks of one template each resume independently (tens of
+thousands of output lines apiece) at ~10 MiB private RAM each. The absolute numbers
+are small because CoW restore is already cheap (~10 ms server-side); the pool's
+value grows with restore cost (bigger guests, colder caches), and either way the
+fork is now a handoff, not a spawn. Interactive I/O hand-off through the pool (vs
+the current detached-to-log forks) and budget-aware pool sizing/eviction are the
+follow-ups.
 
 ---
 

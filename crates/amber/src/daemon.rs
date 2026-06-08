@@ -34,6 +34,10 @@ struct VmEntry {
 
 type Registry = Arc<Mutex<HashMap<String, VmEntry>>>;
 
+/// Warm pool: template directory -> ids of pre-staged paused workers ready to be
+/// released. A fork pops one (a ~ms handoff) instead of spawning (~tens of ms).
+type Pool = Arc<Mutex<HashMap<String, Vec<String>>>>;
+
 /// Default per-VM RAM when no template `ram_cap` applies (matches `VmConfig`).
 const DEFAULT_MEM_BYTES: u64 = 512 * 1024 * 1024;
 
@@ -152,6 +156,117 @@ fn attach_control(cmd: &mut Command) -> io::Result<(UnixStream, UnixStream)> {
     Ok((host, child))
 }
 
+// ---- warm pool (M4 fork) ----
+
+/// Spawn a paused fork of `template`: a detached `restore` worker that does all
+/// the costly work (CoW map + GIC + register restore), signals ready on the
+/// control channel, and blocks for a go byte. Returns once it is warmed and
+/// registered. The caller decides whether to pool the id or release it now.
+fn spawn_paused(reg: &Registry, counter: &AtomicU64, pool: &Pool, template: &str) -> io::Result<String> {
+    let (id, kill) = reserve(reg, counter, template)
+        .map_err(|_| io::Error::new(io::ErrorKind::Other, "RAM budget exceeded"))?;
+
+    let dir = logs_dir();
+    std::fs::create_dir_all(&dir)?;
+    let out = std::fs::File::create(dir.join(format!("{id}.log")))?;
+    let err = out.try_clone()?;
+
+    let exe = std::env::current_exe()?;
+    let mut cmd = Command::new(exe);
+    // The template only restores correctly on the software GIC (the timer survives
+    // there), so the worker runs in swgic mode regardless of the daemon's env.
+    cmd.arg("restore").arg(template);
+    cmd.env("AMBER_PAUSED", "1").env("AMBER_GIC", "sw");
+    cmd.stdin(Stdio::null()).stdout(out).stderr(err);
+    let (mut ctl_host, ctl_child) = match attach_control(&mut cmd) {
+        Ok(p) => p,
+        Err(e) => {
+            reg.lock().unwrap().remove(&id);
+            return Err(e);
+        }
+    };
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            reg.lock().unwrap().remove(&id);
+            return Err(e);
+        }
+    };
+    drop(ctl_child);
+    let pid = child.id();
+
+    // Block until the worker finishes the restore and signals ready (one byte).
+    // This is the warming cost, paid ahead of any fork request.
+    let mut ready = [0u8; 1];
+    if io::Read::read_exact(&mut ctl_host, &mut ready).is_err() {
+        reg.lock().unwrap().remove(&id);
+        let _ = child.kill();
+        return Err(io::Error::new(io::ErrorKind::Other, "worker failed to warm"));
+    }
+    set_runtime(reg, &id, pid, ctl_host);
+
+    let reg2 = reg.clone();
+    let pool2 = pool.clone();
+    let id2 = id.clone();
+    let tmpl2 = template.to_string();
+    thread::spawn(move || {
+        let never = AtomicBool::new(false);
+        let _ = supervise(&mut child, &kill, &never);
+        reg2.lock().unwrap().remove(&id2);
+        if let Some(v) = pool2.lock().unwrap().get_mut(&tmpl2) {
+            v.retain(|x| x != &id2);
+        }
+    });
+    Ok(id)
+}
+
+/// Release a paused worker by writing the go byte to its control channel.
+fn release(reg: &Registry, id: &str) -> bool {
+    let g = reg.lock().unwrap();
+    match g.get(id).and_then(|e| e.control.as_ref()) {
+        Some(ctl) => {
+            let mut w: &UnixStream = ctl;
+            io::Write::write_all(&mut w, &[1u8]).is_ok()
+        }
+        None => false,
+    }
+}
+
+fn handle_fork(
+    mut stream: UnixStream,
+    reg: Registry,
+    counter: Arc<AtomicU64>,
+    pool: Pool,
+    template: String,
+) -> io::Result<()> {
+    // Take a pre-warmed worker if the pool has one; otherwise stage one now.
+    let pooled = pool.lock().unwrap().get_mut(&template).and_then(|v| v.pop());
+    let id = match pooled {
+        Some(id) => id,
+        None => match spawn_paused(&reg, &counter, &pool, &template) {
+            Ok(id) => id,
+            Err(e) => {
+                write_reply(&mut stream, &Reply::Error { message: e.to_string() })?;
+                return Ok(());
+            }
+        },
+    };
+
+    if !release(&reg, &id) {
+        write_reply(&mut stream, &Reply::Error { message: format!("failed to release {id}") })?;
+        return Ok(());
+    }
+    write_reply(&mut stream, &Reply::Started { id })?;
+
+    // Refill the pool in the background so the next fork is warm too.
+    thread::spawn(move || {
+        if let Ok(rid) = spawn_paused(&reg, &counter, &pool, &template) {
+            pool.lock().unwrap().entry(template).or_default().push(rid);
+        }
+    });
+    Ok(())
+}
+
 // ---- daemon ----
 
 pub fn serve() -> io::Result<()> {
@@ -168,14 +283,16 @@ pub fn serve() -> io::Result<()> {
 
     let reg: Registry = Arc::new(Mutex::new(HashMap::new()));
     let counter = Arc::new(AtomicU64::new(0));
+    let pool: Pool = Arc::new(Mutex::new(HashMap::new()));
 
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let reg = reg.clone();
         let counter = counter.clone();
+        let pool = pool.clone();
         let sock = sock.clone();
         thread::spawn(move || {
-            if let Err(e) = handle(stream, reg, counter, &sock) {
+            if let Err(e) = handle(stream, reg, counter, pool, &sock) {
                 log::warn!("connection error: {e}");
             }
         });
@@ -195,6 +312,7 @@ fn handle(
     mut stream: UnixStream,
     reg: Registry,
     counter: Arc<AtomicU64>,
+    pool: Pool,
     sock: &std::path::Path,
 ) -> io::Result<()> {
     if !authorized(&stream) {
@@ -252,6 +370,9 @@ fn handle(
                 }
             };
             write_reply(&mut stream, &reply)?;
+        }
+        Request::Fork { template } => {
+            return handle_fork(stream, reg, counter, pool, template);
         }
         Request::Kill { id } => {
             // Signal the owner thread; it kills and reaps the child it owns.
@@ -556,6 +677,18 @@ pub fn run_client(reference: &str, argv: &[String]) -> io::Result<i32> {
 /// Start a detached VM; returns its id.
 pub fn run_detached(reference: &str, argv: &[String]) -> io::Result<String> {
     match request(&Request::RunDetached { reference: reference.to_string(), argv: argv.to_vec() })? {
+        Reply::Started { id } => Ok(id),
+        Reply::BudgetExceeded { budget, used, requested } => {
+            Err(io::Error::other(budget_msg(budget, used, requested)))
+        }
+        Reply::Error { message } => Err(io::Error::other(message)),
+        _ => Err(io::Error::other("unexpected reply")),
+    }
+}
+
+/// Fork a VM from a warm template; returns the new VM's id.
+pub fn fork(template: &str) -> io::Result<String> {
+    match request(&Request::Fork { template: template.to_string() })? {
         Reply::Started { id } => Ok(id),
         Reply::BudgetExceeded { budget, used, requested } => {
             Err(io::Error::other(budget_msg(budget, used, requested)))

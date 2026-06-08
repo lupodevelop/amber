@@ -88,11 +88,20 @@
       "Bash(perl -0pi -e 's/range\\\\\\(o, gicd::IPRIORITYR, 4\\\\\\)/range\\(o, gicd::IPRIORITYR, 64\\)/g; s/range\\\\\\(o, gicd::ITARGETSR, 4\\\\\\)/range\\(o, gicd::ITARGETSR, 64\\)/g; s/range\\\\\\(off, gicd::IPRIORITYR, 4\\\\\\)/range\\(off, gicd::IPRIORITYR, 64\\)/g' crates/amber-hvf/src/gicv2.rs)",
       "Bash(echo \"done: $\\(cargo build --release -p amber --features swgic 2>&1)",
       "Bash(rm -rf /tmp/swgic-snap)",
-      "Bash(AMBER_GIC=sw AMBER_SNAPSHOT=/tmp/swgic-snap AMBER_SNAPSHOT_AFTER_MS=2500 ./target/release/amber run alpine:3 -- sh -c 'i=0; while [ $i -lt 30 ]; do i=$\\(\\(i+1\\)\\); echo \"TICK $i\"; sleep 1; done')"
+      "Bash(AMBER_GIC=sw AMBER_SNAPSHOT=/tmp/swgic-snap AMBER_SNAPSHOT_AFTER_MS=2500 ./target/release/amber run alpine:3 -- sh -c 'i=0; while [ $i -lt 30 ]; do i=$\\(\\(i+1\\)\\); echo \"TICK $i\"; sleep 1; done')",
+      "Bash(sed -n '474,495p' crates/amber/src/main.rs)",
+      "Bash(sed -n '151,182p' crates/amber-core/src/vm.rs)",
+      "Bash(perl -0pi -e 's/\\(control_fd: cfg\\\\.control_fd,\\\\n\\)/$1            paused: false,\\\\n/; s/\\(control_fd: None,\\\\n\\(\\\\s+\\)snapshot: None,\\)/control_fd: None,\\\\n            paused: false,\\\\n            snapshot: None,/' crates/amber-core/src/vm.rs)",
+      "Bash(echo \"=== $\\(cargo build --release -p amber --features swgic 2>&1)",
+      "Bash(bash /tmp/forkbench.sh)",
+      "Bash(bash /tmp/coldwarm.sh)",
+      "Bash(echo \"default: $\\(cargo build --release -p amber 2>&1)"
     ],
     "additionalDirectories": [
       "/private/tmp/snap",
-      "/private/tmp/snap2"
+      "/private/tmp/snap2",
+      "/tmp",
+      "/private/tmp"
     ]
   }
 }

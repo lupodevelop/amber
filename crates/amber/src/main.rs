@@ -40,6 +40,7 @@ fn main() -> ExitCode {
         Some("balloon") => cmd_balloon(&args),
         Some("pull") => cmd_pull(&args),
         Some("restore") => cmd_restore(&args),
+        Some("fork") => cmd_fork(&args),
         Some("boot") => cmd_boot(&args),
         _ => {
             eprintln!("usage:");
@@ -476,18 +477,42 @@ fn cmd_restore(args: &[String]) -> ExitCode {
         eprintln!("usage: amber restore <snapshot-dir>");
         return ExitCode::FAILURE;
     };
-    let vm = match Vm::restore_from(Path::new(dir)) {
+    let mut vm = match Vm::restore_from(Path::new(dir)) {
         Ok(vm) => vm,
         Err(e) => {
             eprintln!("restore failed: {e}");
             return ExitCode::FAILURE;
         }
     };
+    // When the daemon stages a pooled fork it passes a control fd and AMBER_PAUSED:
+    // the worker signals ready and waits for the go byte before resuming the guest.
+    if let Some(fd) = std::env::var("AMBER_CONTROL_FD").ok().and_then(|s| s.parse().ok()) {
+        let paused = std::env::var("AMBER_PAUSED").as_deref() == Ok("1");
+        vm = vm.with_control(fd, paused);
+    }
     let _raw = RawTerm::enable();
     match run(vm) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("run failed: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `amber fork <template>`: hand off a warm fork of a template snapshot.
+fn cmd_fork(args: &[String]) -> ExitCode {
+    let Some(template) = args.get(2) else {
+        eprintln!("usage: amber fork <template-dir>");
+        return ExitCode::FAILURE;
+    };
+    match daemon::fork(template) {
+        Ok(id) => {
+            println!("{id}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("fork failed: {e}");
             ExitCode::FAILURE
         }
     }
