@@ -775,6 +775,40 @@ just balloon targets.
 
 ---
 
+## M4 — fork from a warm template (CoW)
+
+With snapshot/restore working on the software GIC, fork became reachable. The
+mechanism is copy-on-write memory: instead of allocating a fresh anonymous region
+and copying the 512 MiB `mem.bin` into it (the old restore path), restore now
+`mmap`s `mem.bin` `MAP_PRIVATE` (`GuestMemory::from_snapshot_cow`). Reads come from
+the file's page cache — shared physically across every fork of the same template —
+and only the pages a fork writes fault a private copy. No up-front copy, and the
+read-only base (kernel text, busybox, the booted page cache) is shared.
+
+It works, and the numbers are the point:
+
+- **Restore is correct over CoW** — a swgic template still resumes and keeps
+  ticking (4→11), so the lazy file mapping is transparent to HVF: `hv_vm_map` does
+  not wire the region, pages fault in on demand.
+- **A fork costs ~10 MiB of private RAM**, not ~140 MiB. A single forked VM's RSS
+  is ~9–10 MiB of its 512 MiB guest; three independent forks of one template total
+  **30 MiB** of private memory (vs ~420 MiB to boot three), each running its own
+  workload. This is the coexistence thesis made literal: dozens of sandboxes can
+  share one template's RAM and barely dent the budget the resident model needs.
+- **Resume is ~55 ms** to first guest instruction (vs ~100 ms+ to boot a kernel to
+  a shell), because the ~75 ms kernel boot is skipped entirely — the guest wakes
+  exactly where the template was frozen.
+
+The remaining ~55 ms is process spawn + `hv_vm_create`/`hv_vm_map` + the register
+restore, all per-fork and inherent to the one-process-per-VM model. The lever that
+takes fork into single-digit ms is a **warm pool**: keep N forks pre-spawned and
+paused so a request is a handoff, not a spawn — the M4 piece still to build, now on
+a working CoW fork. (Templates and forks must use `AMBER_GIC=sw`: the periodic
+timer only survives a restore on the software GIC, and the snapshot's `gic_kind`
+guard enforces the match.)
+
+---
+
 ## Cross-cutting choices
 
 - **Backend seam holds.** Every milestone added capability above the

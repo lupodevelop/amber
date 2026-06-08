@@ -41,6 +41,37 @@ impl GuestMemory {
         })
     }
 
+    /// Map a snapshot's `mem.bin` as guest RAM **copy-on-write**: reads come from
+    /// the file's page cache (shared across every fork of the same template),
+    /// writes fault a private anonymous copy. This is what makes a fork cheap — no
+    /// up-front copy of the whole image, and forks share all the pages they never
+    /// touch. `len` is the guest RAM size (the file is exactly that big).
+    pub fn from_snapshot_cow(base: u64, path: &std::path::Path) -> Result<Self> {
+        use std::os::fd::AsRawFd;
+        let file = std::fs::File::open(path).map_err(Error::Mmap)?;
+        let len = file.metadata().map_err(Error::Mmap)?.len() as usize;
+        // MAP_PRIVATE on a file fd is copy-on-write; the mapping survives closing
+        // the fd (the kernel keeps the reference), so `file` may drop right after.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(Error::Mmap(std::io::Error::last_os_error()));
+        }
+        Ok(Self {
+            host: NonNull::new(ptr as *mut u8).unwrap(),
+            len,
+            base,
+        })
+    }
+
     pub fn base(&self) -> u64 {
         self.base
     }

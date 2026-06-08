@@ -150,8 +150,9 @@ impl Vm {
     /// instead of booting.
     pub fn restore_from(dir: &std::path::Path) -> Result<Self> {
         let loaded = crate::snapshot::read(dir)?;
-        let mem = GuestMemory::new(loaded.meta.mem_base, loaded.meta.mem_size as usize)?;
-        crate::snapshot::load_mem(dir, &mem)?;
+        // Copy-on-write map of the snapshot's RAM: no up-front copy, and every fork
+        // of this template shares the untouched pages. This is the fork fast path.
+        let mem = GuestMemory::from_snapshot_cow(loaded.meta.mem_base, &dir.join("mem.bin"))?;
 
         let mut virtio: Vec<VirtioDev> = Vec::new();
         if let Some(path) = &loaded.meta.disk {
