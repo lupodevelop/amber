@@ -895,6 +895,36 @@ CoW fork + warm pool with interactive I/O on top — are working end to end.
 
 ---
 
+## M7 — exec: a fresh command per fork
+
+Fork resumes a template's *frozen* workload; exec runs a *new* command in a fork.
+The pieces were all in hand — warm pool, interactive relay, console I/O, exit-code
+plumbing — so M7 is a thin layer: a guest **agent** plus two commands.
+
+The agent is the template's init: `stty -echo; echo __AMBER_READY__; read -r c;
+sh -c "$c"; echo __AMBER_RC__$?; <quiet printk>; poweroff -f`. `amber template
+<image> <dir>` boots it on the software GIC and snapshots once it is blocked on the
+`read` — a ready-to-exec template. `amber exec <template> -- <cmd>` forks that
+template (warm pool), writes the command line to the agent's `read` over the
+console, streams the command's stdout to the client, and parses the `__AMBER_RC__`
+line for the exit code (filtering it out of the output). `stty -echo` stops the
+console echoing the command back; silencing printk before `poweroff` drops the
+"reboot: Power down" dmesg.
+
+Two refinements made it clean and fast. The exit code rides back in the marker line
+the client strips, so `amber exec … -- 'exit 7'` returns 7 and `false` returns 1.
+And the client returns the moment it sees the marker — the command is done and its
+output is flushed — dropping the connection so the relay reaps the fork, instead of
+waiting for the guest to finish powering off. That cut a warm exec from ~113 ms
+(poweroff-bound) to **~15 ms**.
+
+Verified end to end: `echo`, `uname -sr` → `Linux 6.12.81-0-virt`, `echo $((21*2))`
+→ `42`, `id -un; cat /etc/alpine-release` → `root` / `3.23.4`, and exit codes
+1/5/7/9 — each a different command in its own warm fork, ~15 ms apiece. This is the
+thesis in one command: a fresh, isolated sandbox per task, spawned in milliseconds.
+
+---
+
 ## Cross-cutting choices
 
 - **Backend seam holds.** Every milestone added capability above the

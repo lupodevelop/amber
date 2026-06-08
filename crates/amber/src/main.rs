@@ -40,6 +40,8 @@ fn main() -> ExitCode {
         Some("balloon") => cmd_balloon(&args),
         Some("pull") => cmd_pull(&args),
         Some("restore") => cmd_restore(&args),
+        Some("template") => cmd_template(&args),
+        Some("exec") => cmd_exec(&args),
         Some("fork") => cmd_fork(&args),
         Some("boot") => cmd_boot(&args),
         _ => {
@@ -495,6 +497,66 @@ fn cmd_restore(args: &[String]) -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("run failed: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// The in-guest agent (M7): announce readiness, read one command line, run it,
+/// report its exit code with a marker the `exec` client parses, then power off.
+/// A template snapshotted while this is blocked on `read` is "ready to exec".
+const EXEC_AGENT: &str = "stty -echo 2>/dev/null; echo __AMBER_READY__; \
+    IFS= read -r __c; sh -c \"$__c\"; __rc=$?; echo \"__AMBER_RC__$__rc\"; \
+    echo 0 >/proc/sys/kernel/printk 2>/dev/null; poweroff -f";
+
+/// `amber template <image> <dir>`: boot `image` running the exec agent and
+/// snapshot it (on the software GIC) once the agent is ready — producing a
+/// ready-to-exec template that `amber exec` forks.
+fn cmd_template(args: &[String]) -> ExitCode {
+    let (Some(image), Some(dir)) = (args.get(2), args.get(3)) else {
+        eprintln!("usage: amber template <image> <dir>");
+        return ExitCode::FAILURE;
+    };
+    // The template must restore on the software GIC (timer survives there), and we
+    // snapshot once the agent has booted and is blocked reading for a command.
+    std::env::set_var("AMBER_GIC", "sw");
+    std::env::set_var("AMBER_SNAPSHOT", dir);
+    std::env::set_var("AMBER_SNAPSHOT_AFTER_MS", "2500");
+    let vm_args = vec![
+        "amber".into(),
+        "__vm".into(),
+        image.clone(),
+        "--".into(),
+        "sh".into(),
+        "-c".into(),
+        EXEC_AGENT.into(),
+    ];
+    let r = cmd_vm(&vm_args);
+    if matches!(r, ExitCode::SUCCESS) {
+        eprintln!("template ready at {dir}: amber exec {dir} -- <command>");
+    }
+    r
+}
+
+/// `amber exec <template> -- <command>`: run a fresh command in a warm fork.
+fn cmd_exec(args: &[String]) -> ExitCode {
+    let split = args.iter().position(|a| a == "--");
+    let Some(template) = args.get(2).filter(|_| split != Some(2)) else {
+        eprintln!("usage: amber exec <template-dir> -- <command>");
+        return ExitCode::FAILURE;
+    };
+    let cmd = match split {
+        Some(i) => args[i + 1..].join(" "),
+        None => String::new(),
+    };
+    if cmd.is_empty() {
+        eprintln!("usage: amber exec <template-dir> -- <command>");
+        return ExitCode::FAILURE;
+    }
+    match daemon::exec(template, &cmd) {
+        Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
+        Err(e) => {
+            eprintln!("exec failed: {e}");
             ExitCode::FAILURE
         }
     }

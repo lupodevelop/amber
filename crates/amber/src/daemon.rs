@@ -798,6 +798,61 @@ pub fn fork_interactive(template: &str) -> io::Result<i32> {
     stream_client(&Request::Fork { template: template.to_string(), interactive: true })
 }
 
+/// Marker the in-guest agent prints after the command, carrying its exit status.
+const RC_MARKER: &[u8] = b"__AMBER_RC__";
+
+/// Run a fresh command in a fork of a ready-to-exec template (M7): fork the
+/// template, hand the agent the command line, stream its output, and return the
+/// exit code the agent reports. The agent line is filtered out of the output.
+pub fn exec(template: &str, cmd: &str) -> io::Result<i32> {
+    let mut s = connect().ok_or_else(|| io::Error::other("no amberd"))?;
+    proto::write_request(&mut s, &Request::Fork { template: template.to_string(), interactive: true })?;
+    // Hand the agent the command (it does `read` then `sh -c`).
+    write_frame(&mut s, TAG_STDIN, format!("{cmd}\n").as_bytes())?;
+
+    let mut rc = 0i32;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut stdout = io::stdout();
+    loop {
+        match read_frame(&mut s)? {
+            Some((TAG_STDOUT, bytes)) => {
+                buf.extend_from_slice(&bytes);
+                // Process complete lines, swallowing the exit-code marker line.
+                while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+                    let line: Vec<u8> = buf.drain(..=nl).collect();
+                    if let Some(code) = line.strip_prefix(RC_MARKER) {
+                        // The marker is the agent's last line: the command is done
+                        // and all its output is already flushed. Return now and let
+                        // the dropped connection reap the fork — no wait for the
+                        // guest to finish powering off (that is the slow part).
+                        rc = String::from_utf8_lossy(code).trim().parse().unwrap_or(0);
+                        return Ok(rc);
+                    }
+                    stdout.write_all(&line)?;
+                    stdout.flush()?;
+                }
+            }
+            Some((TAG_REPLY, payload)) => {
+                return match serde_json::from_slice::<Reply>(&payload)? {
+                    Reply::Exit { .. } => {
+                        if !buf.is_empty() {
+                            stdout.write_all(&buf)?;
+                            stdout.flush()?;
+                        }
+                        Ok(rc)
+                    }
+                    Reply::Error { message } => Err(io::Error::other(message)),
+                    Reply::BudgetExceeded { budget, used, requested } => {
+                        Err(io::Error::other(budget_msg(budget, used, requested)))
+                    }
+                    _ => Ok(rc),
+                };
+            }
+            _ => return Ok(rc),
+        }
+    }
+}
+
 /// Send `req`, then relay our stdin to the VM and its stdout to ours until the
 /// terminal Exit. Shared by interactive `run` and `fork`.
 fn stream_client(req: &Request) -> io::Result<i32> {
