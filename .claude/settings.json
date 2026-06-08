@@ -101,7 +101,8 @@
       "Bash(pkill -9 -f 'amber __vm')",
       "Bash(pkill -9 -f 'amber restore')",
       "Bash(sed -n '/pub struct VirtioMmio/,/^}/p' crates/amber-core/src/virtio.rs)",
-      "Bash(sed -n '/struct Queue/,/^}/p' crates/amber-core/src/virtio.rs)"
+      "Bash(sed -n '/struct Queue/,/^}/p' crates/amber-core/src/virtio.rs)",
+      "Bash(echo \"default build \\(now swgic\\): $\\(cargo build --release -p amber 2>&1)"
     ],
     "additionalDirectories": [
       "/private/tmp/snap",

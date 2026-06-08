@@ -923,6 +923,19 @@ Verified end to end: `echo`, `uname -sr` → `Linux 6.12.81-0-virt`, `echo $((21
 1/5/7/9 — each a different command in its own warm fork, ~15 ms apiece. This is the
 thesis in one command: a fresh, isolated sandbox per task, spawned in milliseconds.
 
+### Software GIC as the default
+
+With snapshot/restore/fork/exec all riding on the software GIC and its boot cost
+measured to be a wash (warm `amber run … -- true` is ~118 ms either way), made it
+the default: the `swgic` cargo feature is on by default and the runtime uses the
+software GIC unless `AMBER_GIC=hw` selects the in-kernel vGIC (a
+`--no-default-features` build drops it entirely). This removes a real footgun — the
+features and snapshot/restore/exec now work out of the box with no `AMBER_GIC`
+env, and a plain `cargo build` no longer silently produces a binary that can't
+restore its own templates. Verified: a snapshot taken with no env records
+`gic_kind: v2`, restores with the timer alive, and `amber exec` runs — all without
+touching `AMBER_GIC`.
+
 ---
 
 ## Cross-cutting choices

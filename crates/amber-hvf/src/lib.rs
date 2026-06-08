@@ -13,10 +13,12 @@ use ffi::*;
 use gicv2::GicV2;
 use std::sync::{Arc, Mutex};
 
-/// Whether to use the software GICv2 instead of the in-kernel vGIC. Compiled in
-/// only with the `swgic` feature, then selected at runtime with `AMBER_GIC=sw`.
+/// Whether to use the software GICv2 instead of the in-kernel vGIC. The `swgic`
+/// feature is on by default and the software GIC is the default at runtime too
+/// (it makes snapshot/restore/fork/exec work); `AMBER_GIC=hw` opts back to the
+/// in-kernel vGIC, and a `--no-default-features` build has no software GIC at all.
 fn swgic_mode() -> bool {
-    cfg!(feature = "swgic") && std::env::var("AMBER_GIC").as_deref() == Ok("sw")
+    cfg!(feature = "swgic") && std::env::var("AMBER_GIC").as_deref() != Ok("hw")
 }
 
 fn check(ret: hv_return_t, what: &str) -> Result<()> {
