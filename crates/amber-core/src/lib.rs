@@ -41,6 +41,15 @@ pub enum GicKind {
     V3,
 }
 
+impl GicKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GicKind::V2 => "v2",
+            GicKind::V3 => "v3",
+        }
+    }
+}
+
 /// The guest-physical memory map. The QEMU `virt` layout, which is the reference
 /// every arm64 microVM follows and what the kernel's `earlycon` expects. Devices
 /// sit below RAM; RAM starts at 1 GiB.

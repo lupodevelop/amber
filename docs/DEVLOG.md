@@ -642,6 +642,29 @@ One footgun to close later: a swgic snapshot and a vGIC snapshot have incompatib
 the same `AMBER_GIC` mode it was captured with. Recording the GIC kind in the
 snapshot and refusing a mismatch is the obvious guard.
 
+### Step 8 — closing the swgic debts
+
+Three follow-ups from step 7, all done:
+
+- **Snapshot kind guard.** `meta.json` now records `gic_kind` ("v2"/"v3"), and
+  restore refuses a mismatch — `snapshot GIC is v2 but this backend is v3; restore
+  with the matching AMBER_GIC` — instead of feeding a 1.5 KB software blob to
+  `hv_gic_set_state` (or vice versa). Old snapshots with no recorded kind are
+  accepted as before (the field is `Option`, best-effort).
+- **Per-entry inject cost.** `hv_vcpu_set_pending_interrupt` is auto-cleared after
+  every run, so the `false` case is a no-op — skip the syscall and only assert the
+  `true` case. Halves the inject overhead on the common (no-pending) path.
+- **Console latency.** The idle park was a fixed `nanosleep` capped at 50 ms, so
+  software-GIC console input waited up to 50 ms (the vGIC wakes instantly via
+  `hv_gic_set_spi`). Switched the park to `thread::park_timeout` and had the
+  console reader `unpark` the vcpu thread the moment it raises the UART line, so
+  input lands immediately; the 50 ms cap is now just a missed-wake backstop. The
+  in-kernel-vGIC path is unaffected (it rarely reaches this idle at all).
+
+Verified: a swgic snapshot still restores and keeps ticking (4→12), a cross-mode
+restore is refused with the message above, and the default vGIC boot + `sleep` loop
+is unchanged.
+
 ---
 
 ## M5 — RAM coexistence (in progress)

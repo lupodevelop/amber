@@ -36,6 +36,11 @@ pub struct Meta {
     pub mem_size: u64,
     /// Host path of the virtio-blk backing image to re-open on restore.
     pub disk: Option<String>,
+    /// The interrupt-controller kind the `gic.bin` blob belongs to ("v2"/"v3").
+    /// The two formats are incompatible, so a restore must use the same backend
+    /// GIC. `None` on snapshots taken before this was recorded.
+    #[serde(default)]
+    pub gic_kind: Option<String>,
 }
 
 /// Everything a snapshot directory holds except the bulk RAM (loaded separately).
@@ -56,6 +61,7 @@ pub fn write(
     cpu: &CpuSnapshot,
     gic: &[u8],
     disk: Option<&Path>,
+    gic_kind: Option<crate::GicKind>,
 ) -> Result<()> {
     std::fs::create_dir_all(dir).map_err(snap_err)?;
 
@@ -69,6 +75,7 @@ pub fn write(
         mem_base: mem.base(),
         mem_size: mem.len() as u64,
         disk: disk.map(|p| p.to_string_lossy().into_owned()),
+        gic_kind: gic_kind.map(|k| k.as_str().to_string()),
     };
     std::fs::write(dir.join("meta.json"), serde_json::to_vec(&meta).map_err(snap_err)?)
         .map_err(snap_err)?;

@@ -222,6 +222,17 @@ impl Vm {
         if let Some(loaded) = &restore {
             // Restore path: the RAM already holds the booted kernel + DTB; put the
             // interrupt controller and vcpu back where they were and resume.
+            // The GIC blob format is per-kind (the software GICv2 and the in-kernel
+            // vGICv3 are incompatible), so refuse a snapshot taken under a different
+            // backend rather than feeding garbage to restore_gic.
+            if let (Some(want), Some(have)) = (&loaded.meta.gic_kind, hv.gic_info()) {
+                if want != have.kind.as_str() {
+                    return Err(crate::Error::Snapshot(format!(
+                        "snapshot GIC is {want} but this backend is {}; restore with the matching AMBER_GIC",
+                        have.kind.as_str()
+                    )));
+                }
+            }
             hv.restore_gic(&loaded.gic)?;
             vcpu.restore(&loaded.cpu)?;
         } else {
@@ -261,9 +272,13 @@ impl Vm {
         let started = std::time::Instant::now();
 
         let balloon = balloon.as_ref();
+        // The vcpu loop runs on this thread; reader threads unpark it to cut idle
+        // latency when it is parked waiting for the timer (software-GIC mode).
+        let vcpu_thread = std::thread::current();
+        let vcpu_thread = &vcpu_thread;
         std::thread::scope(|s| {
             // Console reader: host stdin -> UART RX -> GIC line -> wake the vcpu.
-            s.spawn(move || console_reader(hv, pl011, pl011_intid, running));
+            s.spawn(move || console_reader(hv, pl011, pl011_intid, running, vcpu_thread));
 
             // Control reader: a control-channel target -> balloon inflate. Moving
             // the target and raising the device's config interrupt makes the guest
@@ -281,7 +296,8 @@ impl Vm {
                     if started.elapsed() >= req.after {
                         let cpu = vcpu.capture()?;
                         let gic = hv.capture_gic()?;
-                        crate::snapshot::write(&req.dir, mem, &cpu, &gic, disk_path)?;
+                        let gic_kind = hv.gic_info().map(|g| g.kind);
+                        crate::snapshot::write(&req.dir, mem, &cpu, &gic, disk_path, gic_kind)?;
                         log::info!("snapshot captured to {}", req.dir.display());
                         return Ok(false);
                     }
@@ -327,21 +343,19 @@ impl Vm {
                         vcpu.set_pc(pc + 4)?;
                         Ok(true)
                     }
-                    // On a fresh boot the hypervisor handles WFI internally and
-                    // this never fires. After a restore it can surface here, so
-                    // park until the virtual timer is due (capped, so console
-                    // input still gets in) instead of busy-spinning.
+                    // On a fresh boot the in-kernel vGIC handles WFI internally and
+                    // this never fires; with the software GIC (and after a restore)
+                    // it does. Park until the virtual timer is due, capped so a
+                    // missed wake still recovers — and a reader thread unparks us
+                    // the instant console/control input raises a line, so the cap is
+                    // only a backstop, not the input latency.
                     VmExit::Idle => {
                         let ns = match vcpu.pending_timer_ns() {
                             Ok(Some(n)) => n.min(50_000_000),
                             _ => 50_000_000,
                         };
                         if ns > 0 {
-                            let ts = libc::timespec {
-                                tv_sec: (ns / 1_000_000_000) as libc::time_t,
-                                tv_nsec: (ns % 1_000_000_000) as _,
-                            };
-                            unsafe { libc::nanosleep(&ts, std::ptr::null_mut()) };
+                            std::thread::park_timeout(std::time::Duration::from_nanos(ns));
                         }
                         Ok(true)
                     }
@@ -381,6 +395,7 @@ fn console_reader<H: Hypervisor>(
     pl011: &Mutex<Pl011>,
     intid: u32,
     running: &AtomicBool,
+    vcpu: &std::thread::Thread,
 ) {
     let mut buf = [0u8; 64];
     while running.load(Ordering::Relaxed) {
@@ -405,6 +420,12 @@ fn console_reader<H: Hypervisor>(
             p.irq_level()
         };
         let _ = hv.set_irq(intid, level);
+        // Wake the vcpu if it is parked in the idle handler (software-GIC mode,
+        // where the line is only sampled between guest entries). With the in-kernel
+        // vGIC `set_irq` already wakes it, so the unpark is just a harmless nudge.
+        if level {
+            vcpu.unpark();
+        }
     }
 }
 

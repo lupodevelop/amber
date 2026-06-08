@@ -282,12 +282,17 @@ impl HvfVcpu {
             g.set_level(VTIMER_INTID, due);
             g.irq_pending()
         };
-        unsafe {
-            check(
-                hv_vcpu_set_pending_interrupt(self.handle, HV_INTERRUPT_TYPE_IRQ, pend),
-                "set pending irq",
-            )
+        // HVF auto-clears the pending interrupt after each run, so only the `true`
+        // case needs a syscall — skipping the common `false` case halves the cost.
+        if pend {
+            unsafe {
+                check(
+                    hv_vcpu_set_pending_interrupt(self.handle, HV_INTERRUPT_TYPE_IRQ, true),
+                    "set pending irq",
+                )?;
+            }
         }
+        Ok(())
     }
 
     /// Service a GICD/GICC MMIO access against the software GIC. Returns true if the
