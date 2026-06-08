@@ -24,6 +24,9 @@ pub struct Fleet {
     /// Hard ceiling for the sum of live VMs. Parsed; enforced once the budget
     /// scheduler exists (M5).
     pub ram_budget: Option<String>,
+    /// How many warm forks to keep pre-staged per template (M4 warm pool). The
+    /// pool tops up to this after each fork, bounded by the RAM budget. Default 1.
+    pub pool_size: Option<usize>,
 }
 
 #[derive(Deserialize, Default)]

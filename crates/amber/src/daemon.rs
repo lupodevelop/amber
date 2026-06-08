@@ -130,6 +130,45 @@ fn reserve(
     Ok((id, kill))
 }
 
+/// Evict one warm-pool worker to free its budget reservation: pull an id from the
+/// pool, kill its process, and drop it from the registry (freeing the RAM it was
+/// accounted at). Returns true if one was evicted. Pooled VMs are idle and
+/// reconstructible, so they yield to a real admission under budget pressure.
+fn evict_one_pooled(reg: &Registry, pool: &Pool) -> bool {
+    let id = {
+        let mut p = pool.lock().unwrap();
+        p.values_mut().find_map(|v| v.pop())
+    };
+    let Some(id) = id else { return false };
+    let mut g = reg.lock().unwrap();
+    if let Some(e) = g.remove(&id) {
+        e.kill.store(true, Ordering::Relaxed); // the supervisor reaps the process
+    }
+    log::info!("evicted pooled VM {id} to free budget");
+    true
+}
+
+/// Reserve admission for a real VM, evicting warm-pool workers as needed to fit
+/// under the budget. Gives up (returning the budget error) only when nothing
+/// poolable is left to reclaim.
+fn reserve_with_evict(
+    reg: &Registry,
+    counter: &AtomicU64,
+    pool: &Pool,
+    reference: &str,
+) -> std::result::Result<(String, Arc<AtomicBool>), (u64, u64, u64)> {
+    loop {
+        match reserve(reg, counter, reference) {
+            Ok(ok) => return Ok(ok),
+            Err(budget) => {
+                if !evict_one_pooled(reg, pool) {
+                    return Err(budget);
+                }
+            }
+        }
+    }
+}
+
 /// Record a reserved VM's pid and control channel once its worker has spawned.
 fn set_runtime(reg: &Registry, id: &str, pid: u32, control: UnixStream) {
     if let Some(e) = reg.lock().unwrap().get_mut(id) {
@@ -258,13 +297,27 @@ fn handle_fork(
     }
     write_reply(&mut stream, &Reply::Started { id })?;
 
-    // Refill the pool in the background so the next fork is warm too.
+    // Refill the pool to its target in the background, so the next forks are warm
+    // too. Stops early if staging fails (e.g. the RAM budget is full) — the pool
+    // is then naturally sized by whatever the budget allows.
+    let target = pool_target();
     thread::spawn(move || {
-        if let Ok(rid) = spawn_paused(&reg, &counter, &pool, &template) {
-            pool.lock().unwrap().entry(template).or_default().push(rid);
+        while pool.lock().unwrap().get(&template).map_or(0, |v| v.len()) < target {
+            match spawn_paused(&reg, &counter, &pool, &template) {
+                Ok(rid) => pool.lock().unwrap().entry(template.clone()).or_default().push(rid),
+                Err(_) => break,
+            }
         }
     });
     Ok(())
+}
+
+/// How many warm forks to keep per template: `[fleet].pool_size`, default 1.
+fn pool_target() -> usize {
+    crate::manifest::Manifest::load()
+        .and_then(|m| m.fleet.pool_size)
+        .unwrap_or(1)
+        .max(1)
 }
 
 // ---- daemon ----
@@ -396,10 +449,10 @@ fn handle(
             std::process::exit(0);
         }
         Request::RunOneShot { reference, argv } => {
-            run_one_shot(stream, reg, counter, reference, argv)?;
+            run_one_shot(stream, reg, counter, pool, reference, argv)?;
         }
         Request::RunDetached { reference, argv } => {
-            start_detached(stream, reg, counter, reference, argv)?;
+            start_detached(stream, reg, counter, pool, reference, argv)?;
         }
         Request::Logs { id } => {
             stream_logs(stream, &id)?;
@@ -418,10 +471,11 @@ fn start_detached(
     mut stream: UnixStream,
     reg: Registry,
     counter: Arc<AtomicU64>,
+    pool: Pool,
     reference: String,
     argv: Vec<String>,
 ) -> io::Result<()> {
-    let (id, kill) = match reserve(&reg, &counter, &reference) {
+    let (id, kill) = match reserve_with_evict(&reg, &counter, &pool, &reference) {
         Ok(x) => x,
         Err((budget, used, requested)) => {
             write_reply(&mut stream, &Reply::BudgetExceeded { budget, used, requested })?;
@@ -488,10 +542,11 @@ fn run_one_shot(
     mut stream: UnixStream,
     reg: Registry,
     counter: Arc<AtomicU64>,
+    pool: Pool,
     reference: String,
     argv: Vec<String>,
 ) -> io::Result<()> {
-    let (id, kill) = match reserve(&reg, &counter, &reference) {
+    let (id, kill) = match reserve_with_evict(&reg, &counter, &pool, &reference) {
         Ok(x) => x,
         Err((budget, used, requested)) => {
             write_reply(&mut stream, &Reply::BudgetExceeded { budget, used, requested })?;

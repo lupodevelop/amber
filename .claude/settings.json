@@ -95,7 +95,9 @@
       "Bash(echo \"=== $\\(cargo build --release -p amber --features swgic 2>&1)",
       "Bash(bash /tmp/forkbench.sh)",
       "Bash(bash /tmp/coldwarm.sh)",
-      "Bash(echo \"default: $\\(cargo build --release -p amber 2>&1)"
+      "Bash(echo \"default: $\\(cargo build --release -p amber 2>&1)",
+      "Bash(echo \"swgic: $\\(cargo build --release -p amber --features swgic 2>&1)",
+      "Bash(bash /tmp/evicttest.sh)"
     ],
     "additionalDirectories": [
       "/private/tmp/snap",

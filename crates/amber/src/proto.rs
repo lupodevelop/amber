@@ -66,7 +66,7 @@ pub enum Reply {
     /// The fleet RAM budget and usage, in bytes (`budget` 0 = unlimited). `used`
     /// is the cap-based reservation (what admission counts); `rss` is the real
     /// resident footprint of the live VMs; `machine` is total host RAM, so the
-    /// headroom left for the resident model is visible.
+    /// host headroom outside the fleet ceiling is visible.
     Budget { budget: u64, used: u64, rss: u64, machine: u64 },
     /// Admission refused to protect the budget. All values in bytes.
     BudgetExceeded { budget: u64, used: u64, requested: u64 },

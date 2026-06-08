@@ -141,7 +141,7 @@ fn cmd_budget() -> ExitCode {
             }
             if machine > 0 {
                 println!(
-                    "machine: {} MiB    left for model+host: {} MiB",
+                    "machine: {} MiB    free on host: {} MiB",
                     mib(machine),
                     mib(machine.saturating_sub(if budget == 0 { rss } else { budget }))
                 );

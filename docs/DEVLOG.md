@@ -828,9 +828,27 @@ hidden. Three warm forks of one template each resume independently (tens of
 thousands of output lines apiece) at ~10 MiB private RAM each. The absolute numbers
 are small because CoW restore is already cheap (~10 ms server-side); the pool's
 value grows with restore cost (bigger guests, colder caches), and either way the
-fork is now a handoff, not a spawn. Interactive I/O hand-off through the pool (vs
-the current detached-to-log forks) and budget-aware pool sizing/eviction are the
-follow-ups.
+fork is now a handoff, not a spawn.
+
+### Warm pool — budget-aware sizing and eviction
+
+Two follow-ups made the pool fleet-safe. **Sizing:** how many warm forks to keep
+per template comes from `[fleet].pool_size` (default one); after a fork the pool
+tops up to that target in the background, and staging stops early if the RAM budget
+is full — so the pool is self-sizing to whatever the budget allows. **Eviction:** pooled
+workers count against the budget (they hold a reservation), but they are idle and
+reconstructible, so a real admission reclaims them. `reserve_with_evict` loops:
+try to reserve, and on a budget miss evict one pooled worker (drop it from the
+registry to free its reservation, kill its process) and retry, giving up only when
+nothing poolable is left. The fork's own warming uses the plain reserve (pooled
+VMs don't evict each other). This is M5's last reclaim lever — the one that was
+waiting on M4 — now in place.
+
+Demonstrated with a 1024 MiB budget and `pool_size = 1`: a fork leaves one VM
+running and one warm in the pool (1024 MiB reserved, ~15 MiB real); a subsequent
+real `run` finds the budget full, evicts the pooled worker
+("evicted pooled VM vm2 to free budget"), and is admitted. Remaining follow-up:
+interactive I/O hand-off through the pool (forks are detached-to-log today).
 
 ---
 
