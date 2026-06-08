@@ -258,6 +258,11 @@ impl Vm {
                 let r = &loaded.dev.pl011;
                 pl011.set_regs([r[0], r[1], r[2], r[3], r[4], r[5]]);
             }
+            // virtio queue state (ring addresses, ready, consumed index) so a
+            // post-restore disk/rng/balloon kick resumes instead of hanging.
+            for (d, s) in virtio.iter_mut().zip(&loaded.dev.virtio) {
+                d.mmio.restore(s);
+            }
         } else {
             // Boot path: seed entropy, build the device tree to match the GIC,
             // and set the arm64 boot registers.
@@ -342,6 +347,7 @@ impl Vm {
                         let gic_kind = hv.gic_info().map(|g| g.kind);
                         let dev = crate::snapshot::DevState {
                             pl011: pl011.lock().unwrap().regs().to_vec(),
+                            virtio: virtio.iter().map(|d| d.mmio.capture()).collect(),
                         };
                         crate::snapshot::write(&req.dir, mem, &cpu, &gic, disk_path, gic_kind, &dev)?;
                         log::info!("snapshot captured to {}", req.dir.display());

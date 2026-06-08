@@ -872,11 +872,26 @@ restoring them; old snapshots without it default cleanly. Verified end to end: a
 echo-shell template, forked interactively through the pool, echoes piped input
 (`pool-input-1` → `ECHO:[pool-input-1]`) back to the client.
 
-The remaining device-state gap is virtio: its queue registers also live in the
-host and reset on restore, so a template that does fresh disk I/O after the
-snapshot would need them captured too — the next follow-up. The big two milestones
-this opened (snapshot/restore on HVF via the software GIC, and CoW fork + warm
-pool on top) are working.
+### Device-state capture — virtio queues too
+
+Closed the other half of the device-state gap: virtio-mmio. Each device's host-side
+state — `status`, `interrupt_status`, and per virtqueue the ring addresses
+(`desc`/`avail`/`used`), the `ready` flag, and the host's consumed index
+(`last_avail`) — lives in the `VirtioMmio`, not guest RAM, so a fresh device after
+restore forgets where the rings are; a post-restore queue kick would hang. Added
+`VirtioMmio::capture`/`restore` and a `virtio: Vec<VirtioDevState>` in `dev.json`,
+captured in creation order and reapplied after the devices are re-attached to guest
+RAM. Older snapshots without it default to the reset state.
+
+Verified with the path that actually exercises a queue past the page cache: an
+eval-shell template captured 3 devices (blk/rng/balloon, 1/1/3 queues, ring at
+`0x437bc000`), and after an interactive fork a raw `dd if=/dev/vda bs=512 count=2`
+read 1024 bytes through the blk virtqueue — which would have hung against a
+reset queue. With this, snapshot/restore captures the full host-side device state
+(PL011 + virtio), so a fork resumes a faithful machine, not just its RAM and vcpu.
+
+The big milestones this opened — snapshot/restore on HVF via the software GIC, and
+CoW fork + warm pool with interactive I/O on top — are working end to end.
 
 ---
 

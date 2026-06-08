@@ -112,6 +112,36 @@ pub struct VirtioMmio {
 }
 
 impl VirtioMmio {
+    /// Capture host-side device state (status + per-queue ring addresses, ready
+    /// flag, and consumed index) for a snapshot. The guest-side driver state lives
+    /// in guest RAM; this is the part that lives here and would otherwise reset.
+    pub fn capture(&self) -> crate::snapshot::VirtioDevState {
+        crate::snapshot::VirtioDevState {
+            status: self.status,
+            interrupt_status: self.interrupt_status,
+            queues: self
+                .queues
+                .iter()
+                .map(|q| [q.num as u64, q.ready as u64, q.desc, q.avail, q.used, q.last_avail as u64])
+                .collect(),
+        }
+    }
+
+    /// Restore state captured by [`capture`], so a post-restore queue kick resumes
+    /// from the right ring addresses and consumed index.
+    pub fn restore(&mut self, s: &crate::snapshot::VirtioDevState) {
+        self.status = s.status;
+        self.interrupt_status = s.interrupt_status;
+        for (q, v) in self.queues.iter_mut().zip(&s.queues) {
+            q.num = v[0] as u32;
+            q.ready = v[1] as u32;
+            q.desc = v[2];
+            q.avail = v[3];
+            q.used = v[4];
+            q.last_avail = v[5] as u16;
+        }
+    }
+
     pub fn new(dev: Box<dyn VirtioDevice>) -> Self {
         let n = dev.num_queues().max(1);
         Self {

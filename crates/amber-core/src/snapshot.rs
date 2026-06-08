@@ -50,6 +50,20 @@ pub struct Meta {
 pub struct DevState {
     /// PL011 [cr, imsc, ibrd, fbrd, lcr_h, ifls]; empty on pre-DevState snapshots.
     pub pl011: Vec<u32>,
+    /// One entry per virtio-mmio device, in creation order. Empty on older
+    /// snapshots (then the devices restore to their reset state).
+    pub virtio: Vec<VirtioDevState>,
+}
+
+/// Host-side virtio-mmio state not in guest RAM: the negotiated status and, per
+/// virtqueue, its ring addresses, ready flag, and the host's consumed index — all
+/// reset by a fresh device, so a post-restore kick would otherwise hang.
+#[derive(Serialize, Deserialize, Default, Debug)]
+pub struct VirtioDevState {
+    pub status: u32,
+    pub interrupt_status: u32,
+    /// Each queue as [num, ready, desc, avail, used, last_avail].
+    pub queues: Vec<[u64; 6]>,
 }
 
 /// Everything a snapshot directory holds except the bulk RAM (loaded separately).

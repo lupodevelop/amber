@@ -99,7 +99,9 @@
       "Bash(echo \"swgic: $\\(cargo build --release -p amber --features swgic 2>&1)",
       "Bash(bash /tmp/evicttest.sh)",
       "Bash(pkill -9 -f 'amber __vm')",
-      "Bash(pkill -9 -f 'amber restore')"
+      "Bash(pkill -9 -f 'amber restore')",
+      "Bash(sed -n '/pub struct VirtioMmio/,/^}/p' crates/amber-core/src/virtio.rs)",
+      "Bash(sed -n '/struct Queue/,/^}/p' crates/amber-core/src/virtio.rs)"
     ],
     "additionalDirectories": [
       "/private/tmp/snap",
