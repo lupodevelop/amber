@@ -125,6 +125,24 @@ impl Pl011 {
         self.ris & self.imsc != 0
     }
 
+    /// The configuration registers, for a snapshot. The RX FIFO and raw status are
+    /// transient (refilled by new input), but the control/mask/baud/line registers
+    /// the guest's driver programmed must survive a restore — without `imsc` the RX
+    /// interrupt stays masked and console input never wakes the guest.
+    pub fn regs(&self) -> [u32; 6] {
+        [self.cr, self.imsc, self.ibrd, self.fbrd, self.lcr_h, self.ifls]
+    }
+
+    /// Restore the configuration registers captured by [`regs`].
+    pub fn set_regs(&mut self, r: [u32; 6]) {
+        self.cr = r[0];
+        self.imsc = r[1];
+        self.ibrd = r[2];
+        self.fbrd = r[3];
+        self.lcr_h = r[4];
+        self.ifls = r[5];
+    }
+
     pub fn read(&mut self, offset: u64, _size: u8) -> u64 {
         if let Some(&(_, v)) = Self::ID.iter().find(|&&(off, _)| off == offset) {
             return v as u64;

@@ -97,7 +97,9 @@
       "Bash(bash /tmp/coldwarm.sh)",
       "Bash(echo \"default: $\\(cargo build --release -p amber 2>&1)",
       "Bash(echo \"swgic: $\\(cargo build --release -p amber --features swgic 2>&1)",
-      "Bash(bash /tmp/evicttest.sh)"
+      "Bash(bash /tmp/evicttest.sh)",
+      "Bash(pkill -9 -f 'amber __vm')",
+      "Bash(pkill -9 -f 'amber restore')"
     ],
     "additionalDirectories": [
       "/private/tmp/snap",

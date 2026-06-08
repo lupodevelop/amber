@@ -43,11 +43,21 @@ pub struct Meta {
     pub gic_kind: Option<String>,
 }
 
+/// Host-side device-emulation state that does not live in guest RAM and so must
+/// be captured separately. Today: the PL011 config registers (so console input
+/// works after a restore). Virtio queue registers are a further follow-up.
+#[derive(Serialize, Deserialize, Default, Debug)]
+pub struct DevState {
+    /// PL011 [cr, imsc, ibrd, fbrd, lcr_h, ifls]; empty on pre-DevState snapshots.
+    pub pl011: Vec<u32>,
+}
+
 /// Everything a snapshot directory holds except the bulk RAM (loaded separately).
 pub struct Loaded {
     pub meta: Meta,
     pub cpu: CpuSnapshot,
     pub gic: Vec<u8>,
+    pub dev: DevState,
 }
 
 fn snap_err<E: std::fmt::Display>(e: E) -> Error {
@@ -55,6 +65,7 @@ fn snap_err<E: std::fmt::Display>(e: E) -> Error {
 }
 
 /// Write a snapshot directory from the captured state.
+#[allow(clippy::too_many_arguments)]
 pub fn write(
     dir: &Path,
     mem: &GuestMemory,
@@ -62,8 +73,11 @@ pub fn write(
     gic: &[u8],
     disk: Option<&Path>,
     gic_kind: Option<crate::GicKind>,
+    dev: &DevState,
 ) -> Result<()> {
     std::fs::create_dir_all(dir).map_err(snap_err)?;
+    std::fs::write(dir.join("dev.json"), serde_json::to_vec(dev).map_err(snap_err)?)
+        .map_err(snap_err)?;
 
     // Raw guest RAM. SAFETY: the region is valid for `len` bytes and the guest is
     // stopped, so no concurrent writes.
@@ -91,7 +105,12 @@ pub fn read(dir: &Path) -> Result<Loaded> {
     let cpu = serde_json::from_slice(&std::fs::read(dir.join("cpu.json")).map_err(snap_err)?)
         .map_err(snap_err)?;
     let gic = std::fs::read(dir.join("gic.bin")).map_err(snap_err)?;
-    Ok(Loaded { meta, cpu, gic })
+    // dev.json is newer than the first snapshots; default it if absent.
+    let dev = std::fs::read(dir.join("dev.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default();
+    Ok(Loaded { meta, cpu, gic, dev })
 }
 
 /// Load the snapshot's RAM image into `mem`.

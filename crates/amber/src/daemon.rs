@@ -30,6 +30,12 @@ struct VmEntry {
     kill: Arc<AtomicBool>,
     /// amberd's end of the control channel to the VM (balloon targets, etc.).
     control: Option<UnixStream>,
+    /// For a pooled (paused) worker: its guest-console pipes, held until the fork
+    /// that releases it either relays them to a client (interactive) or drains
+    /// stdout to the log (detached). Paused workers emit nothing, so the pipe is
+    /// idle until the go byte.
+    stdout: Option<std::process::ChildStdout>,
+    stdin: Option<std::process::ChildStdin>,
 }
 
 type Registry = Arc<Mutex<HashMap<String, VmEntry>>>;
@@ -125,6 +131,8 @@ fn reserve(
             },
             kill: kill.clone(),
             control: None,
+            stdout: None,
+            stdin: None,
         },
     );
     Ok((id, kill))
@@ -207,8 +215,9 @@ fn spawn_paused(reg: &Registry, counter: &AtomicU64, pool: &Pool, template: &str
 
     let dir = logs_dir();
     std::fs::create_dir_all(&dir)?;
-    let out = std::fs::File::create(dir.join(format!("{id}.log")))?;
-    let err = out.try_clone()?;
+    // Worker logs (stderr) go to the file; the guest console (stdout) is a pipe we
+    // hold, so the fork can relay it interactively or drain it to the log.
+    let err = std::fs::File::create(dir.join(format!("{id}.log")))?;
 
     let exe = std::env::current_exe()?;
     let mut cmd = Command::new(exe);
@@ -216,7 +225,7 @@ fn spawn_paused(reg: &Registry, counter: &AtomicU64, pool: &Pool, template: &str
     // there), so the worker runs in swgic mode regardless of the daemon's env.
     cmd.arg("restore").arg(template);
     cmd.env("AMBER_PAUSED", "1").env("AMBER_GIC", "sw");
-    cmd.stdin(Stdio::null()).stdout(out).stderr(err);
+    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(err);
     let (mut ctl_host, ctl_child) = match attach_control(&mut cmd) {
         Ok(p) => p,
         Err(e) => {
@@ -233,6 +242,8 @@ fn spawn_paused(reg: &Registry, counter: &AtomicU64, pool: &Pool, template: &str
     };
     drop(ctl_child);
     let pid = child.id();
+    let cout = child.stdout.take();
+    let cin = child.stdin.take();
 
     // Block until the worker finishes the restore and signals ready (one byte).
     // This is the warming cost, paid ahead of any fork request.
@@ -242,7 +253,12 @@ fn spawn_paused(reg: &Registry, counter: &AtomicU64, pool: &Pool, template: &str
         let _ = child.kill();
         return Err(io::Error::new(io::ErrorKind::Other, "worker failed to warm"));
     }
-    set_runtime(reg, &id, pid, ctl_host);
+    if let Some(e) = reg.lock().unwrap().get_mut(&id) {
+        e.info.pid = pid;
+        e.control = Some(ctl_host);
+        e.stdout = cout;
+        e.stdin = cin;
+    }
 
     let reg2 = reg.clone();
     let pool2 = pool.clone();
@@ -277,6 +293,7 @@ fn handle_fork(
     counter: Arc<AtomicU64>,
     pool: Pool,
     template: String,
+    interactive: bool,
 ) -> io::Result<()> {
     // Take a pre-warmed worker if the pool has one; otherwise stage one now.
     let pooled = pool.lock().unwrap().get_mut(&template).and_then(|v| v.pop());
@@ -291,15 +308,105 @@ fn handle_fork(
         },
     };
 
+    // Grab the worker's console pipes before releasing it (paused, so silent until
+    // the go byte — nothing is lost) and start the refill so the next fork is warm.
+    let (cout, cin, kill) = {
+        let mut g = reg.lock().unwrap();
+        match g.get_mut(&id) {
+            Some(e) => (e.stdout.take(), e.stdin.take(), Some(e.kill.clone())),
+            None => (None, None, None),
+        }
+    };
     if !release(&reg, &id) {
         write_reply(&mut stream, &Reply::Error { message: format!("failed to release {id}") })?;
         return Ok(());
     }
-    write_reply(&mut stream, &Reply::Started { id })?;
+    refill_pool(reg, counter, pool, template);
 
-    // Refill the pool to its target in the background, so the next forks are warm
-    // too. Stops early if staging fails (e.g. the RAM budget is full) — the pool
-    // is then naturally sized by whatever the budget allows.
+    if interactive {
+        relay_interactive(stream, cout, cin, kill)
+    } else {
+        // Detached: drain the guest console to the log so `amber logs` shows it.
+        if let Some(mut out) = cout {
+            if let Ok(mut log) =
+                std::fs::OpenOptions::new().append(true).open(logs_dir().join(format!("{id}.log")))
+            {
+                thread::spawn(move || {
+                    let _ = io::copy(&mut out, &mut log);
+                });
+            }
+        }
+        write_reply(&mut stream, &Reply::Started { id })
+    }
+}
+
+/// Full-duplex relay between the client and a just-released fork's console: the
+/// guest's stdout streams to the client, the client's `TAG_STDIN` frames go to the
+/// guest. Returns when the guest's stdout closes (it exited) or the client leaves
+/// (then the worker is killed so it does not orphan).
+fn relay_interactive(
+    mut stream: UnixStream,
+    cout: Option<std::process::ChildStdout>,
+    cin: Option<std::process::ChildStdin>,
+    kill: Option<Arc<AtomicBool>>,
+) -> io::Result<()> {
+    let client_gone = Arc::new(AtomicBool::new(false));
+
+    let mut wout = stream.try_clone()?;
+    let gone1 = client_gone.clone();
+    let h_out = thread::spawn(move || {
+        let Some(mut out) = cout else { return };
+        let mut buf = [0u8; 8192];
+        loop {
+            match out.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if write_frame(&mut wout, TAG_STDOUT, &buf[..n]).is_err() {
+                        gone1.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    let mut rin = stream.try_clone()?;
+    let gone2 = client_gone.clone();
+    let h_in = thread::spawn(move || {
+        let Some(mut cin) = cin else { return };
+        loop {
+            match read_frame(&mut rin) {
+                Ok(Some((TAG_STDIN, payload))) => {
+                    if cin.write_all(&payload).and_then(|_| cin.flush()).is_err() {
+                        break;
+                    }
+                }
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => {
+                    gone2.store(true, Ordering::Relaxed);
+                    break;
+                }
+            }
+        }
+    });
+
+    // The guest closing stdout means it exited; a write failure means the client
+    // left. Either way, stop.
+    let _ = h_out.join();
+    if client_gone.load(Ordering::Relaxed) {
+        if let Some(k) = &kill {
+            k.store(true, Ordering::Relaxed); // the supervisor reaps the orphan
+        }
+    }
+    let _ = write_reply(&mut stream, &Reply::Exit { code: 0 });
+    let _ = stream.shutdown(std::net::Shutdown::Both); // unblock the stdin reader
+    let _ = h_in.join();
+    Ok(())
+}
+
+/// Refill a template's warm pool to its target in the background. Stops early if
+/// staging fails (e.g. the RAM budget is full), so the pool self-sizes to budget.
+fn refill_pool(reg: Registry, counter: Arc<AtomicU64>, pool: Pool, template: String) {
     let target = pool_target();
     thread::spawn(move || {
         while pool.lock().unwrap().get(&template).map_or(0, |v| v.len()) < target {
@@ -309,7 +416,6 @@ fn handle_fork(
             }
         }
     });
-    Ok(())
 }
 
 /// How many warm forks to keep per template: `[fleet].pool_size`, default 1.
@@ -424,8 +530,8 @@ fn handle(
             };
             write_reply(&mut stream, &reply)?;
         }
-        Request::Fork { template } => {
-            return handle_fork(stream, reg, counter, pool, template);
+        Request::Fork { template, interactive } => {
+            return handle_fork(stream, reg, counter, pool, template, interactive);
         }
         Request::Kill { id } => {
             // Signal the owner thread; it kills and reaps the child it owns.
@@ -684,11 +790,19 @@ fn request(req: &Request) -> io::Result<Reply> {
 /// Run via the daemon: forward our stdin, stream the guest's stdout to ours,
 /// return the exit code.
 pub fn run_client(reference: &str, argv: &[String]) -> io::Result<i32> {
+    stream_client(&Request::RunOneShot { reference: reference.to_string(), argv: argv.to_vec() })
+}
+
+/// Fork interactively from a template: stream the resumed guest's console.
+pub fn fork_interactive(template: &str) -> io::Result<i32> {
+    stream_client(&Request::Fork { template: template.to_string(), interactive: true })
+}
+
+/// Send `req`, then relay our stdin to the VM and its stdout to ours until the
+/// terminal Exit. Shared by interactive `run` and `fork`.
+fn stream_client(req: &Request) -> io::Result<i32> {
     let mut s = connect().ok_or_else(|| io::Error::other("no amberd"))?;
-    proto::write_request(
-        &mut s,
-        &Request::RunOneShot { reference: reference.to_string(), argv: argv.to_vec() },
-    )?;
+    proto::write_request(&mut s, req)?;
 
     // Forward our stdin to the VM on a side thread; the process exiting on the
     // terminal Exit reply tears this down.
@@ -741,9 +855,9 @@ pub fn run_detached(reference: &str, argv: &[String]) -> io::Result<String> {
     }
 }
 
-/// Fork a VM from a warm template; returns the new VM's id.
+/// Fork a detached VM from a warm template; returns the new VM's id.
 pub fn fork(template: &str) -> io::Result<String> {
-    match request(&Request::Fork { template: template.to_string() })? {
+    match request(&Request::Fork { template: template.to_string(), interactive: false })? {
         Reply::Started { id } => Ok(id),
         Reply::BudgetExceeded { budget, used, requested } => {
             Err(io::Error::other(budget_msg(budget, used, requested)))

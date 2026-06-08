@@ -847,8 +847,36 @@ waiting on M4 — now in place.
 Demonstrated with a 1024 MiB budget and `pool_size = 1`: a fork leaves one VM
 running and one warm in the pool (1024 MiB reserved, ~15 MiB real); a subsequent
 real `run` finds the budget full, evicts the pooled worker
-("evicted pooled VM vm2 to free budget"), and is admitted. Remaining follow-up:
-interactive I/O hand-off through the pool (forks are detached-to-log today).
+("evicted pooled VM vm2 to free budget"), and is admitted.
+
+### Warm pool — interactive I/O, and a device-state capture it forced
+
+`amber fork -i` attaches the terminal to the resumed guest (full-duplex), where
+plain `amber fork` stays detached-to-log. The enabling trick: a pooled worker is
+paused at the gate, so it emits nothing until the go byte — which means it can be
+spawned with its console as **pipes amberd holds** without anything blocking while
+it waits. At fork time amberd grabs those pipes; interactive relays them to the
+client (the same stdout-stream + `TAG_STDIN` machinery as `RunOneShot`, factored
+into a shared `stream_client`), detached drains stdout to the log. A client
+disconnect kills the worker; the guest exiting closes stdout and ends the relay.
+
+Getting input to actually reach the guest exposed a real **device-state capture**
+gap (the one M3 flagged and deferred). The PL011's registers live in the *host*
+emulation, not guest RAM, and restore rebuilt a fresh `Pl011` — so the interrupt
+mask the guest's driver had programmed (`UARTIMSC`) was lost, and `irq_level()`
+(`ris & imsc`) stayed zero, so a keystroke's RX interrupt never fired and the
+guest's `read` never woke. (Output was unaffected — TX is not interrupt-gated that
+way — which is why it looked like only input was broken.) Fixed by snapshotting the
+PL011 config registers (`cr/imsc/ibrd/fbrd/lcr_h/ifls`) into a new `dev.json` and
+restoring them; old snapshots without it default cleanly. Verified end to end: an
+echo-shell template, forked interactively through the pool, echoes piped input
+(`pool-input-1` → `ECHO:[pool-input-1]`) back to the client.
+
+The remaining device-state gap is virtio: its queue registers also live in the
+host and reset on restore, so a template that does fresh disk I/O after the
+snapshot would need them captured too — the next follow-up. The big two milestones
+this opened (snapshot/restore on HVF via the software GIC, and CoW fork + warm
+pool on top) are working.
 
 ---
 

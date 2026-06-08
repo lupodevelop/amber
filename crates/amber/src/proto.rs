@@ -47,7 +47,9 @@ pub enum Request {
     Balloon { id: String, mib: u64 },
     /// Fork a VM from a warm template (a snapshot directory): hand off a
     /// pre-staged paused worker if the pool has one, else stage one now.
-    Fork { template: String },
+    /// `interactive` streams the resumed guest's console I/O to the client (like
+    /// `RunOneShot`); otherwise the fork is detached and only its id is returned.
+    Fork { template: String, interactive: bool },
     /// Kill a VM by id.
     Kill { id: String },
     /// Stop the daemon.

@@ -500,20 +500,35 @@ fn cmd_restore(args: &[String]) -> ExitCode {
     }
 }
 
-/// `amber fork <template>`: hand off a warm fork of a template snapshot.
+/// `amber fork [-i] <template>`: hand off a warm fork of a template snapshot.
+/// `-i` attaches the terminal to the resumed guest; otherwise it runs detached.
 fn cmd_fork(args: &[String]) -> ExitCode {
-    let Some(template) = args.get(2) else {
-        eprintln!("usage: amber fork <template-dir>");
+    let rest: Vec<&String> = args[2..].iter().collect();
+    let interactive = rest.iter().any(|a| a.as_str() == "-i");
+    let Some(template) = rest.iter().find(|a| !a.starts_with('-')) else {
+        eprintln!("usage: amber fork [-i] <template-dir>");
         return ExitCode::FAILURE;
     };
-    match daemon::fork(template) {
-        Ok(id) => {
-            println!("{id}");
-            ExitCode::SUCCESS
+    if interactive {
+        let _raw = RawTerm::enable();
+        match daemon::fork_interactive(template) {
+            Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
+            Err(e) => {
+                drop(_raw);
+                eprintln!("fork failed: {e}");
+                ExitCode::FAILURE
+            }
         }
-        Err(e) => {
-            eprintln!("fork failed: {e}");
-            ExitCode::FAILURE
+    } else {
+        match daemon::fork(template) {
+            Ok(id) => {
+                println!("{id}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("fork failed: {e}");
+                ExitCode::FAILURE
+            }
         }
     }
 }

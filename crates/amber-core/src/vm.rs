@@ -212,7 +212,7 @@ impl Vm {
         let Vm {
             mem,
             mut bus,
-            pl011,
+            mut pl011,
             mut virtio,
             balloon,
             control_fd,
@@ -252,6 +252,12 @@ impl Vm {
             }
             hv.restore_gic(&loaded.gic)?;
             vcpu.restore(&loaded.cpu)?;
+            // Restore host-side device state that is not in guest RAM. The PL011
+            // mask especially: without it, console input cannot interrupt the guest.
+            if loaded.dev.pl011.len() == 6 {
+                let r = &loaded.dev.pl011;
+                pl011.set_regs([r[0], r[1], r[2], r[3], r[4], r[5]]);
+            }
         } else {
             // Boot path: seed entropy, build the device tree to match the GIC,
             // and set the arm64 boot registers.
@@ -334,7 +340,10 @@ impl Vm {
                         let cpu = vcpu.capture()?;
                         let gic = hv.capture_gic()?;
                         let gic_kind = hv.gic_info().map(|g| g.kind);
-                        crate::snapshot::write(&req.dir, mem, &cpu, &gic, disk_path, gic_kind)?;
+                        let dev = crate::snapshot::DevState {
+                            pl011: pl011.lock().unwrap().regs().to_vec(),
+                        };
+                        crate::snapshot::write(&req.dir, mem, &cpu, &gic, disk_path, gic_kind, &dev)?;
                         log::info!("snapshot captured to {}", req.dir.display());
                         return Ok(false);
                     }
