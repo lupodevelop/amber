@@ -559,6 +559,31 @@ interface) ourselves, and WFI traps natively again — at which point we own idl
 timer injection and snapshot/restore/fork work on Mac. That is the next real lever
 for M3/M4 here; until then the KVM backend (M8) remains the other clean path.
 
+### Step 5 — software GIC: GICv2, not GICv3 (build started)
+
+Started the software GIC as an opt-in backend mode (`--features swgic`,
+`AMBER_GIC=sw`; default stays the in-kernel vGIC). One correction up front:
+**GICv2, not GICv3.** GICv3's CPU interface is the `ICC_*` system registers, and
+HVF does not trap guest GIC-sysreg access — which is the whole reason Apple added
+the in-kernel vGIC in macOS 15, and which makes a software GICv3 CPU interface
+unimplementable here. GICv2's CPU interface is **memory-mapped** (GICC), so every
+access is a stage-2 data abort we already decode. Injection uses
+`hv_vcpu_set_pending_interrupt` (the IRQ line, available since macOS 11), and the
+guest reads `GICC_IAR` over MMIO to learn the INTID. This is the classic HVF
+non-vGIC model, and it gives back native WFI trapping for free.
+
+First piece: `gicv2.rs`, a pure single-CPU GICv2 — distributor (CTLR/TYPER,
+IS/ICENABLER, IS/ICPENDR, IS/ICACTIVER, IPRIORITYR, ICFGR, SGIR) and CPU interface
+(CTLR/PMR/IAR/EOIR/HPPIR) — modelling enable/pending/active/priority per INTID,
+level vs edge (devices are level and follow their line; the timer PPI and SGIs are
+edge), a PMR + running-priority preemption gate, and the IAR/EOIR acknowledge
+cycle. No HVF calls in it, so it unit-tests without a hypervisor: the
+enable→pend→ack→EOI cycle, PMR masking, edge-latch consumption, and priority
+ordering all pass. Next: wire it into the HVF backend (skip `hv_gic_create`, route
+GICD/GICC MMIO and `VTIMER_ACTIVATED` through it, raise the IRQ line before
+`hv_vcpu_run`), emit the GICv2 DTB node, and boot to a shell on it — then the
+timer and snapshot-survival that motivated all this.
+
 ---
 
 ## M5 — RAM coexistence (in progress)

@@ -3,6 +3,7 @@
 //! raw HVF exit into the shared `VmExit` vocabulary.
 
 mod ffi;
+mod gicv2;
 mod sysregs;
 
 use amber_core::hypervisor::{decode_data_abort, Hypervisor, Vcpu, VmExit};
