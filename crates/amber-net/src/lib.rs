@@ -30,7 +30,7 @@ mod smoltcp_backend {
     };
     use std::collections::VecDeque;
     use std::io::{Read, Write};
-    use std::net::{Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
+    use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -112,8 +112,41 @@ mod smoltcp_backend {
         flows: Vec<Flow>,
         dns: SocketHandle,
         pending_dns: Vec<DnsQuery>,
+        /// Inbound (host->guest) port-forwards: host listeners hand accepted
+        /// connections here; the netstack dials the guest and we bridge them.
+        accepted: Arc<Mutex<VecDeque<(TcpStream, u16)>>>,
+        inbound: Vec<(SocketHandle, TcpStream)>,
+        has_listeners: bool,
         next_eph: u16,
         start: std::time::Instant,
+    }
+
+    /// Bridge bytes between a smoltcp socket and its host stream (shared by
+    /// outbound and inbound flows). Returns true once the smoltcp side is Closed.
+    fn bridge(sock: &mut tcp::Socket, host: &mut TcpStream, host_done: &mut bool) {
+        if sock.can_recv() {
+            let _ = sock.recv(|data| {
+                let n = host.write(data).unwrap_or(0);
+                (n, ())
+            });
+        }
+        if sock.can_send() && !*host_done {
+            let mut buf = [0u8; 32 * 1024];
+            match host.read(&mut buf) {
+                Ok(0) => {
+                    *host_done = true;
+                    sock.close();
+                }
+                Ok(n) => {
+                    let _ = sock.send_slice(&buf[..n]);
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(_) => {
+                    *host_done = true;
+                    sock.close();
+                }
+            }
+        }
     }
 
     /// (src, dst, src_port, dst_port, syn, ack) of an Ethernet/IPv4/TCP frame.
@@ -186,6 +219,28 @@ mod smoltcp_backend {
             let _ = dns_sock.bind(IpListenEndpoint { addr: Some(IpAddress::Ipv4(GATEWAY)), port: 53 });
             let dns = sockets.add(dns_sock);
 
+            // Inbound port-forwards from AMBER_PORTS="hostport:guestport,...": one
+            // host listener per mapping, accepted connections queued for the netstack.
+            let accepted: Arc<Mutex<VecDeque<(TcpStream, u16)>>> = Arc::new(Mutex::new(VecDeque::new()));
+            let mut has_listeners = false;
+            for m in std::env::var("AMBER_PORTS").unwrap_or_default().split(',').filter(|s| !s.is_empty()) {
+                let Some((h, g)) = m.split_once(':') else { continue };
+                let (Ok(hp), Ok(gp)) = (h.parse::<u16>(), g.parse::<u16>()) else { continue };
+                match TcpListener::bind(("0.0.0.0", hp)) {
+                    Ok(listener) => {
+                        has_listeners = true;
+                        let q = accepted.clone();
+                        std::thread::spawn(move || {
+                            for stream in listener.incoming().flatten() {
+                                q.lock().unwrap().push_back((stream, gp));
+                            }
+                        });
+                        log::info!("net: forwarding host :{hp} -> guest :{gp}");
+                    }
+                    Err(e) => log::warn!("net: cannot listen on :{hp}: {e}"),
+                }
+            }
+
             SmoltcpBackend {
                 iface,
                 device,
@@ -193,9 +248,49 @@ mod smoltcp_backend {
                 flows: Vec::new(),
                 dns,
                 pending_dns: Vec::new(),
+                accepted,
+                inbound: Vec::new(),
+                has_listeners,
                 next_eph: 40000,
                 start: std::time::Instant::now(),
             }
+        }
+
+        /// Dial the guest for each freshly accepted host connection, then bridge.
+        fn accept_inbound(&mut self) {
+            let pending: Vec<(TcpStream, u16)> = self.accepted.lock().unwrap().drain(..).collect();
+            for (stream, gport) in pending {
+                let _ = stream.set_nonblocking(true);
+                self.next_eph = self.next_eph.wrapping_add(1).max(40000);
+                let eph = self.next_eph;
+                let mut sock = tcp::Socket::new(
+                    tcp::SocketBuffer::new(vec![0u8; 64 * 1024]),
+                    tcp::SocketBuffer::new(vec![0u8; 64 * 1024]),
+                );
+                let r = sock.connect(self.iface.context(), (IpAddress::Ipv4(GUEST), gport), (IpAddress::Ipv4(GATEWAY), eph));
+                if r.is_ok() {
+                    let handle = self.sockets.add(sock);
+                    self.inbound.push((handle, stream));
+                } else {
+                    log::debug!("net: inbound dial to guest:{gport} failed: {r:?}");
+                }
+            }
+        }
+
+        fn pump_inbound(&mut self) {
+            for (handle, host) in &mut self.inbound {
+                let sock = self.sockets.get_mut::<tcp::Socket>(*handle);
+                let mut done = false;
+                bridge(sock, host, &mut done);
+            }
+            let sockets = &mut self.sockets;
+            self.inbound.retain(|(h, _)| {
+                let dead = sockets.get::<tcp::Socket>(*h).state() == tcp::State::Closed;
+                if dead {
+                    sockets.remove(*h);
+                }
+                !dead
+            });
         }
 
         /// Forward DNS queries the guest sent to the gateway out to the host
@@ -301,32 +396,7 @@ mod smoltcp_backend {
                     }
                 }
                 let Some(host) = flow.host.as_mut() else { continue };
-
-                // guest -> host
-                if sock.can_recv() {
-                    let _ = sock.recv(|data| {
-                        let n = host.write(data).unwrap_or(0);
-                        (n, ())
-                    });
-                }
-                // host -> guest
-                if sock.can_send() && !flow.host_done {
-                    let mut buf = [0u8; 32 * 1024];
-                    match host.read(&mut buf) {
-                        Ok(0) => {
-                            flow.host_done = true;
-                            sock.close();
-                        }
-                        Ok(n) => {
-                            let _ = sock.send_slice(&buf[..n]);
-                        }
-                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                        Err(_) => {
-                            flow.host_done = true;
-                            sock.close();
-                        }
-                    }
-                }
+                bridge(sock, host, &mut flow.host_done);
             }
             let sockets = &mut self.sockets;
             self.flows.retain(|flow| {
@@ -377,7 +447,9 @@ mod smoltcp_backend {
         }
         fn poll(&mut self) -> Option<Vec<u8>> {
             self.poll_iface();
+            self.accept_inbound();
             self.pump_flows();
+            self.pump_inbound();
             self.pump_dns();
             self.poll_iface();
             let mut f = self.device.tx.lock().unwrap().pop_front()?;
@@ -388,7 +460,12 @@ mod smoltcp_backend {
             MAC
         }
         fn wants_poll(&self) -> bool {
-            !self.flows.is_empty() || !self.pending_dns.is_empty()
+            // Keep polling while there is work or any inbound listener (so accepted
+            // connections are dialed promptly even when the guest is otherwise idle).
+            self.has_listeners
+                || !self.flows.is_empty()
+                || !self.inbound.is_empty()
+                || !self.pending_dns.is_empty()
         }
     }
 }
