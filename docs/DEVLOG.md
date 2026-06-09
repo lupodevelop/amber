@@ -938,6 +938,40 @@ touching `AMBER_GIC`.
 
 ---
 
+## Networking — Firecracker-shaped, pluggable backend
+
+Firecracker gives the guest virtio-net and pumps frames to a host TAP fd; the host
+kernel NATs. macOS has no TAP, so amber keeps Firecracker's *architecture* — a
+virtio-net device that pumps Ethernet frames across a `NetBackend` seam — and
+swaps the backend: a userspace netstack on macOS (rootless, no entitlement), a TAP
+fd on Linux/KVM later. The seam means the device never changes when the host
+strategy does, and the backends (smoltcp / gvproxy / vmnet / tap) are
+interchangeable, one default and the rest flagged.
+
+**Foundation (device + seam).** `NetBackend` (send a guest frame, poll for one to
+deliver) plus a virtio-net `NetDevice` (id 1): feature negotiation (MAC +
+VERSION_1), config-space MAC, the tx path (drain the readable descriptors, strip
+the 12-byte virtio-net header, hand the frame to the backend). Receive is the
+subtle half — frames arrive off the guest's notify cycle — so the device declares a
+receive queue that `process` does *not* consume on notify; instead the run loop
+calls `pump_rx` each iteration, which pulls a posted buffer and writes one frame
+(prepending a zeroed header) per `poll_rx`. A `CaptureBackend` logging tx proved it:
+the guest sees `eth0` and transmits ARP/IPv6 frames the backend receives.
+
+**Module A — smoltcp, end to end.** A new `amber-net` crate (smoltcp behind a
+default feature) implements the backend as a userspace gateway: a smoltcp
+`phy::Device` bridged to two frame queues, an `Interface` at 10.0.0.1/24. `send`
+feeds a guest frame and polls the stack; `poll` polls and returns whatever the
+stack emitted. With the guest statically 10.0.0.2, smoltcp answers ARP and ICMP for
+the gateway with no socket needed — so `ping 10.0.0.1` from the guest returns
+`64 bytes from 10.0.0.1 … 0% packet loss`. That round-trip exercises the entire
+path: guest tx → virtio-net → smoltcp → reply → `pump_rx` → guest rx. The remaining
+modules (TCP proxy to host sockets, UDP/DNS, an async wake thread for
+host-originated traffic, then the other backends) build outward connectivity on top
+of this proven base.
+
+---
+
 ## Cross-cutting choices
 
 - **Backend seam holds.** Every milestone added capability above the

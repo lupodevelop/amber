@@ -445,6 +445,7 @@ fn cmd_vm(args: &[String]) -> ExitCode {
     // slot in here. Default: no network device.
     let net: Option<Box<dyn amber_core::NetBackend>> = match std::env::var("AMBER_NET").as_deref() {
         Ok("capture") => Some(Box::new(amber_core::CaptureBackend)),
+        Ok(kind) => amber_net::backend(kind),
         _ => None,
     };
 

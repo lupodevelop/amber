@@ -1,0 +1,25 @@
+[package]
+name = "amber-net"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Host-side network backends behind amber-core's NetBackend seam. Each strategy is
+# a feature so its dependencies are opt-in. smoltcp (userspace netstack) is the
+# default; gvproxy/vmnet/tap come later.
+[dependencies]
+amber-core.workspace = true
+log.workspace = true
+smoltcp = { version = "0.12", default-features = false, features = [
+    "std",
+    "medium-ethernet",
+    "proto-ipv4",
+    "socket-tcp",
+    "socket-udp",
+    "socket-icmp",
+], optional = true }
+
+[features]
+default = ["smoltcp-backend"]
+smoltcp-backend = ["dep:smoltcp"]

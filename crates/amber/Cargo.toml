@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 amber-core.workspace = true
 amber-image.workspace = true
+amber-net.workspace = true
 log.workspace = true
 env_logger.workspace = true
 libc.workspace = true
