@@ -981,7 +981,18 @@ from the guest, `GET / HTTP/1.0` to `1.1.1.1:80` over the proxy returns
 `HTTP/1.1 301 Moved Permanently / Server: cloudflare` — a real connection to the
 internet through a host socket. (The host connect is currently blocking with a
 short timeout, and responses arrive on the run loop's ≤50 ms poll; an async wake
-thread — Module D — makes both prompt. UDP/DNS, then the other backends, follow.)
+thread — Module D — makes both prompt.)
+
+**Module C — DNS.** The guest needs names, not just IPs. Cleanest path: the gateway
+is the resolver, so no NAT is needed — a smoltcp UDP socket bound to the gateway's
+own `10.0.0.1:53` receives the guest's queries (it owns that address). Each query
+is forwarded to a host resolver (`1.1.1.1:53`) over a fresh non-blocking
+`UdpSocket`, matched back to the asking guest endpoint, and the reply relayed to the
+guest. With the guest's `resolv.conf` pointing at `10.0.0.1`, `nslookup example.com`
+returns `104.20.23.154`, and the headline check — `wget http://example.com` —
+resolves the name *and* fetches the page (`<title>Example Domain</title>`, full
+HTML). DNS + TCP-DNAT together: real outbound connectivity by hostname, which is
+what agent tasks need.
 
 ---
 

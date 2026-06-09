@@ -22,17 +22,20 @@ mod smoltcp_backend {
     use amber_core::NetBackend;
     use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
     use smoltcp::phy::{Device, DeviceCapabilities, Medium};
-    use smoltcp::socket::tcp;
+    use smoltcp::socket::{tcp, udp};
     use smoltcp::time::Instant;
     use smoltcp::wire::{
         EthernetAddress, EthernetFrame, EthernetProtocol, HardwareAddress, IpAddress, IpCidr,
-        IpProtocol, Ipv4Address, Ipv4Packet, TcpPacket,
+        IpEndpoint, IpListenEndpoint, IpProtocol, Ipv4Address, Ipv4Packet, TcpPacket,
     };
     use std::collections::VecDeque;
     use std::io::{Read, Write};
-    use std::net::{Ipv4Addr, SocketAddr, TcpStream};
+    use std::net::{Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    /// Where the gateway forwards the guest's DNS queries.
+    const RESOLVER: &str = "1.1.1.1:53";
 
     const GATEWAY: Ipv4Address = Ipv4Address::new(10, 0, 0, 1);
     const GUEST: Ipv4Address = Ipv4Address::new(10, 0, 0, 2);
@@ -92,11 +95,20 @@ mod smoltcp_backend {
         host_done: bool,
     }
 
+    /// A DNS query the gateway forwarded to the host resolver, awaiting its reply
+    /// to relay back to the guest endpoint that asked.
+    struct DnsQuery {
+        host: UdpSocket,
+        guest: IpEndpoint,
+    }
+
     pub struct SmoltcpBackend {
         iface: Interface,
         device: Bridge,
         sockets: SocketSet<'static>,
         flows: Vec<Flow>,
+        dns: SocketHandle,
+        pending_dns: Vec<DnsQuery>,
         next_eph: u16,
         start: std::time::Instant,
     }
@@ -160,14 +172,60 @@ mod smoltcp_backend {
             iface.update_ip_addrs(|addrs| {
                 let _ = addrs.push(IpCidr::new(IpAddress::Ipv4(GATEWAY), 24));
             });
+
+            // A UDP socket on the gateway's own :53 — the guest's nameserver. No NAT
+            // needed: the destination is the gateway's address, so smoltcp accepts.
+            let mut sockets = SocketSet::new(Vec::new());
+            let mut dns_sock = udp::Socket::new(
+                udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 16], vec![0u8; 16 * 1024]),
+                udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 16], vec![0u8; 16 * 1024]),
+            );
+            let _ = dns_sock.bind(IpListenEndpoint { addr: Some(IpAddress::Ipv4(GATEWAY)), port: 53 });
+            let dns = sockets.add(dns_sock);
+
             SmoltcpBackend {
                 iface,
                 device,
-                sockets: SocketSet::new(Vec::new()),
+                sockets,
                 flows: Vec::new(),
+                dns,
+                pending_dns: Vec::new(),
                 next_eph: 40000,
                 start: std::time::Instant::now(),
             }
+        }
+
+        /// Forward DNS queries the guest sent to the gateway out to the host
+        /// resolver, and relay replies back. UDP, stateless, one host socket per
+        /// in-flight query (matched back to its guest endpoint).
+        fn pump_dns(&mut self) {
+            // guest -> resolver
+            loop {
+                let sock = self.sockets.get_mut::<udp::Socket>(self.dns);
+                let (payload, guest) = match sock.recv() {
+                    Ok((data, meta)) => (data.to_vec(), meta.endpoint),
+                    Err(_) => break,
+                };
+                if let Ok(h) = UdpSocket::bind("0.0.0.0:0") {
+                    let _ = h.set_nonblocking(true);
+                    if h.connect(RESOLVER).is_ok() && h.send(&payload).is_ok() {
+                        self.pending_dns.push(DnsQuery { host: h, guest });
+                    }
+                }
+            }
+            // resolver -> guest
+            let sock = self.sockets.get_mut::<udp::Socket>(self.dns);
+            self.pending_dns.retain_mut(|q| {
+                let mut buf = [0u8; 2048];
+                match q.host.recv(&mut buf) {
+                    Ok(n) => {
+                        let _ = sock.send_slice(&buf[..n], q.guest);
+                        false
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => true,
+                    Err(_) => false,
+                }
+            });
         }
 
         fn now(&self) -> Instant {
@@ -289,11 +347,13 @@ mod smoltcp_backend {
             self.device.rx.lock().unwrap().push_back(f);
             self.poll_iface();
             self.pump_flows();
+            self.pump_dns();
             self.poll_iface();
         }
         fn poll(&mut self) -> Option<Vec<u8>> {
             self.poll_iface();
             self.pump_flows();
+            self.pump_dns();
             self.poll_iface();
             let mut f = self.device.tx.lock().unwrap().pop_front()?;
             self.dnat_out(&mut f);
