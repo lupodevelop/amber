@@ -295,7 +295,7 @@ fn cmd_boot(args: &[String]) -> ExitCode {
 
     let cfg = VmConfig { kernel, initrd, disk, ..Default::default() };
 
-    let vm = match Vm::prepare(&cfg) {
+    let vm = match Vm::prepare(&cfg, None) {
         Ok(vm) => vm,
         Err(e) => {
             eprintln!("prepare failed: {e}");
@@ -440,8 +440,16 @@ fn cmd_vm(args: &[String]) -> ExitCode {
     if std::env::var("AMBER_VERBOSE").is_ok() {
         cfg.cmdline = "earlycon=pl011,0x9000000 console=ttyAMA0".into();
     }
+    // Network backend (the host-side seam). For now AMBER_NET=capture wires the
+    // bring-up backend that logs transmitted frames; smoltcp/gvproxy/vmnet/tap
+    // slot in here. Default: no network device.
+    let net: Option<Box<dyn amber_core::NetBackend>> = match std::env::var("AMBER_NET").as_deref() {
+        Ok("capture") => Some(Box::new(amber_core::CaptureBackend)),
+        _ => None,
+    };
+
     let t_prep_start = std::time::Instant::now();
-    let vm = match Vm::prepare(&cfg) {
+    let vm = match Vm::prepare(&cfg, net) {
         Ok(vm) => vm,
         Err(e) => {
             eprintln!("prepare failed: {e}");
@@ -609,6 +617,10 @@ mod guest {
         "drivers/virtio/virtio_balloon.ko",
         "drivers/char/hw_random/rng-core.ko",
         "drivers/char/hw_random/virtio-rng.ko",
+        // virtio-net and its failover dependencies (load deps first).
+        "net/core/failover.ko",
+        "drivers/net/net_failover.ko",
+        "drivers/net/virtio_net.ko",
         "fs/squashfs/squashfs.ko",
         "fs/overlayfs/overlay.ko",
     ];

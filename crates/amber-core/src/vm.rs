@@ -113,7 +113,7 @@ impl Vm {
     /// Place the kernel and initramfs in guest RAM and wire the device bus. The
     /// DTB is deferred to `run`, because its interrupt-controller node depends on
     /// the GIC the backend creates.
-    pub fn prepare(cfg: &VmConfig) -> Result<Self> {
+    pub fn prepare(cfg: &VmConfig, net: Option<Box<dyn crate::net::NetBackend>>) -> Result<Self> {
         let mem = GuestMemory::new(layout::RAM_BASE, cfg.mem_size)?;
 
         let kernel = loader::load_kernel(&mem, &cfg.kernel)?;
@@ -121,7 +121,8 @@ impl Vm {
         let dtb_addr = mem.base() + layout::DTB_OFFSET;
 
         // Block device first (so it is /dev/vda) if there is a disk, then an
-        // entropy source. Indices set each device's MMIO window and interrupt.
+        // entropy source, then the network (if any). Indices set each device's
+        // MMIO window and interrupt.
         let mut virtio: Vec<VirtioDev> = Vec::new();
         if let Some(path) = &cfg.disk {
             let i = virtio.len();
@@ -129,6 +130,10 @@ impl Vm {
         }
         let i = virtio.len();
         virtio.push(VirtioDev::new(i, Box::new(RngDevice::open()?)));
+        if let Some(backend) = net {
+            let i = virtio.len();
+            virtio.push(VirtioDev::new(i, Box::new(crate::net::NetDevice::new(backend))));
+        }
         let balloon = push_balloon(&mut virtio);
 
         Ok(Self {
@@ -337,6 +342,14 @@ impl Vm {
 
             // vcpu loop on this thread.
             let mut step = || -> Result<bool> {
+                // Deliver any frames that arrived from the network backend into the
+                // guest's receive queue and raise the device interrupt.
+                for d in virtio.iter_mut() {
+                    if d.mmio.pump_rx() {
+                        hv.set_irq(d.intid, d.mmio.irq_level())?;
+                    }
+                }
+
                 // Snapshot point: the guest is stopped between runs, so its RAM
                 // and registers are consistent. Capture once the deadline passes,
                 // then stop (restore is a separate path).

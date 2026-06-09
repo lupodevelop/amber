@@ -102,7 +102,12 @@
       "Bash(pkill -9 -f 'amber restore')",
       "Bash(sed -n '/pub struct VirtioMmio/,/^}/p' crates/amber-core/src/virtio.rs)",
       "Bash(sed -n '/struct Queue/,/^}/p' crates/amber-core/src/virtio.rs)",
-      "Bash(echo \"default build \\(now swgic\\): $\\(cargo build --release -p amber 2>&1)"
+      "Bash(echo \"default build \\(now swgic\\): $\\(cargo build --release -p amber 2>&1)",
+      "Bash(sed -n '/pub trait VirtioDevice/,/^}/p' crates/amber-core/src/virtio.rs)",
+      "Bash(sed -n '/pub struct Buf/,/^}/p' crates/amber-core/src/virtio.rs)",
+      "Bash(sed -n '/pub struct RngDevice/,/^}/p;/impl VirtioDevice for RngDevice/,/^}/p' crates/amber-core/src/virtio.rs)",
+      "Bash(echo \"=== $\\(cargo build --release -p amber 2>&1)",
+      "Bash(echo \"default build: $\\(cargo build --release -p amber 2>&1)"
     ],
     "additionalDirectories": [
       "/private/tmp/snap",

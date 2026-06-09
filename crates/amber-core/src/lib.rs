@@ -11,12 +11,14 @@ pub mod dtb;
 pub mod hypervisor;
 pub mod loader;
 pub mod memory;
+pub mod net;
 pub mod snapshot;
 pub mod virtio;
 mod vm;
 
 pub use hypervisor::{Hypervisor, Vcpu};
 pub use memory::GuestMemory;
+pub use net::{CaptureBackend, NetBackend, NetDevice};
 pub use vm::{SnapshotReq, Vm, VmConfig};
 
 /// Where a backend placed its interrupt controller, so the device tree can

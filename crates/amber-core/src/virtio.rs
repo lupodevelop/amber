@@ -88,6 +88,18 @@ pub trait VirtioDevice {
     /// Service one descriptor chain on `queue`; return the number of bytes the
     /// device wrote into guest memory (the used-ring length).
     fn handle(&mut self, queue: usize, ram: &GuestRam, bufs: &[Buf]) -> u32;
+
+    /// The queue this device fills asynchronously (host -> guest), if any. Notifies
+    /// on it are not consumed in `handle` (they just post buffers); the run loop
+    /// pumps it via `poll_rx` when data arrives. virtio-net's receive queue uses it.
+    fn rx_queue(&self) -> Option<usize> {
+        None
+    }
+    /// Next payload to deliver on `rx_queue` (already including any device header),
+    /// or None. Polled by the run loop; must be non-blocking.
+    fn poll_rx(&mut self) -> Option<Vec<u8>> {
+        None
+    }
 }
 
 #[derive(Default, Clone, Copy)]
@@ -243,8 +255,33 @@ impl VirtioMmio {
         }
     }
 
+    /// Deliver host-originated frames into the device's receive queue, consuming
+    /// one posted guest buffer per frame. Returns true if anything was delivered
+    /// (the caller raises the interrupt). Frames with no buffer waiting are dropped.
+    pub fn pump_rx(&mut self) -> bool {
+        let Some(ram) = self.ram else { return false };
+        let Some(rxq) = self.dev.rx_queue() else { return false };
+        let mut any = false;
+        while let Some(data) = self.dev.poll_rx() {
+            let Some(q) = self.queues.get_mut(rxq) else { break };
+            if !inject_one(&ram, q, &data) {
+                break; // no buffer posted: drop and stop (the frame is lost)
+            }
+            any = true;
+        }
+        if any {
+            self.interrupt_status |= 1;
+        }
+        any
+    }
+
     fn process(&mut self, qidx: usize) {
         let Some(ram) = self.ram else { return };
+        // The receive queue is filled asynchronously by `pump_rx`, not on notify;
+        // a notify there just posts buffers, so do not consume them here.
+        if self.dev.rx_queue() == Some(qidx) {
+            return;
+        }
         let Some(mut q) = self.queues.get(qidx).copied() else { return };
         if q.ready == 0 || q.num == 0 {
             return;
@@ -297,6 +334,35 @@ fn push_used(ram: &GuestRam, used: u64, id: u32, len: u32, qsz: u16) {
     ram.write_u32(elem, id);
     ram.write_u32(elem + 4, len);
     ram.write_u16(used + 2, idx.wrapping_add(1));
+}
+
+/// Write one host->guest payload into the next posted buffer of a receive queue
+/// (spilling across a descriptor chain if needed) and publish it on the used ring.
+/// Returns false if no buffer is available, so the caller can stop and drop.
+fn inject_one(ram: &GuestRam, q: &mut Queue, data: &[u8]) -> bool {
+    if q.ready == 0 || q.num == 0 {
+        return false;
+    }
+    let qsz = q.num as u16;
+    let avail_idx = ram.read_u16(q.avail + 2);
+    if q.last_avail == avail_idx {
+        return false; // no buffer posted by the guest
+    }
+    let slot = q.last_avail % qsz;
+    let head = ram.read_u16(q.avail + 4 + 2 * slot as u64);
+    let bufs = collect_chain(ram, q.desc, head, qsz);
+    let mut off = 0usize;
+    for b in bufs.iter().filter(|b| b.writable) {
+        if off >= data.len() {
+            break;
+        }
+        let n = (b.len as usize).min(data.len() - off);
+        ram.write(b.addr, &data[off..off + n]);
+        off += n;
+    }
+    push_used(ram, q.used, head as u32, off as u32, qsz);
+    q.last_avail = q.last_avail.wrapping_add(1);
+    true
 }
 
 /// virtio-blk, read-only. The base is a read-only image (squashfs); the guest
