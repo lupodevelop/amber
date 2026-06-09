@@ -994,6 +994,24 @@ resolves the name *and* fetches the page (`<title>Example Domain</title>`, full
 HTML). DNS + TCP-DNAT together: real outbound connectivity by hostname, which is
 what agent tasks need.
 
+**Module D — never block the vcpu, answer promptly.** Two rough edges from B/C: the
+host `connect` blocked the vcpu thread (a dead destination froze the guest for
+seconds), and host-side replies only arrived on the run loop's ≤50 ms idle poll.
+Fixed both without a wake thread. The connect now runs on a throwaway thread and
+hands the stream back over a channel; the flow opens its smoltcp socket immediately
+(so the guest's SYN is answered) and starts forwarding once the stream lands — a
+failed connect aborts the guest side. And the device reports `wants_poll()` while it
+has open flows or in-flight DNS, capping the idle park at ~1 ms so replies reach the
+guest in ~ms. Verified: `wget http://example.com` still returns the page, and a
+`sleep` loop keeps ticking on schedule (`0s, 1s, 2s`) *while* a connect to an
+unreachable `10.255.255.1` is in flight — the vcpu never stalls. (A true
+edge-triggered waker would also let long-lived idle connections sleep rather than
+poll at 1 ms; for amber's short sandbox tasks the adaptive poll suffices.)
+
+With A–D the software-GIC guest has working outbound networking by hostname, fast
+and non-blocking — sandboxes can fetch, install, and call APIs. The other backends
+(gvproxy, vmnet, the Linux TAP for KVM) plug into the same seam when wanted.
+
 ---
 
 ## Cross-cutting choices

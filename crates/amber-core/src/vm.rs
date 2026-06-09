@@ -415,9 +415,17 @@ impl Vm {
                     // the instant console/control input raises a line, so the cap is
                     // only a backstop, not the input latency.
                     VmExit::Idle => {
+                        // Cap the park hard when a device (the network backend) is
+                        // awaiting async host-side replies, so they reach the guest
+                        // in ~ms; otherwise park until the timer is due (50 ms cap).
+                        let cap = if virtio.iter().any(|d| d.mmio.wants_poll()) {
+                            1_000_000
+                        } else {
+                            50_000_000
+                        };
                         let ns = match vcpu.pending_timer_ns() {
-                            Ok(Some(n)) => n.min(50_000_000),
-                            _ => 50_000_000,
+                            Ok(Some(n)) => n.min(cap),
+                            _ => cap,
                         };
                         if ns > 0 {
                             std::thread::park_timeout(std::time::Duration::from_nanos(ns));

@@ -100,6 +100,12 @@ pub trait VirtioDevice {
     fn poll_rx(&mut self) -> Option<Vec<u8>> {
         None
     }
+    /// True while the device has asynchronous work pending and wants the run loop
+    /// to poll it eagerly rather than wait out the idle park (e.g. the network
+    /// backend awaiting host-side replies).
+    fn wants_poll(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Default, Clone, Copy)]
@@ -253,6 +259,12 @@ impl VirtioMmio {
         for q in &mut self.queues {
             *q = Queue::default();
         }
+    }
+
+    /// Whether the wrapped device has async work pending (see
+    /// [`VirtioDevice::wants_poll`]).
+    pub fn wants_poll(&self) -> bool {
+        self.dev.wants_poll()
     }
 
     /// Deliver host-originated frames into the device's receive queue, consuming

@@ -91,7 +91,10 @@ mod smoltcp_backend {
         ext_port: u16,
         eph: u16,
         handle: SocketHandle,
-        host: TcpStream,
+        /// The host connection, once it completes. `connecting` carries it from the
+        /// connect thread so the vcpu never blocks on a slow or dead destination.
+        host: Option<TcpStream>,
+        connecting: Option<std::sync::mpsc::Receiver<std::io::Result<TcpStream>>>,
         host_done: bool,
     }
 
@@ -247,14 +250,13 @@ mod smoltcp_backend {
             if self.flows.iter().any(|f| f.guest_port == sport && f.ext_ip == dst && f.ext_port == dport) {
                 return;
             }
-            let host = match TcpStream::connect_timeout(&SocketAddr::from((dst, dport)), Duration::from_secs(3)) {
-                Ok(s) => s,
-                Err(e) => {
-                    log::debug!("net: connect {dst}:{dport} failed: {e}");
-                    return;
-                }
-            };
-            let _ = host.set_nonblocking(true);
+            // Connect on a thread so the vcpu is never blocked; the stream arrives
+            // over the channel and the flow starts forwarding once it lands.
+            let (tx, rx) = std::sync::mpsc::channel();
+            let addr = SocketAddr::from((dst, dport));
+            std::thread::spawn(move || {
+                let _ = tx.send(TcpStream::connect_timeout(&addr, Duration::from_secs(5)));
+            });
             self.next_eph = self.next_eph.wrapping_add(1).max(40000);
             let eph = self.next_eph;
             let mut sock = tcp::Socket::new(
@@ -271,7 +273,8 @@ mod smoltcp_backend {
                 ext_port: dport,
                 eph,
                 handle,
-                host,
+                host: None,
+                connecting: Some(rx),
                 host_done: false,
             });
         }
@@ -279,15 +282,37 @@ mod smoltcp_backend {
         fn pump_flows(&mut self) {
             for flow in &mut self.flows {
                 let sock = self.sockets.get_mut::<tcp::Socket>(flow.handle);
+
+                // Resolve a still-connecting host (non-blocking).
+                if flow.host.is_none() {
+                    match flow.connecting.as_ref().map(|rx| rx.try_recv()) {
+                        Some(Ok(Ok(s))) => {
+                            let _ = s.set_nonblocking(true);
+                            flow.host = Some(s);
+                            flow.connecting = None;
+                        }
+                        Some(Ok(Err(_))) | Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                            // Connect failed: tear the guest side down.
+                            flow.connecting = None;
+                            flow.host_done = true;
+                            sock.abort();
+                        }
+                        _ => {} // still connecting; leave guest data buffered in smoltcp
+                    }
+                }
+                let Some(host) = flow.host.as_mut() else { continue };
+
+                // guest -> host
                 if sock.can_recv() {
                     let _ = sock.recv(|data| {
-                        let n = flow.host.write(data).unwrap_or(0);
+                        let n = host.write(data).unwrap_or(0);
                         (n, ())
                     });
                 }
+                // host -> guest
                 if sock.can_send() && !flow.host_done {
                     let mut buf = [0u8; 32 * 1024];
-                    match flow.host.read(&mut buf) {
+                    match host.read(&mut buf) {
                         Ok(0) => {
                             flow.host_done = true;
                             sock.close();
@@ -361,6 +386,9 @@ mod smoltcp_backend {
         }
         fn mac(&self) -> [u8; 6] {
             MAC
+        }
+        fn wants_poll(&self) -> bool {
+            !self.flows.is_empty() || !self.pending_dns.is_empty()
         }
     }
 }

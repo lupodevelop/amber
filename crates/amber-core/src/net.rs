@@ -21,6 +21,13 @@ pub trait NetBackend: Send {
     fn mac(&self) -> [u8; 6] {
         [0x52, 0x54, 0x00, 0x12, 0x34, 0x56]
     }
+    /// True while the backend has in-flight work (open connections, pending
+    /// queries) whose host-side responses arrive asynchronously. The run loop polls
+    /// more eagerly while this holds so replies reach the guest in ~ms, not the
+    /// idle-park cap.
+    fn wants_poll(&self) -> bool {
+        false
+    }
 }
 
 /// A backend that drops transmits and never receives, logging a one-line summary
@@ -100,6 +107,9 @@ impl VirtioDevice for NetDevice {
     }
     fn rx_queue(&self) -> Option<usize> {
         Some(Self::RX)
+    }
+    fn wants_poll(&self) -> bool {
+        self.backend.wants_poll()
     }
     fn handle(&mut self, queue: usize, ram: &GuestRam, bufs: &[Buf]) -> u32 {
         if queue == Self::TX {
