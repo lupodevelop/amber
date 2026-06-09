@@ -44,15 +44,55 @@ fn main() -> ExitCode {
         Some("exec") => cmd_exec(&args),
         Some("fork") => cmd_fork(&args),
         Some("boot") => cmd_boot(&args),
-        _ => {
-            eprintln!("usage:");
-            eprintln!("  amber run [-d] <image|template> [-- <argv>...]");
-            eprintln!("  amber up | down | ps | rm <id> | logs <id>");
-            eprintln!("  amber pull <image>");
-            eprintln!("  amber boot <kernel-Image> [initramfs] [disk]");
+        Some("help") | Some("-h") | Some("--help") | None => {
+            print_help(&mut std::io::stdout());
+            ExitCode::SUCCESS
+        }
+        Some(other) => {
+            eprintln!("amber: unknown command '{other}'\n");
+            print_help(&mut std::io::stderr());
             ExitCode::FAILURE
         }
     }
+}
+
+/// The command reference, grouped by what you're doing.
+fn print_help(w: &mut impl std::io::Write) {
+    let _ = write!(
+        w,
+        "\
+amber — fast, isolated microVM sandboxes on Apple Silicon
+
+usage: amber <command> [args]
+
+  run & exec
+    run [-d] <image|template> [-- <argv>]   boot a microVM and run a command
+                                            (-d: detached, prints an id)
+    exec <template-dir> -- <command>        run a command in a warm fork
+    template <image> <dir>                  build a ready-to-exec template
+    fork [-i] <template-dir>                fork a template (-i: attach terminal)
+    restore <snapshot-dir>                  resume a snapshot mid-execution
+
+  daemon & fleet
+    up | down                               start / stop the amberd daemon
+    ps                                      list VMs (ID PID AGE CAP RSS IMAGE)
+    logs <id>                               stream a VM's output
+    rm <id>                                 kill a VM
+    budget                                  fleet RAM: budget / reserved / real / host
+    balloon <id> <MiB>                      ask a VM to give RAM back
+
+  images
+    pull <image>                            pre-pull / refresh into the cache
+    boot <kernel-Image> [initramfs] [disk]  boot a raw kernel (no OCI)
+
+  env
+    AMBER_NET=none        disable networking (on by default)
+    AMBER_PORTS=8080:80   forward a host port to the guest
+    AMBER_GIC=hw          use the in-kernel vGIC (no snapshot timer)
+
+docs: README.md  ·  config: amber.toml
+"
+    );
 }
 
 /// Route `run`: `-d` detaches (daemon only); otherwise through amberd if

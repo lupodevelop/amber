@@ -6,10 +6,8 @@ command, throw it away. Firecracker's idea taken local and narrowed to arm64,
 optimized for spawn. Apple Silicon (Hypervisor.framework) today; arm64 Linux (KVM)
 is on the roadmap.
 
-This README is the **implementation as it stands**. The build journal (every bug,
-decision, and measurement) is in [`docs/DEVLOG.md`](docs/DEVLOG.md); the network
-backend design is in [`docs/networking-backends.md`](docs/networking-backends.md);
-positioning lives in [`project-resorces/docs/`](project-resorces/docs/).
+This README is the **implementation as it stands**. The network backend design is
+in [`docs/networking-backends.md`](docs/networking-backends.md).
 
 ## What it does
 
@@ -28,21 +26,19 @@ positioning lives in [`project-resorces/docs/`](project-resorces/docs/).
 
 It does this on macOS without KVM by emulating the interrupt controller in
 userspace (a software GICv2) — which is what makes snapshot/restore/fork/exec work
-on Apple Silicon at all (the in-kernel vGIC can't restore the timer). See the
-DEVLOG for the full story.
+on Apple Silicon at all (the in-kernel vGIC can't restore the timer).
 
 ## Status
 
-| Milestone | What works |
-|-----------|------------|
-| M0 / M0.5 | Boot a bundled arm64 kernel to userspace; GIC + timer; interactive PL011 console |
-| M1 | `amber run <image>`: OCI pull, flatten, squashfs base + tmpfs overlay, virtio-blk/rng |
-| M2 | `amber.toml` templates; `amberd` daemon over a unix socket; `ps`/`rm`/`logs`; image cache; `-d` detached |
-| M3 | snapshot **capture + restore** — RAM + vcpu + GIC + PL011/virtio device state; periodic timer survives (on the software GIC) |
-| M4 | **fork** from a template (CoW, ~10 MiB/fork) + **warm pool** (~ms handoff) + budget-aware sizing/eviction + interactive `fork -i` |
-| M5 | RAM coexistence: fleet `ram_budget` + admission; real RSS; virtio-balloon free-page reporting **and** active reclaim; pool eviction |
-| M7 | **`amber exec`** — run a fresh command in a warm fork (~15 ms), with exit codes |
-| net | software GICv2 (default) unlocks it all; userspace netstack: outbound TCP+DNS by name, inbound port-forward, on by default |
+| Capability | What works |
+| --- | --- |
+| **Run** | boot an OCI image (squashfs base + tmpfs overlay), interactive console, virtio-blk/rng |
+| **Networking** | outbound TCP + DNS by hostname, inbound port-forward; on by default, rootless |
+| **Snapshot / restore** | capture + resume a VM mid-execution — RAM + vcpu + interrupt controller + PL011/virtio device state; periodic timer survives |
+| **Fork** | copy-on-write from a template (~10 MiB/fork) + warm pool (~ms handoff) + budget-aware sizing/eviction; interactive `fork -i` |
+| **Exec** | `amber exec <template> -- <cmd>` — a fresh command in a warm fork (~15 ms), with exit codes |
+| **RAM budget** | fleet ceiling + admission control, real-RSS accounting, virtio-balloon reclaim (passive + active), pool eviction |
+| **Daemon** | `amberd` over a unix socket; `ps`/`logs`/`rm`/`budget`; templates and budget from `amber.toml` |
 
 Rough numbers (Apple Silicon, alpine): warm boot `amber run -- true` ~100 ms; warm
 `amber exec` ~15 ms; a fork costs ~10 MiB private RAM; free-page reporting shrinks a
@@ -190,8 +186,7 @@ ram_cap = "384MiB"      # guest RAM and the amount accounted against the budget
   PYTHONUNBUFFERED = "1"
 ```
 
-`amber run pytools -- ...` resolves the template by name. Schema:
-[`project-resorces/docs/MANIFEST.md`](project-resorces/docs/MANIFEST.md).
+`amber run pytools -- ...` resolves the template by name.
 
 ## Environment knobs
 
@@ -219,13 +214,13 @@ crates/
   amber        CLI + amberd control plane (run/exec/template/fork/ps/budget/...)
 ```
 
-The `Hypervisor`/`Vcpu` traits are the seam: a KVM backend (M8, arm64 Linux) is a
+The `Hypervisor`/`Vcpu` traits are the seam: a KVM backend (arm64 Linux) is a
 third crate implementing them. amberd is a supervisor — one `amber __vm` child per
 VM — because HVF is one-VM-per-process; that is also the per-sandbox isolation.
 
 ## Limitations & roadmap
 
-- **macOS only** today; the KVM backend (arm64 Linux) is M8 — needs the hardware to
+- **macOS only** today; a KVM backend (arm64 Linux) — needs the hardware to
   build and test. On KVM the in-kernel vGIC has a complete save/restore surface, so
   the software GIC becomes optional there.
 - Borrowed Alpine kernel/modules under `assets/`; a bundled, trimmed, built-in-everything
