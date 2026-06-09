@@ -50,8 +50,15 @@ VM's real footprint (e.g. 264 MiB → 52 MiB after the guest frees memory).
 
 ## Build
 
-Apple Silicon, macOS. HVF needs the hypervisor entitlement, so **every build must be
-re-codesigned** before running:
+Apple Silicon, macOS. HVF needs the hypervisor entitlement, and **every `cargo
+build` invalidates the code signature**, so build and sign together — `make` does
+both:
+
+```sh
+make            # cargo build --release + codesign (use this, not a bare cargo build)
+```
+
+Equivalently, by hand:
 
 ```sh
 cargo build --release
