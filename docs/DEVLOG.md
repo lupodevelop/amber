@@ -1012,6 +1012,15 @@ With A–D the software-GIC guest has working outbound networking by hostname, f
 and non-blocking — sandboxes can fetch, install, and call APIs. The other backends
 (gvproxy, vmnet, the Linux TAP for KVM) plug into the same seam when wanted.
 
+**Auto-config.** So networking is on by simply asking for it, the bootstrap init now
+configures the guest itself: gated on `eth0` existing (i.e. a virtio-net device is
+present, which only happens when `AMBER_NET` is set), it brings the link up, assigns
+the static `10.0.0.2/24`, sets the default route via `10.0.0.1`, and writes
+`nameserver 10.0.0.1` into the chroot's `resolv.conf` — addresses matched to the
+backend. So `AMBER_NET=smoltcp amber run alpine:3 -- wget http://example.com`
+returns the page with no manual `ip`/`resolv.conf` in the workload. (Networking
+stays opt-in: no `AMBER_NET`, no device, init skips the block.)
+
 ---
 
 ## Cross-cutting choices

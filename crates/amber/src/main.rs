@@ -656,6 +656,19 @@ fn build_bootstrap(config: &amber_image::ImageConfig, argv: &[String]) -> std::i
     init.push_str("mount -t devtmpfs dev /newroot/dev\n");
     init.push_str("mount -t proc proc /newroot/proc\n");
     init.push_str("mount -t sysfs sysfs /newroot/sys\n");
+    // Auto-configure networking when a virtio-net device is present (AMBER_NET set).
+    // The static address and gateway must match amber-net's backend (guest
+    // 10.0.0.2/24, gateway+resolver 10.0.0.1); resolv.conf goes into the chroot root
+    // so the command sees it.
+    init.push_str(
+        "if [ -e /sys/class/net/eth0 ]; then \
+         ip link set eth0 up; \
+         ip addr add 10.0.0.2/24 dev eth0; \
+         ip route add default via 10.0.0.1; \
+         mkdir -p /newroot/etc; \
+         echo 'nameserver 10.0.0.1' > /newroot/etc/resolv.conf; \
+         fi\n",
+    );
     // Image environment crosses chroot (it inherits our env).
     for e in &config.env {
         init.push_str(&format!("export {}\n", sh_quote(e)));
