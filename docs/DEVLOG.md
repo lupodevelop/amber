@@ -965,10 +965,23 @@ feeds a guest frame and polls the stack; `poll` polls and returns whatever the
 stack emitted. With the guest statically 10.0.0.2, smoltcp answers ARP and ICMP for
 the gateway with no socket needed — so `ping 10.0.0.1` from the guest returns
 `64 bytes from 10.0.0.1 … 0% packet loss`. That round-trip exercises the entire
-path: guest tx → virtio-net → smoltcp → reply → `pump_rx` → guest rx. The remaining
-modules (TCP proxy to host sockets, UDP/DNS, an async wake thread for
-host-originated traffic, then the other backends) build outward connectivity on top
-of this proven base.
+path: guest tx → virtio-net → smoltcp → reply → `pump_rx` → guest rx.
+
+**Module B — outbound TCP, via DNAT.** The obvious approach — `set_any_ip(true)`
+and a socket listening on the foreign destination — does not work: smoltcp 0.12
+leaves the socket in `Listen` and never accepts the guest's SYN to a non-interface
+address. The fix is destination NAT. On a fresh SYN to `ext_ip:ext_port` we connect
+a host `TcpStream` and open a smoltcp socket listening on the **gateway's own** IP
+and a unique ephemeral port; then every guest→external TCP frame is rewritten
+in-place (dst → gateway:eph, IP+TCP checksums refilled) before smoltcp sees it, and
+every gateway→guest reply is rewritten back (src → ext_ip:ext_port) on the way out.
+smoltcp only ever deals with its own address, so it accepts and bridges normally;
+`pump_flows` shuttles bytes between each smoltcp socket and its host stream. Result:
+from the guest, `GET / HTTP/1.0` to `1.1.1.1:80` over the proxy returns
+`HTTP/1.1 301 Moved Permanently / Server: cloudflare` — a real connection to the
+internet through a host socket. (The host connect is currently blocking with a
+short timeout, and responses arrive on the run loop's ≤50 ms poll; an async wake
+thread — Module D — makes both prompt. UDP/DNS, then the other backends, follow.)
 
 ---
 
