@@ -1021,6 +1021,20 @@ backend. So `AMBER_NET=smoltcp amber run alpine:3 -- wget http://example.com`
 returns the page with no manual `ip`/`resolv.conf` in the workload. (Networking
 stays opt-in: no `AMBER_NET`, no device, init skips the block.)
 
+**Networking through the warm pool (exec/fork).** Until now net only worked on the
+boot path; a forked or `exec`'d sandbox had none, which is exactly where agent
+tasks need it. The catch is the snapshot device set: a restore must recreate the
+same virtio devices in the same order or the queue state misaligns. So the snapshot
+now records `meta.net`, `amber template` builds with a net device (it sets
+`AMBER_NET` so the template boots a configured eth0), and `restore_from` recreates
+the net device when `meta.net` — with a *fresh* backend (its host-side state isn't
+snapshotted), while the guest's driver state and eth0 config come back in restored
+RAM. So a fork resumes with working networking immediately. Verified end to end:
+`amber exec <net-template> -- wget http://example.com` returns `Example Domain`, and
+`nslookup` resolves — a warm-forked sandbox, spawned in ms, with real internet.
+This is the whole point: `amber exec <template> -- <command>` runs an arbitrary
+networked task in a fresh, isolated, fast sandbox.
+
 ---
 
 ## Cross-cutting choices

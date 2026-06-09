@@ -41,6 +41,11 @@ pub struct Meta {
     /// GIC. `None` on snapshots taken before this was recorded.
     #[serde(default)]
     pub gic_kind: Option<String>,
+    /// Whether a virtio-net device was present. A restore must recreate the same
+    /// device set (so the virtio queue state lines up), so this drives whether the
+    /// restored VM gets a network device.
+    #[serde(default)]
+    pub net: bool,
 }
 
 /// Host-side device-emulation state that does not live in guest RAM and so must
@@ -88,6 +93,7 @@ pub fn write(
     disk: Option<&Path>,
     gic_kind: Option<crate::GicKind>,
     dev: &DevState,
+    net: bool,
 ) -> Result<()> {
     std::fs::create_dir_all(dir).map_err(snap_err)?;
     std::fs::write(dir.join("dev.json"), serde_json::to_vec(dev).map_err(snap_err)?)
@@ -104,6 +110,7 @@ pub fn write(
         mem_size: mem.len() as u64,
         disk: disk.map(|p| p.to_string_lossy().into_owned()),
         gic_kind: gic_kind.map(|k| k.as_str().to_string()),
+        net,
     };
     std::fs::write(dir.join("meta.json"), serde_json::to_vec(&meta).map_err(snap_err)?)
         .map_err(snap_err)?;

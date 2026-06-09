@@ -158,12 +158,16 @@ impl Vm {
     /// Build a VM from a snapshot directory: load its RAM, re-open its disk and
     /// devices, and stash the captured GIC + vcpu state for `run` to apply
     /// instead of booting.
-    pub fn restore_from(dir: &std::path::Path) -> Result<Self> {
+    pub fn restore_from(dir: &std::path::Path, net: Option<Box<dyn crate::net::NetBackend>>) -> Result<Self> {
         let loaded = crate::snapshot::read(dir)?;
         // Copy-on-write map of the snapshot's RAM: no up-front copy, and every fork
         // of this template shares the untouched pages. This is the fork fast path.
         let mem = GuestMemory::from_snapshot_cow(loaded.meta.mem_base, &dir.join("mem.bin"))?;
 
+        // Recreate the same device set the template had, in the same order, so the
+        // restored virtio queue state lines up. The network device gets a fresh
+        // backend (its host state is not snapshotted); the guest's driver state
+        // (eth0 config) is in restored RAM, so the fork has working net at once.
         let mut virtio: Vec<VirtioDev> = Vec::new();
         if let Some(path) = &loaded.meta.disk {
             let i = virtio.len();
@@ -171,6 +175,12 @@ impl Vm {
         }
         let i = virtio.len();
         virtio.push(VirtioDev::new(i, Box::new(RngDevice::open()?)));
+        if loaded.meta.net {
+            if let Some(backend) = net {
+                let i = virtio.len();
+                virtio.push(VirtioDev::new(i, Box::new(crate::net::NetDevice::new(backend))));
+            }
+        }
         let balloon = push_balloon(&mut virtio);
 
         Ok(Self {
@@ -362,7 +372,8 @@ impl Vm {
                             pl011: pl011.lock().unwrap().regs().to_vec(),
                             virtio: virtio.iter().map(|d| d.mmio.capture()).collect(),
                         };
-                        crate::snapshot::write(&req.dir, mem, &cpu, &gic, disk_path, gic_kind, &dev)?;
+                        let has_net = virtio.iter().any(|d| d.mmio.device_id() == 1);
+                        crate::snapshot::write(&req.dir, mem, &cpu, &gic, disk_path, gic_kind, &dev, has_net)?;
                         log::info!("snapshot captured to {}", req.dir.display());
                         return Ok(false);
                     }

@@ -488,7 +488,10 @@ fn cmd_restore(args: &[String]) -> ExitCode {
         eprintln!("usage: amber restore <snapshot-dir>");
         return ExitCode::FAILURE;
     };
-    let mut vm = match Vm::restore_from(Path::new(dir)) {
+    // Provide a fresh network backend; restore_from uses it only if the template
+    // had a net device (meta.net), keeping the device set aligned with the snapshot.
+    let net = amber_net::backend("smoltcp");
+    let mut vm = match Vm::restore_from(Path::new(dir), net) {
         Ok(vm) => vm,
         Err(e) => {
             eprintln!("restore failed: {e}");
@@ -529,6 +532,9 @@ fn cmd_template(args: &[String]) -> ExitCode {
     // The template must restore on the software GIC (timer survives there), and we
     // snapshot once the agent has booted and is blocked reading for a command.
     std::env::set_var("AMBER_GIC", "sw");
+    // Templates carry a network device so forked/exec'd sandboxes have internet;
+    // the init auto-configures eth0. (The fork's restore provides a fresh backend.)
+    std::env::set_var("AMBER_NET", "smoltcp");
     std::env::set_var("AMBER_SNAPSHOT", dir);
     std::env::set_var("AMBER_SNAPSHOT_AFTER_MS", "2500");
     let vm_args = vec![

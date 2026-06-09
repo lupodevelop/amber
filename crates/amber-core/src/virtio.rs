@@ -267,6 +267,11 @@ impl VirtioMmio {
         self.dev.wants_poll()
     }
 
+    /// The virtio device-type id of the wrapped device (e.g. 1 = net).
+    pub fn device_id(&self) -> u32 {
+        self.dev.device_id()
+    }
+
     /// Deliver host-originated frames into the device's receive queue, consuming
     /// one posted guest buffer per frame. Returns true if anything was delivered
     /// (the caller raises the interrupt). Frames with no buffer waiting are dropped.
