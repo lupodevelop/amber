@@ -1,6 +1,8 @@
 /target
 **/*.rs.bk
-Cargo.lock
 .DS_Store
 /assets
 /amber-cache
+# Private working notes and the local Claude harness config (personal paths).
+/dev_notes
+/.claude

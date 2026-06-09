@@ -752,11 +752,16 @@ fn build_bootstrap(config: &amber_image::ImageConfig, argv: &[String]) -> std::i
 
 /// `<MODULES_ROOT>/<version>/kernel` for the first kernel version present.
 fn first_module_dir() -> std::io::Result<std::path::PathBuf> {
-    let mut entries = std::fs::read_dir(guest::MODULES_ROOT)?;
-    let first = entries
-        .next()
-        .ok_or_else(|| std::io::Error::other("no kernel modules dir"))??;
-    Ok(first.path().join("kernel"))
+    // The modules root holds a versioned dir (e.g. `6.12.81-0-virt`) and may also
+    // hold a sibling `firmware` dir, so pick the entry that actually has a `kernel`
+    // module tree rather than the first one read_dir happens to return.
+    for e in std::fs::read_dir(guest::MODULES_ROOT)? {
+        let kernel = e?.path().join("kernel");
+        if kernel.is_dir() {
+            return Ok(kernel);
+        }
+    }
+    Err(std::io::Error::other("no kernel modules dir"))
 }
 
 /// Human-friendly age from whole seconds: `5s`, `3m`, `2h`.

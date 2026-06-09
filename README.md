@@ -61,8 +61,16 @@ cargo build --release
 codesign --entitlements amber.entitlements -s - target/release/amber
 ```
 
-A guest kernel + busybox + modules are expected under `assets/` for now (borrowed
-Alpine `virt` artifacts; a bundled kernel is future work).
+The guest kernel, busybox/musl, and kernel modules are borrowed Alpine `virt`
+artifacts (not redistributed here). Fetch and assemble them into `assets/`:
+
+```sh
+brew install squashfs        # one-time: to unpack the kernel modules (modloop)
+./scripts/fetch-assets.sh    # downloads the Alpine virt kernel + modules + busybox
+```
+
+(Override the release with `ALPINE_VER=3.22.1`. A bundled, trimmed kernel is future
+work.)
 
 The software GIC is the default. To build the in-kernel-vGIC-only variant (no
 software GIC): `cargo build --release --no-default-features`.
