@@ -1018,8 +1018,13 @@ present, which only happens when `AMBER_NET` is set), it brings the link up, ass
 the static `10.0.0.2/24`, sets the default route via `10.0.0.1`, and writes
 `nameserver 10.0.0.1` into the chroot's `resolv.conf` — addresses matched to the
 backend. So `AMBER_NET=smoltcp amber run alpine:3 -- wget http://example.com`
-returns the page with no manual `ip`/`resolv.conf` in the workload. (Networking
-stays opt-in: no `AMBER_NET`, no device, init skips the block.)
+returns the page with no manual `ip`/`resolv.conf` in the workload.
+
+**On by default.** Networking is now the default (like the software GIC): a plain
+`amber run alpine:3 -- wget http://example.com` reaches the internet with no
+`AMBER_NET` at all, matching the container-like expectation that a sandbox has a
+network. `AMBER_NET=none` opts out (no device, init skips the config block),
+`AMBER_NET=capture` is the bring-up logger, any other value names a backend.
 
 **Networking through the warm pool (exec/fork).** Until now net only worked on the
 boot path; a forked or `exec`'d sandbox had none, which is exactly where agent

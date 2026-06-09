@@ -443,10 +443,13 @@ fn cmd_vm(args: &[String]) -> ExitCode {
     // Network backend (the host-side seam). For now AMBER_NET=capture wires the
     // bring-up backend that logs transmitted frames; smoltcp/gvproxy/vmnet/tap
     // slot in here. Default: no network device.
+    // Networking is on by default (the software netstack); AMBER_NET=none opts out,
+    // AMBER_NET=capture is the bring-up logger, any other value names a backend.
     let net: Option<Box<dyn amber_core::NetBackend>> = match std::env::var("AMBER_NET").as_deref() {
+        Ok("none") | Ok("off") => None,
         Ok("capture") => Some(Box::new(amber_core::CaptureBackend)),
         Ok(kind) => amber_net::backend(kind),
-        _ => None,
+        Err(_) => amber_net::backend("smoltcp"),
     };
 
     let t_prep_start = std::time::Instant::now();
