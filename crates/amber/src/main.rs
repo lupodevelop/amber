@@ -682,7 +682,8 @@ mod guest {
 fn build_bootstrap(config: &amber_image::ImageConfig, argv: &[String]) -> std::io::Result<Vec<u8>> {
     let busybox = std::fs::read(guest::BUSYBOX)?;
     let musl = std::fs::read(guest::MUSL)?;
-    let kernel_mods = first_module_dir()?;
+    // None => a built-in-everything kernel (resin): no modules to insmod.
+    let kernel_mods = first_module_dir();
 
     let mut init = String::new();
     init.push_str("#!/bin/busybox sh\n");
@@ -691,9 +692,11 @@ fn build_bootstrap(config: &amber_image::ImageConfig, argv: &[String]) -> std::i
     init.push_str("mount -t proc proc /proc\n");
     init.push_str("mount -t sysfs sysfs /sys\n");
     init.push_str("mount -t devtmpfs dev /dev\n");
-    for m in guest::MODULES {
-        let name = Path::new(m).file_name().unwrap().to_str().unwrap();
-        init.push_str(&format!("insmod /mod/{name}\n"));
+    if kernel_mods.is_some() {
+        for m in guest::MODULES {
+            let name = Path::new(m).file_name().unwrap().to_str().unwrap();
+            init.push_str(&format!("insmod /mod/{name}\n"));
+        }
     }
     init.push_str("mkdir -p /base /scratch /newroot\n");
     init.push_str("mount -t squashfs -o ro /dev/vda /base\n");
@@ -733,16 +736,19 @@ fn build_bootstrap(config: &amber_image::ImageConfig, argv: &[String]) -> std::i
     init.push_str("poweroff -f\n");
 
     let mut cpio = amber_image::Cpio::new();
-    for d in ["bin", "lib", "mod", "dev", "proc", "sys"] {
+    for d in ["bin", "lib", "dev", "proc", "sys"] {
         cpio.dir(d, 0o755);
     }
     cpio.file("bin/busybox", &busybox, 0o755);
     cpio.file("lib/ld-musl-aarch64.so.1", &musl, 0o755);
     cpio.symlink("lib/libc.musl-aarch64.so.1", "ld-musl-aarch64.so.1");
-    for m in guest::MODULES {
-        let name = Path::new(m).file_name().unwrap().to_str().unwrap();
-        let data = std::fs::read(kernel_mods.join(m))?;
-        cpio.file(&format!("mod/{name}"), &data, 0o644);
+    if let Some(kernel_mods) = &kernel_mods {
+        cpio.dir("mod", 0o755);
+        for m in guest::MODULES {
+            let name = Path::new(m).file_name().unwrap().to_str().unwrap();
+            let data = std::fs::read(kernel_mods.join(m))?;
+            cpio.file(&format!("mod/{name}"), &data, 0o644);
+        }
     }
     cpio.file("init", init.as_bytes(), 0o755);
     cpio.char_dev("dev/console", 0o600, 5, 1);
@@ -750,18 +756,21 @@ fn build_bootstrap(config: &amber_image::ImageConfig, argv: &[String]) -> std::i
     cpio.finish_gz()
 }
 
-/// `<MODULES_ROOT>/<version>/kernel` for the first kernel version present.
-fn first_module_dir() -> std::io::Result<std::path::PathBuf> {
+/// `<MODULES_ROOT>/<version>/kernel` for the first kernel version present, or
+/// `None` when no modules ship — a built-in-everything kernel (resin) needs none,
+/// so the bootstrap skips insmod entirely. This is what lets one amber binary boot
+/// either the modular Alpine kernel or a trimmed built-in one, chosen by `assets/`.
+fn first_module_dir() -> Option<std::path::PathBuf> {
     // The modules root holds a versioned dir (e.g. `6.12.81-0-virt`) and may also
     // hold a sibling `firmware` dir, so pick the entry that actually has a `kernel`
     // module tree rather than the first one read_dir happens to return.
-    for e in std::fs::read_dir(guest::MODULES_ROOT)? {
-        let kernel = e?.path().join("kernel");
+    for e in std::fs::read_dir(guest::MODULES_ROOT).ok()?.flatten() {
+        let kernel = e.path().join("kernel");
         if kernel.is_dir() {
-            return Ok(kernel);
+            return Some(kernel);
         }
     }
-    Err(std::io::Error::other("no kernel modules dir"))
+    None
 }
 
 /// Human-friendly age from whole seconds: `5s`, `3m`, `2h`.
