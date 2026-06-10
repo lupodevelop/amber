@@ -1,0 +1,22 @@
+name: ci
+
+# Build, lint, and run the cross-platform unit tests. The runner is macOS because
+# the HVF backend (amber-hvf) links Hypervisor.framework and only compiles there;
+# the unit tests themselves drive no vcpu, so no entitlement or nested virt is
+# needed. The end-to-end pipeline (boot/snapshot/fork/exec) is covered by
+# scripts/integration-test.sh, which needs real HVF + assets and runs locally.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup component add clippy
+      - name: clippy (warnings are errors)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: unit tests
+        run: cargo test --workspace

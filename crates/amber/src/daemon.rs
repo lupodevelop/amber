@@ -211,7 +211,7 @@ fn attach_control(cmd: &mut Command) -> io::Result<(UnixStream, UnixStream)> {
 /// registered. The caller decides whether to pool the id or release it now.
 fn spawn_paused(reg: &Registry, counter: &AtomicU64, pool: &Pool, template: &str) -> io::Result<String> {
     let (id, kill) = reserve(reg, counter, template)
-        .map_err(|_| io::Error::new(io::ErrorKind::Other, "RAM budget exceeded"))?;
+        .map_err(|_| io::Error::other("RAM budget exceeded"))?;
 
     let dir = logs_dir();
     std::fs::create_dir_all(&dir)?;
@@ -251,7 +251,7 @@ fn spawn_paused(reg: &Registry, counter: &AtomicU64, pool: &Pool, template: &str
     if io::Read::read_exact(&mut ctl_host, &mut ready).is_err() {
         reg.lock().unwrap().remove(&id);
         let _ = child.kill();
-        return Err(io::Error::new(io::ErrorKind::Other, "worker failed to warm"));
+        return Err(io::Error::other("worker failed to warm"));
     }
     if let Some(e) = reg.lock().unwrap().get_mut(&id) {
         e.info.pid = pid;

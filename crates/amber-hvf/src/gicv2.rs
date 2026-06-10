@@ -133,7 +133,7 @@ impl GicV2 {
             if p >= self.pmr || p >= cap {
                 continue;
             }
-            if best.map_or(true, |(_, bp)| p < bp) {
+            if best.is_none_or(|(_, bp)| p < bp) {
                 best = Some((i as u32, p));
             }
         }
@@ -293,7 +293,7 @@ impl GicV2 {
                 let base = base_index_cfg(o);
                 for b in 0..16 {
                     let i = base + b;
-                    if i >= 16 && i < NUM_INTID {
+                    if (16..NUM_INTID).contains(&i) {
                         // bit[1] of each 2-bit field selects edge; PPIs (16–31)
                         // are kept as the guest configures.
                         self.edge[i] = (v >> (b * 2 + 1)) & 1 != 0;

@@ -304,9 +304,9 @@ impl HvfVcpu {
         let Some(gic) = self.swgic.clone() else { return Ok(false) };
         use amber_core::layout::{GIC_CPU_BASE, GIC_CPU_SIZE, GIC_DIST_BASE, GIC_DIST_SIZE};
         let ipa = access.ipa;
-        let (off, is_cpu) = if ipa >= GIC_DIST_BASE && ipa < GIC_DIST_BASE + GIC_DIST_SIZE {
+        let (off, is_cpu) = if (GIC_DIST_BASE..GIC_DIST_BASE + GIC_DIST_SIZE).contains(&ipa) {
             (ipa - GIC_DIST_BASE, false)
-        } else if ipa >= GIC_CPU_BASE && ipa < GIC_CPU_BASE + GIC_CPU_SIZE {
+        } else if (GIC_CPU_BASE..GIC_CPU_BASE + GIC_CPU_SIZE).contains(&ipa) {
             (ipa - GIC_CPU_BASE, true)
         } else {
             return Ok(false);

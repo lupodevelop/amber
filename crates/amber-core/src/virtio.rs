@@ -674,10 +674,13 @@ mod tests {
         std::env::temp_dir().join(format!("amber-test-{}-{}", std::process::id(), name))
     }
 
+    /// (addr, len, writable) of each buffer in one serviced chain.
+    type Chain = Vec<(u64, u32, bool)>;
+
     /// A device that records every chain it is handed and reports a fixed length.
     #[derive(Default)]
     struct RecState {
-        calls: Vec<(usize, Vec<(u64, u32, bool)>)>,
+        calls: Vec<(usize, Chain)>,
     }
     struct Rec {
         id: u32,

@@ -5,7 +5,7 @@
 BIN := target/release/amber
 ENTITLEMENTS := amber.entitlements
 
-.PHONY: build sign release test clean
+.PHONY: build sign release test test-int lint clean
 
 # Default: build the release binary and codesign it (software GIC + net on).
 build:
@@ -20,9 +20,17 @@ sign:
 # Alias.
 release: build
 
-# Unit tests (no codesign needed).
+# Unit tests (cross-platform, no codesign needed).
 test:
 	cargo test
+
+# Clippy with warnings as errors (what CI gates on).
+lint:
+	cargo clippy --workspace --all-targets -- -D warnings
+
+# End-to-end smoke test of the real pipeline (needs HVF + assets). Builds first.
+test-int: build
+	./scripts/integration-test.sh
 
 clean:
 	cargo clean
