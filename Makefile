@@ -5,7 +5,7 @@
 BIN := target/release/amber
 ENTITLEMENTS := amber.entitlements
 
-.PHONY: build sign release test test-int lint clean
+.PHONY: build sign release test test-int lint kernel clean
 
 # Default: build the release binary and codesign it (software GIC + net on).
 build:
@@ -31,6 +31,11 @@ lint:
 # End-to-end smoke test of the real pipeline (needs HVF + assets). Builds first.
 test-int: build
 	./scripts/integration-test.sh
+
+# Build the resin guest kernel (trimmed, built-in-everything arm64) into
+# assets/Image via Docker. Fetches the Alpine virt config base on first run.
+kernel:
+	./scripts/build-kernel.sh
 
 clean:
 	cargo clean

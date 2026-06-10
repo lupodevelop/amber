@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
 # Build "resin" — amber's trimmed, built-in-everything arm64 guest kernel.
 #
-# Everything amber drives (virtio-mmio/blk/net/balloon/rng, PL011, GICv2, arch
-# timer) and every filesystem its rootfs uses (squashfs, overlay, tmpfs) is
-# compiled in, so amber boots resin with an empty modules dir and skips insmod.
+# Self-contained: upstream kernel source (kernel.org) + amber's own committed
+# kernel/resin_defconfig. No distro dependency at build time — resin is shipped
+# ready. Everything amber drives (virtio-mmio/blk/net/balloon/rng, PL011, GICv2,
+# arch timer) and every filesystem its rootfs uses (squashfs, overlay, tmpfs) is
+# built in, so amber boots resin with no modules dir and skips insmod.
 #
 # Built natively inside an arm64 Linux container — Docker on Apple Silicon runs
 # arm64 images natively, so there is no cross toolchain to manage. The kernel
-# source is upstream (GPL); this repo ships only the config fragment + this script.
+# source is upstream GPL; this repo ships the defconfig + this script.
 #
-# Output: assets/Image (override OUT=). Kernel version: KVER= (default below).
+# Output: assets/Image (override OUT=). Kernel version: KVER= (must match the
+# version resin_defconfig was generated against).
 set -euo pipefail
 
 KVER="${KVER:-6.12.93}"
@@ -18,11 +21,11 @@ OUT="${OUT:-assets/Image}"
 JOBS="${JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
-[ -f "$ROOT/kernel/resin.config" ] || { echo "missing kernel/resin.config"; exit 1; }
+[ -f "$ROOT/kernel/resin_defconfig" ] || { echo "missing kernel/resin_defconfig"; exit 1; }
 command -v docker >/dev/null || { echo "docker not found"; exit 1; }
 
-# Cache the kernel source tarball on the host so re-runs (config iteration) skip
-# the ~140 MiB download and go straight to compile.
+# Cache the kernel source tarball on the host so re-runs skip the ~140 MiB
+# download and go straight to compile.
 CACHE="$ROOT/kernel/.cache"
 mkdir -p "$CACHE"
 
@@ -47,35 +50,14 @@ docker run --rm -v "$ROOT:/work" -v "$CACHE:/cache" -w /work debian:bookworm bas
   tar -xf "$tarball"
   cd "linux-'"$KVER"'"
 
-  # Base config: Alpine'\''s linux-virt (a proven virt-guest config) if present,
-  # else the generic arm64 defconfig.
-  if [ -f /work/kernel/alpine-virt.config ]; then
-    echo "--> base: Alpine linux-virt config (subtract modules) + resin overlay"
-    cp /work/kernel/alpine-virt.config .config
-    # Subtraction: with modules off, olddefconfig would promote every Alpine =m to
-    # built-in (=y) and balloon the image. Pre-disable all of them; the overlay
-    # below pins back the few amber needs. Keeps resin == Alpine base + those.
-    grep "=m$" .config | sed "s/=m$//" | while read -r sym; do
-      case "$sym" in
-        CONFIG_VIRTIO|CONFIG_VIRTIO_MMIO|CONFIG_VIRTIO_BLK|CONFIG_VIRTIO_NET|\
-CONFIG_VIRTIO_BALLOON|CONFIG_HW_RANDOM_VIRTIO|CONFIG_NET_FAILOVER|CONFIG_FAILOVER|\
-CONFIG_SQUASHFS|CONFIG_OVERLAY_FS) echo "$sym=y" ;;
-        *) echo "# $sym is not set" ;;
-      esac
-    done > resin-subtract.config
-  else
-    echo "--> base: arm64 defconfig + resin overlay"
-    make ARCH=arm64 defconfig >/dev/null
-    : > resin-subtract.config
-  fi
-  ./scripts/kconfig/merge_config.sh -m -O . .config resin-subtract.config /work/kernel/resin.config >/dev/null
+  echo "--> resin_defconfig"
+  cp /work/kernel/resin_defconfig .config
   make ARCH=arm64 olddefconfig >/dev/null
 
   echo "--> compile Image"
   make ARCH=arm64 -j'"$JOBS"' Image >/dev/null
   cp arch/arm64/boot/Image "/work/'"$OUT"'"
-  # Also surface vmlinux + System.map (symbols) for debugging a boot hang: map a
-  # runtime PC to its function. Kept next to the Image, both gitignored.
+  # vmlinux + System.map (symbols) for debugging a boot hang. Both gitignored.
   cp vmlinux /work/kernel/vmlinux 2>/dev/null || true
   cp System.map /work/kernel/System.map 2>/dev/null || true
   ls -lh arch/arm64/boot/Image
