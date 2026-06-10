@@ -127,6 +127,13 @@ impl GuestRam {
         (off.checked_add(n)? <= self.len).then_some(off)
     }
 
+    /// Whether `[gpa, gpa+n)` lies entirely within guest RAM. Device emulation uses
+    /// it to discard a hostile guest's out-of-range descriptor before trusting its
+    /// length for an allocation.
+    pub fn in_range(&self, gpa: u64, n: usize) -> bool {
+        self.offset(gpa, n).is_some()
+    }
+
     /// Host pointer for a guest-physical range, if it lies within RAM. Used by
     /// the balloon to `madvise` guest-reported free pages.
     pub fn host_ptr_at(&self, gpa: u64, len: usize) -> Option<*mut u8> {
@@ -186,5 +193,84 @@ impl Drop for GuestMemory {
         unsafe {
             libc::munmap(self.host.as_ptr() as *mut libc::c_void, self.len);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BASE: u64 = 0x4000_0000;
+
+    fn mem(len: usize) -> GuestMemory {
+        GuestMemory::new(BASE, len).unwrap()
+    }
+
+    #[test]
+    fn write_then_read_roundtrips() {
+        let m = mem(0x1000);
+        let r = m.ram();
+        assert!(r.write(BASE + 8, &[1, 2, 3, 4]));
+        let mut b = [0u8; 4];
+        assert!(r.read(BASE + 8, &mut b));
+        assert_eq!(b, [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn typed_accessors_are_little_endian() {
+        let m = mem(0x1000);
+        let r = m.ram();
+        r.write_u32(BASE + 16, 0x0403_0201);
+        assert_eq!(r.read_u32(BASE + 16), 0x0403_0201);
+        let mut b = [0u8; 4];
+        r.read(BASE + 16, &mut b);
+        assert_eq!(b, [1, 2, 3, 4]);
+        r.write_u16(BASE + 32, 0xbeef);
+        assert_eq!(r.read_u16(BASE + 32), 0xbeef);
+    }
+
+    #[test]
+    fn reads_below_base_are_rejected() {
+        let m = mem(0x1000);
+        let r = m.ram();
+        let mut b = [9u8; 4];
+        assert!(!r.read(BASE - 1, &mut b));
+        // A rejected typed read returns zero, never reads host memory.
+        assert_eq!(r.read_u32(0), 0);
+        assert_eq!(r.read_u64(BASE - 8), 0);
+    }
+
+    #[test]
+    fn accesses_past_the_end_are_rejected() {
+        let m = mem(0x1000);
+        let r = m.ram();
+        let mut b = [0u8; 16];
+        // Starts in range but runs off the end.
+        assert!(!r.read(BASE + 0x1000 - 8, &mut b));
+        assert!(!r.write(BASE + 0x1000 - 8, &b));
+        // Exactly the last byte is fine.
+        assert!(r.write(BASE + 0x1000 - 1, &[7]));
+        assert!(r.in_range(BASE + 0x1000 - 1, 1));
+        assert!(!r.in_range(BASE + 0x1000 - 1, 2));
+        assert!(!r.in_range(BASE + 0x1000, 1));
+    }
+
+    #[test]
+    fn address_arithmetic_does_not_overflow() {
+        let m = mem(0x1000);
+        let r = m.ram();
+        // gpa + len would overflow u64; must be rejected, not panic.
+        assert!(!r.in_range(u64::MAX, 16));
+        assert!(!r.read(u64::MAX - 2, &mut [0u8; 8]));
+        assert_eq!(r.read_u64(u64::MAX), 0);
+    }
+
+    #[test]
+    fn host_ptr_at_only_inside_range() {
+        let m = mem(0x1000);
+        let r = m.ram();
+        assert!(r.host_ptr_at(BASE, 0x1000).is_some());
+        assert!(r.host_ptr_at(BASE, 0x1001).is_none());
+        assert!(r.host_ptr_at(BASE - 1, 1).is_none());
     }
 }

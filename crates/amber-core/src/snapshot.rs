@@ -139,3 +139,90 @@ pub fn load_mem(dir: &Path, mem: &GuestMemory) -> Result<()> {
     let bytes = std::fs::read(dir.join("mem.bin")).map_err(snap_err)?;
     mem.write(mem.base(), &bytes)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmpdir(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("amber-snap-{}-{}", std::process::id(), name));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn meta_defaults_missing_fields() {
+        // A pre-gic_kind/pre-net snapshot only had base+size.
+        let m: Meta = serde_json::from_str(r#"{"mem_base":1024,"mem_size":2048}"#).unwrap();
+        assert_eq!(m.mem_base, 1024);
+        assert_eq!(m.mem_size, 2048);
+        assert_eq!(m.gic_kind, None);
+        assert!(!m.net);
+        assert_eq!(m.disk, None);
+    }
+
+    #[test]
+    fn meta_roundtrips() {
+        let m = Meta {
+            mem_base: 0x4000_0000,
+            mem_size: 256 << 20,
+            disk: Some("/tmp/base.img".into()),
+            gic_kind: Some("v2".into()),
+            net: true,
+        };
+        let back: Meta = serde_json::from_slice(&serde_json::to_vec(&m).unwrap()).unwrap();
+        assert_eq!(back.mem_base, m.mem_base);
+        assert_eq!(back.gic_kind.as_deref(), Some("v2"));
+        assert!(back.net);
+    }
+
+    #[test]
+    fn devstate_roundtrips() {
+        let d = DevState {
+            pl011: vec![1, 2, 3, 4, 5, 6],
+            virtio: vec![VirtioDevState {
+                status: 0xb,
+                interrupt_status: 1,
+                queues: vec![[8, 1, 0x1000, 0x2000, 0x3000, 5]],
+            }],
+        };
+        let back: DevState = serde_json::from_slice(&serde_json::to_vec(&d).unwrap()).unwrap();
+        assert_eq!(back.pl011, d.pl011);
+        assert_eq!(back.virtio.len(), 1);
+        assert_eq!(back.virtio[0].queues[0], [8, 1, 0x1000, 0x2000, 0x3000, 5]);
+    }
+
+    #[test]
+    fn read_defaults_devstate_when_absent() {
+        let dir = tmpdir("nodev");
+        std::fs::write(dir.join("meta.json"), br#"{"mem_base":0,"mem_size":0}"#).unwrap();
+        std::fs::write(dir.join("cpu.json"), serde_json::to_vec(&CpuSnapshot::default()).unwrap()).unwrap();
+        std::fs::write(dir.join("gic.bin"), b"").unwrap();
+        // no dev.json
+        let loaded = read(&dir).unwrap();
+        assert!(loaded.dev.pl011.is_empty());
+        assert!(loaded.dev.virtio.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_mem_rejects_image_larger_than_ram() {
+        let dir = tmpdir("big");
+        std::fs::write(dir.join("mem.bin"), vec![0u8; 0x2000]).unwrap();
+        let mem = GuestMemory::new(0x4000_0000, 0x1000).unwrap(); // RAM smaller than image
+        assert!(load_mem(&dir, &mem).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_mem_loads_fitting_image() {
+        let dir = tmpdir("fit");
+        let mut img = vec![0u8; 0x1000];
+        img[0..4].copy_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+        std::fs::write(dir.join("mem.bin"), &img).unwrap();
+        let mem = GuestMemory::new(0x4000_0000, 0x1000).unwrap();
+        load_mem(&dir, &mem).unwrap();
+        assert_eq!(mem.ram().read_u32(0x4000_0000), 0xefbe_adde);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

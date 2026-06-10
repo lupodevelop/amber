@@ -55,7 +55,17 @@ const FEATURE_VERSION_1_WORD: u32 = 1;
 const VIRTQ_DESC_F_NEXT: u16 = 1;
 const VIRTQ_DESC_F_WRITE: u16 = 2;
 
+/// Largest single descriptor buffer the transport will hand a device. The guest
+/// chooses descriptor lengths; no legitimate blk/net/rng/balloon buffer comes near
+/// this, so it is purely a ceiling on a hostile guest's per-buffer allocation.
+const MAX_DESC_LEN: u32 = 16 << 20; // 16 MiB
+
 /// One descriptor's buffer, as gathered from a chain.
+///
+/// Invariant established by [`collect_chain`]: `[addr, addr+len)` lies entirely
+/// within guest RAM and `len <= MAX_DESC_LEN`. A device may size an allocation
+/// from `len` without fear of an out-of-range or astronomically large value. (The
+/// underlying `GuestRam::read`/`write` still bounds-check every access regardless.)
 pub struct Buf {
     pub addr: u64,
     pub len: u32,
@@ -151,7 +161,7 @@ impl VirtioMmio {
         self.status = s.status;
         self.interrupt_status = s.interrupt_status;
         for (q, v) in self.queues.iter_mut().zip(&s.queues) {
-            q.num = v[0] as u32;
+            q.num = (v[0] as u32).min(QUEUE_MAX);
             q.ready = v[1] as u32;
             q.desc = v[2];
             q.avail = v[3];
@@ -223,7 +233,9 @@ impl VirtioMmio {
             DEVICE_FEATURES_SEL => self.device_features_sel = v,
             DRIVER_FEATURES | DRIVER_FEATURES_SEL => {}
             QUEUE_SEL => self.queue_sel = v as usize,
-            QUEUE_NUM => self.with_queue(sel, |q| q.num = v),
+            // The driver must not pick a ring larger than we advertise; clamp so the
+            // ring-index math (`% num`) and the per-notify work stay bounded.
+            QUEUE_NUM => self.with_queue(sel, |q| q.num = v.min(QUEUE_MAX)),
             QUEUE_READY => self.with_queue(sel, |q| q.ready = v),
             QUEUE_NOTIFY => self.process(v as usize),
             INTERRUPT_ACK => {
@@ -304,16 +316,20 @@ impl VirtioMmio {
             return;
         }
         let qsz = q.num as u16;
-        let avail_idx = ram.read_u16(q.avail + 2);
+        let avail_idx = ram.read_u16(q.avail.wrapping_add(2));
 
         let mut progressed = false;
-        while q.last_avail != avail_idx {
+        // A ready queue can have at most `qsz` buffers outstanding; bound the work
+        // per notify by that, so a hostile available index can't spin the vcpu.
+        let mut budget = qsz;
+        while q.last_avail != avail_idx && budget > 0 {
             let slot = q.last_avail % qsz;
-            let head = ram.read_u16(q.avail + 4 + 2 * slot as u64);
+            let head = ram.read_u16(q.avail.wrapping_add(4 + 2 * slot as u64));
             let bufs = collect_chain(&ram, q.desc, head, qsz);
             let written = self.dev.handle(qidx, &ram, &bufs);
             push_used(&ram, q.used, head as u32, written, qsz);
             q.last_avail = q.last_avail.wrapping_add(1);
+            budget -= 1;
             progressed = true;
         }
         self.queues[qidx].last_avail = q.last_avail;
@@ -323,21 +339,32 @@ impl VirtioMmio {
     }
 }
 
+/// Walk a descriptor chain into its buffers. Every value here is guest-controlled,
+/// so each step is bounded: a descriptor index must point inside the declared table
+/// (`i < qsz`), a chain visits at most `qsz` descriptors (so a `next` cycle can't
+/// loop forever), each buffer is clamped to `MAX_DESC_LEN`, and a buffer not wholly
+/// inside guest RAM is downgraded to zero length (the device then skips it). All
+/// address arithmetic wraps rather than panicking on a crafted base.
 fn collect_chain(ram: &GuestRam, desc: u64, head: u16, qsz: u16) -> Vec<Buf> {
     let mut bufs = Vec::new();
     let mut i = head;
-    loop {
-        let d = desc + 16 * i as u64;
+    for _ in 0..qsz {
+        if i >= qsz {
+            break; // index outside the descriptor table: malformed chain.
+        }
+        let d = desc.wrapping_add(16 * i as u64);
         let addr = ram.read_u64(d);
-        let len = ram.read_u32(d + 8);
-        let flags = ram.read_u16(d + 12);
-        let next = ram.read_u16(d + 14);
+        let len = ram.read_u32(d.wrapping_add(8)).min(MAX_DESC_LEN);
+        let flags = ram.read_u16(d.wrapping_add(12));
+        let next = ram.read_u16(d.wrapping_add(14));
+        // Trust the length only for a buffer fully inside guest RAM.
+        let len = if ram.in_range(addr, len as usize) { len } else { 0 };
         bufs.push(Buf {
             addr,
             len,
             writable: flags & VIRTQ_DESC_F_WRITE != 0,
         });
-        if flags & VIRTQ_DESC_F_NEXT == 0 || bufs.len() > qsz as usize {
+        if flags & VIRTQ_DESC_F_NEXT == 0 {
             break;
         }
         i = next;
@@ -346,11 +373,14 @@ fn collect_chain(ram: &GuestRam, desc: u64, head: u16, qsz: u16) -> Vec<Buf> {
 }
 
 fn push_used(ram: &GuestRam, used: u64, id: u32, len: u32, qsz: u16) {
-    let idx = ram.read_u16(used + 2);
-    let elem = used + 4 + 8 * (idx % qsz) as u64;
+    if qsz == 0 {
+        return;
+    }
+    let idx = ram.read_u16(used.wrapping_add(2));
+    let elem = used.wrapping_add(4 + 8 * (idx % qsz) as u64);
     ram.write_u32(elem, id);
-    ram.write_u32(elem + 4, len);
-    ram.write_u16(used + 2, idx.wrapping_add(1));
+    ram.write_u32(elem.wrapping_add(4), len);
+    ram.write_u16(used.wrapping_add(2), idx.wrapping_add(1));
 }
 
 /// Write one host->guest payload into the next posted buffer of a receive queue
@@ -361,12 +391,12 @@ fn inject_one(ram: &GuestRam, q: &mut Queue, data: &[u8]) -> bool {
         return false;
     }
     let qsz = q.num as u16;
-    let avail_idx = ram.read_u16(q.avail + 2);
+    let avail_idx = ram.read_u16(q.avail.wrapping_add(2));
     if q.last_avail == avail_idx {
         return false; // no buffer posted by the guest
     }
     let slot = q.last_avail % qsz;
-    let head = ram.read_u16(q.avail + 4 + 2 * slot as u64);
+    let head = ram.read_u16(q.avail.wrapping_add(4 + 2 * slot as u64));
     let bufs = collect_chain(ram, q.desc, head, qsz);
     let mut off = 0usize;
     for b in bufs.iter().filter(|b| b.writable) {
@@ -584,8 +614,8 @@ impl VirtioDevice for BalloonDevice {
                 for b in bufs {
                     let n = b.len / 4;
                     for i in 0..n as u64 {
-                        let pfn = ram.read_u32(b.addr + 4 * i) as u64;
-                        Self::madvise(ram, pfn * Self::BALLOON_PAGE, Self::BALLOON_PAGE as usize);
+                        let pfn = ram.read_u32(b.addr.wrapping_add(4 * i)) as u64;
+                        Self::madvise(ram, pfn.wrapping_mul(Self::BALLOON_PAGE), Self::BALLOON_PAGE as usize);
                     }
                 }
             }
@@ -600,5 +630,405 @@ impl VirtioDevice for BalloonDevice {
             _ => {}
         }
         0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::GuestMemory;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    use std::sync::Arc;
+
+    const BASE: u64 = 0x4000_0000;
+    const RAMSZ: usize = 0x4_0000; // 256 KiB
+    const DESC: u64 = BASE + 0x1000;
+    const AVAIL: u64 = BASE + 0x2000;
+    const USED: u64 = BASE + 0x3000;
+    const DATA: u64 = BASE + 0x4000;
+
+    fn ram() -> GuestMemory {
+        GuestMemory::new(BASE, RAMSZ).unwrap()
+    }
+    fn put_desc(r: &GuestRam, i: u16, addr: u64, len: u32, flags: u16, next: u16) {
+        let d = DESC + 16 * i as u64;
+        r.write(d, &addr.to_le_bytes());
+        r.write_u32(d + 8, len);
+        r.write_u16(d + 12, flags);
+        r.write_u16(d + 14, next);
+    }
+    fn avail_set(r: &GuestRam, slot: u16, head: u16, idx: u16) {
+        r.write_u16(AVAIL + 4 + 2 * slot as u64, head);
+        r.write_u16(AVAIL + 2, idx);
+    }
+    fn used_idx(r: &GuestRam) -> u16 {
+        r.read_u16(USED + 2)
+    }
+    fn used_elem(r: &GuestRam, slot: u16) -> (u32, u32) {
+        let e = USED + 4 + 8 * slot as u64;
+        (r.read_u32(e), r.read_u32(e + 4))
+    }
+    fn tmp(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("amber-test-{}-{}", std::process::id(), name))
+    }
+
+    /// A device that records every chain it is handed and reports a fixed length.
+    #[derive(Default)]
+    struct RecState {
+        calls: Vec<(usize, Vec<(u64, u32, bool)>)>,
+    }
+    struct Rec {
+        id: u32,
+        nq: usize,
+        st: Rc<RefCell<RecState>>,
+        written: u32,
+    }
+    fn rec(id: u32, nq: usize, written: u32) -> (Box<Rec>, Rc<RefCell<RecState>>) {
+        let st = Rc::new(RefCell::new(RecState::default()));
+        (Box::new(Rec { id, nq, st: st.clone(), written }), st)
+    }
+    impl VirtioDevice for Rec {
+        fn device_id(&self) -> u32 {
+            self.id
+        }
+        fn num_queues(&self) -> usize {
+            self.nq
+        }
+        fn handle(&mut self, queue: usize, _ram: &GuestRam, bufs: &[Buf]) -> u32 {
+            let row = bufs.iter().map(|b| (b.addr, b.len, b.writable)).collect();
+            self.st.borrow_mut().calls.push((queue, row));
+            self.written
+        }
+    }
+
+    fn setup_queue(m: &mut VirtioMmio, sel: u32, num: u32) {
+        m.write(QUEUE_SEL, 4, sel as u64);
+        m.write(QUEUE_NUM, 4, num as u64);
+        m.write(QUEUE_DESC_LOW, 4, DESC & 0xffff_ffff);
+        m.write(QUEUE_DESC_HIGH, 4, DESC >> 32);
+        m.write(QUEUE_DRIVER_LOW, 4, AVAIL & 0xffff_ffff);
+        m.write(QUEUE_DRIVER_HIGH, 4, AVAIL >> 32);
+        m.write(QUEUE_DEVICE_LOW, 4, USED & 0xffff_ffff);
+        m.write(QUEUE_DEVICE_HIGH, 4, USED >> 32);
+        m.write(QUEUE_READY, 4, 1);
+    }
+
+    // ---- collect_chain: every input is guest-controlled ----
+
+    #[test]
+    fn chain_single_descriptor() {
+        let m = ram();
+        let r = m.ram();
+        put_desc(&r, 0, DATA, 100, 0, 0);
+        let bufs = collect_chain(&r, DESC, 0, 8);
+        assert_eq!(bufs.len(), 1);
+        assert_eq!((bufs[0].addr, bufs[0].len, bufs[0].writable), (DATA, 100, false));
+    }
+
+    #[test]
+    fn chain_follows_next_and_write_flag() {
+        let m = ram();
+        let r = m.ram();
+        put_desc(&r, 0, DATA, 10, VIRTQ_DESC_F_NEXT, 3);
+        put_desc(&r, 3, DATA + 10, 20, VIRTQ_DESC_F_WRITE, 0);
+        let bufs = collect_chain(&r, DESC, 0, 8);
+        assert_eq!(bufs.len(), 2);
+        assert_eq!((bufs[1].addr, bufs[1].len, bufs[1].writable), (DATA + 10, 20, true));
+    }
+
+    #[test]
+    fn chain_head_outside_table_is_empty() {
+        let m = ram();
+        let r = m.ram();
+        assert!(collect_chain(&r, DESC, 8, 8).is_empty()); // head == qsz
+        assert!(collect_chain(&r, DESC, 9, 8).is_empty()); // head > qsz
+    }
+
+    #[test]
+    fn chain_next_outside_table_stops() {
+        let m = ram();
+        let r = m.ram();
+        put_desc(&r, 0, DATA, 10, VIRTQ_DESC_F_NEXT, 50);
+        assert_eq!(collect_chain(&r, DESC, 0, 8).len(), 1);
+    }
+
+    #[test]
+    fn chain_cycle_is_bounded_by_queue_size() {
+        let m = ram();
+        let r = m.ram();
+        put_desc(&r, 0, DATA, 1, VIRTQ_DESC_F_NEXT, 1);
+        put_desc(&r, 1, DATA, 1, VIRTQ_DESC_F_NEXT, 0);
+        // A 0<->1 cycle never terminates on its own; the qsz cap stops it.
+        assert_eq!(collect_chain(&r, DESC, 0, 8).len(), 8);
+    }
+
+    #[test]
+    fn chain_clamps_oversized_length() {
+        let big = GuestMemory::new(BASE, 32 << 20).unwrap();
+        let r = big.ram();
+        let d = BASE; // descriptor table at base
+        r.write(d, &(BASE + 0x1_0000).to_le_bytes());
+        r.write_u32(d + 8, 30 << 20); // 30 MiB > MAX_DESC_LEN
+        r.write_u16(d + 12, 0);
+        r.write_u16(d + 14, 0);
+        let bufs = collect_chain(&r, d, 0, 8);
+        assert_eq!(bufs[0].len, MAX_DESC_LEN);
+    }
+
+    #[test]
+    fn chain_out_of_range_buffer_is_zero_length() {
+        let m = ram();
+        let r = m.ram();
+        put_desc(&r, 0, BASE + RAMSZ as u64, 16, VIRTQ_DESC_F_WRITE, 0);
+        let bufs = collect_chain(&r, DESC, 0, 8);
+        assert_eq!(bufs[0].len, 0); // address past RAM -> length downgraded
+        assert!(bufs[0].writable); // flag still preserved
+    }
+
+    #[test]
+    fn chain_wrapping_descriptor_base_does_not_panic() {
+        let m = ram();
+        let r = m.ram();
+        let bufs = collect_chain(&r, u64::MAX - 3, 0, 4);
+        assert_eq!(bufs.len(), 1);
+        assert_eq!(bufs[0].len, 0);
+    }
+
+    // ---- process: notify-driven service ----
+
+    #[test]
+    fn process_delivers_chain_and_publishes_used() {
+        let m = ram();
+        let (dev, st) = rec(99, 1, 42);
+        let mut mmio = VirtioMmio::new(dev);
+        mmio.attach(m.ram());
+        setup_queue(&mut mmio, 0, 8);
+        let r = m.ram();
+        put_desc(&r, 0, DATA, 64, VIRTQ_DESC_F_WRITE, 0);
+        avail_set(&r, 0, 0, 1);
+        mmio.write(QUEUE_NOTIFY, 4, 0);
+
+        let calls = &st.borrow().calls;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, 0);
+        assert_eq!(calls[0].1, vec![(DATA, 64, true)]);
+        assert_eq!(used_idx(&r), 1);
+        assert_eq!(used_elem(&r, 0), (0, 42)); // (head id, bytes written)
+        assert!(mmio.irq_level());
+    }
+
+    #[test]
+    fn process_work_is_bounded_by_queue_size() {
+        let m = ram();
+        let (dev, st) = rec(99, 1, 0);
+        let mut mmio = VirtioMmio::new(dev);
+        mmio.attach(m.ram());
+        setup_queue(&mut mmio, 0, 4);
+        let r = m.ram();
+        for i in 0..4u16 {
+            put_desc(&r, i, DATA, 8, 0, 0);
+        }
+        r.write_u16(AVAIL + 2, 60000); // hostile available index
+        mmio.write(QUEUE_NOTIFY, 4, 0);
+        assert_eq!(st.borrow().calls.len(), 4); // capped at qsz, not 60000
+    }
+
+    #[test]
+    fn process_ignores_unready_or_empty_queue() {
+        let m = ram();
+        let (dev, st) = rec(9, 1, 0);
+        let mut mmio = VirtioMmio::new(dev);
+        mmio.attach(m.ram());
+        setup_queue(&mut mmio, 0, 4);
+        mmio.write(QUEUE_READY, 4, 0); // not ready
+        let r = m.ram();
+        put_desc(&r, 0, DATA, 8, 0, 0);
+        avail_set(&r, 0, 0, 1);
+        mmio.write(QUEUE_NOTIFY, 4, 0);
+        assert!(st.borrow().calls.is_empty());
+    }
+
+    #[test]
+    fn queue_num_is_clamped_to_max() {
+        let (dev, _) = rec(9, 1, 0);
+        let mut mmio = VirtioMmio::new(dev);
+        mmio.write(QUEUE_SEL, 4, 0);
+        mmio.write(QUEUE_NUM, 4, 100_000);
+        assert_eq!(mmio.capture().queues[0][0], QUEUE_MAX as u64);
+    }
+
+    #[test]
+    fn reset_clears_queue_state() {
+        let (dev, _) = rec(9, 1, 0);
+        let mut mmio = VirtioMmio::new(dev);
+        setup_queue(&mut mmio, 0, 8);
+        mmio.write(STATUS, 4, 0); // status 0 -> reset
+        let q = mmio.capture().queues[0];
+        assert_eq!(q, [0, 0, 0, 0, 0, 0]);
+    }
+
+    // ---- used/inject ring mechanics ----
+
+    #[test]
+    fn push_used_wraps_ring_index() {
+        let m = ram();
+        let r = m.ram();
+        r.write_u16(USED + 2, 7); // idx 7, qsz 4 -> slot 3
+        push_used(&r, USED, 5, 99, 4);
+        assert_eq!(used_idx(&r), 8);
+        assert_eq!(used_elem(&r, 3), (5, 99));
+    }
+
+    #[test]
+    fn push_used_with_zero_queue_is_noop() {
+        let m = ram();
+        let r = m.ram();
+        push_used(&r, USED, 1, 1, 0); // must not divide by zero
+        assert_eq!(used_idx(&r), 0);
+    }
+
+    #[test]
+    fn inject_one_fills_posted_buffer() {
+        let m = ram();
+        let r = m.ram();
+        put_desc(&r, 0, DATA, 16, VIRTQ_DESC_F_WRITE, 0);
+        avail_set(&r, 0, 0, 1);
+        let mut q = Queue { num: 8, ready: 1, desc: DESC, avail: AVAIL, used: USED, last_avail: 0 };
+        assert!(inject_one(&r, &mut q, &[0xaa, 0xbb, 0xcc]));
+        let mut got = [0u8; 3];
+        r.read(DATA, &mut got);
+        assert_eq!(got, [0xaa, 0xbb, 0xcc]);
+        assert_eq!(used_elem(&r, 0), (0, 3));
+        assert_eq!(q.last_avail, 1);
+    }
+
+    #[test]
+    fn inject_one_without_posted_buffer_drops() {
+        let m = ram();
+        let r = m.ram();
+        let mut q = Queue { num: 8, ready: 1, desc: DESC, avail: AVAIL, used: USED, last_avail: 0 };
+        assert!(!inject_one(&r, &mut q, &[1, 2, 3])); // avail idx == last_avail
+    }
+
+    // ---- virtio-blk (read-only) ----
+
+    fn blk_chain(data_len: u32) -> Vec<Buf> {
+        vec![
+            Buf { addr: DATA, len: 16, writable: false },          // header
+            Buf { addr: DATA + 16, len: data_len, writable: true }, // data
+            Buf { addr: DATA + 16 + data_len as u64, len: 1, writable: true }, // status
+        ]
+    }
+
+    #[test]
+    fn blk_in_reads_from_disk_and_acks() {
+        let path = tmp("blk.img");
+        std::fs::write(&path, vec![0xABu8; 1024]).unwrap();
+        let mut blk = BlkDevice::open(&path).unwrap();
+        let m = ram();
+        let r = m.ram();
+        r.write_u32(DATA, BlkDevice::T_IN);
+        r.write(DATA + 8, &0u64.to_le_bytes()); // sector 0
+        let written = blk.handle(0, &r, &blk_chain(512));
+        assert_eq!(written, 512 + 1);
+        let mut data = [0u8; 512];
+        r.read(DATA + 16, &mut data);
+        assert!(data.iter().all(|&b| b == 0xAB));
+        assert_eq!(r.read_u32(DATA + 16 + 512) & 0xff, 0); // VIRTIO_BLK_S_OK
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn blk_reads_past_eof_as_zero() {
+        let path = tmp("blk2.img");
+        std::fs::write(&path, vec![0xABu8; 512]).unwrap();
+        let mut blk = BlkDevice::open(&path).unwrap();
+        let m = ram();
+        let r = m.ram();
+        r.write_u32(DATA, BlkDevice::T_IN);
+        r.write(DATA + 8, &9999u64.to_le_bytes()); // sector well past EOF
+        blk.handle(0, &r, &blk_chain(512));
+        let mut data = [0xffu8; 512];
+        r.read(DATA + 16, &mut data);
+        assert!(data.iter().all(|&b| b == 0));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn blk_short_chain_returns_zero() {
+        let path = tmp("blk3.img");
+        std::fs::write(&path, vec![0u8; 512]).unwrap();
+        let mut blk = BlkDevice::open(&path).unwrap();
+        let m = ram();
+        let r = m.ram();
+        let bufs = vec![Buf { addr: DATA, len: 16, writable: false }];
+        assert_eq!(blk.handle(0, &r, &bufs), 0);
+        std::fs::remove_file(&path).ok();
+    }
+
+    // ---- virtio-rng ----
+
+    #[test]
+    fn rng_fills_only_writable_buffers() {
+        let mut rng = RngDevice::open().unwrap();
+        let m = ram();
+        let r = m.ram();
+        let bufs = vec![
+            Buf { addr: DATA, len: 32, writable: true },
+            Buf { addr: DATA + 64, len: 16, writable: false }, // read-only: skipped
+        ];
+        assert_eq!(rng.handle(0, &r, &bufs), 32);
+    }
+
+    // ---- virtio-balloon ----
+
+    #[test]
+    fn balloon_inflate_and_report_are_bounded_and_safe() {
+        let bal_target = Arc::new(AtomicU64::new(0));
+        let bal_dirty = Arc::new(AtomicBool::new(false));
+        let mut bal = BalloonDevice::new(bal_target, bal_dirty);
+        let m = ram();
+        let r = m.ram();
+        r.write_u32(DATA, 5); // pfn 5
+        r.write_u32(DATA + 4, 6); // pfn 6
+        // `handle` collides with the inherent BalloonHandle accessor; call the trait.
+        let inflate = <BalloonDevice as VirtioDevice>::handle(&mut bal, BalloonDevice::INFLATE_VQ, &r, &[Buf { addr: DATA, len: 8, writable: false }]);
+        assert_eq!(inflate, 0);
+        let report = <BalloonDevice as VirtioDevice>::handle(&mut bal, BalloonDevice::REPORTING_VQ, &r, &[Buf { addr: DATA, len: 4096, writable: false }]);
+        assert_eq!(report, 0);
+    }
+
+    // ---- snapshot capture / restore ----
+
+    #[test]
+    fn capture_restore_roundtrips() {
+        let (dev, _) = rec(2, 2, 0);
+        let mut a = VirtioMmio::new(dev);
+        setup_queue(&mut a, 0, 8);
+        a.write(STATUS, 4, 0xb);
+        let snap = a.capture();
+
+        let (dev2, _) = rec(2, 2, 0);
+        let mut b = VirtioMmio::new(dev2);
+        b.restore(&snap);
+        let snap2 = b.capture();
+        assert_eq!(snap.status, snap2.status);
+        assert_eq!(snap.interrupt_status, snap2.interrupt_status);
+        assert_eq!(snap.queues, snap2.queues);
+    }
+
+    #[test]
+    fn restore_clamps_queue_num() {
+        let s = crate::snapshot::VirtioDevState {
+            status: 1,
+            interrupt_status: 0,
+            queues: vec![[100_000, 1, 0, 0, 0, 0]],
+        };
+        let (dev, _) = rec(2, 1, 0);
+        let mut b = VirtioMmio::new(dev);
+        b.restore(&s);
+        assert_eq!(b.capture().queues[0][0], QUEUE_MAX as u64);
     }
 }

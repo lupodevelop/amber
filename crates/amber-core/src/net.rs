@@ -60,6 +60,12 @@ impl NetBackend for CaptureBackend {
 /// so it is zeroed except num_buffers on receive.
 const VIRTIO_NET_HDR_LEN: usize = 12;
 
+/// Ceiling on a single transmitted frame (virtio-net header + Ethernet). We
+/// negotiate no segmentation offload, so a legitimate frame never exceeds the MTU
+/// by much; this caps how large a frame a hostile guest can make us assemble out
+/// of a long descriptor chain.
+const MAX_TX_FRAME: usize = 64 * 1024;
+
 /// virtio-net (device id 1). Queue 0 is receive (filled asynchronously as frames
 /// arrive from the backend), queue 1 is transmit.
 pub struct NetDevice {
@@ -117,7 +123,11 @@ impl VirtioDevice for NetDevice {
             // header, and hand the Ethernet frame to the backend.
             let mut frame = Vec::new();
             for b in bufs.iter().filter(|b| !b.writable) {
-                let mut d = vec![0u8; b.len as usize];
+                if frame.len() >= MAX_TX_FRAME {
+                    break;
+                }
+                let take = (b.len as usize).min(MAX_TX_FRAME - frame.len());
+                let mut d = vec![0u8; take];
                 ram.read(b.addr, &mut d);
                 frame.extend_from_slice(&d);
             }
@@ -135,5 +145,112 @@ impl VirtioDevice for NetDevice {
         out[10] = 1;
         out.extend_from_slice(&frame);
         Some(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::GuestMemory;
+    use std::sync::{Arc, Mutex};
+
+    const BASE: u64 = 0x4000_0000;
+    const DATA: u64 = BASE + 0x1000;
+
+    /// A backend that records transmitted frames and replays queued receives.
+    #[derive(Clone, Default)]
+    struct RecBackend {
+        sent: Arc<Mutex<Vec<Vec<u8>>>>,
+        inq: Arc<Mutex<Vec<Vec<u8>>>>,
+    }
+    impl NetBackend for RecBackend {
+        fn send(&mut self, frame: &[u8]) {
+            self.sent.lock().unwrap().push(frame.to_vec());
+        }
+        fn poll(&mut self) -> Option<Vec<u8>> {
+            self.inq.lock().unwrap().pop()
+        }
+    }
+
+    fn ram(len: usize) -> GuestMemory {
+        GuestMemory::new(BASE, len).unwrap()
+    }
+
+    #[test]
+    fn tx_strips_header_and_forwards_ethernet() {
+        let be = RecBackend::default();
+        let sent = be.sent.clone();
+        let mut dev = NetDevice::new(Box::new(be));
+        let m = ram(0x2000);
+        let r = m.ram();
+        let payload = [0xde, 0xad, 0xbe, 0xef, 0x00, 0x11];
+        r.write(DATA, &[0u8; VIRTIO_NET_HDR_LEN]);
+        r.write(DATA + VIRTIO_NET_HDR_LEN as u64, &payload);
+        let bufs = vec![Buf { addr: DATA, len: (VIRTIO_NET_HDR_LEN + payload.len()) as u32, writable: false }];
+        assert_eq!(dev.handle(NetDevice::TX, &r, &bufs), 0);
+        let s = sent.lock().unwrap();
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0], payload);
+    }
+
+    #[test]
+    fn tx_header_only_frame_is_dropped() {
+        let be = RecBackend::default();
+        let sent = be.sent.clone();
+        let mut dev = NetDevice::new(Box::new(be));
+        let m = ram(0x2000);
+        let r = m.ram();
+        let bufs = vec![Buf { addr: DATA, len: VIRTIO_NET_HDR_LEN as u32, writable: false }];
+        dev.handle(NetDevice::TX, &r, &bufs);
+        assert!(sent.lock().unwrap().is_empty()); // nothing past the header
+    }
+
+    #[test]
+    fn tx_frame_is_capped() {
+        let be = RecBackend::default();
+        let sent = be.sent.clone();
+        let mut dev = NetDevice::new(Box::new(be));
+        let m = ram(1 << 20);
+        let r = m.ram();
+        let bufs = vec![
+            Buf { addr: DATA, len: 60 * 1024, writable: false },
+            Buf { addr: DATA + 60 * 1024, len: 60 * 1024, writable: false },
+        ];
+        dev.handle(NetDevice::TX, &r, &bufs);
+        let s = sent.lock().unwrap();
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].len(), MAX_TX_FRAME - VIRTIO_NET_HDR_LEN);
+    }
+
+    #[test]
+    fn tx_ignores_writable_descriptors() {
+        let be = RecBackend::default();
+        let sent = be.sent.clone();
+        let mut dev = NetDevice::new(Box::new(be));
+        let m = ram(0x2000);
+        let r = m.ram();
+        // A writable buffer is part of the rx path, never gathered into a tx frame.
+        let bufs = vec![Buf { addr: DATA, len: 100, writable: true }];
+        dev.handle(NetDevice::TX, &r, &bufs);
+        assert!(sent.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn rx_prepends_header_with_num_buffers() {
+        let be = RecBackend::default();
+        be.inq.lock().unwrap().push(vec![1, 2, 3, 4]);
+        let mut dev = NetDevice::new(Box::new(be));
+        let out = dev.poll_rx().unwrap();
+        assert_eq!(out.len(), VIRTIO_NET_HDR_LEN + 4);
+        assert_eq!(out[10], 1); // num_buffers = 1
+        assert_eq!(&out[VIRTIO_NET_HDR_LEN..], &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn config_exposes_mac() {
+        let dev = NetDevice::new(Box::new(RecBackend::default()));
+        assert_eq!(dev.config(0).to_le_bytes(), [0x52, 0x54, 0x00, 0x12]);
+        let hi = dev.config(4).to_le_bytes();
+        assert_eq!([hi[0], hi[1]], [0x34, 0x56]);
     }
 }

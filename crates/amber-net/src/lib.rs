@@ -468,4 +468,121 @@ mod smoltcp_backend {
                 || !self.pending_dns.is_empty()
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use smoltcp::phy::ChecksumCapabilities;
+        use smoltcp::wire::{Ipv4Repr, TcpControl, TcpRepr, TcpSeqNumber};
+
+        /// Build an Ethernet/IPv4/TCP frame with correct checksums.
+        fn build(src: Ipv4Address, dst: Ipv4Address, sport: u16, dport: u16, ctrl: TcpControl) -> Vec<u8> {
+            let tcp_repr = TcpRepr {
+                src_port: sport,
+                dst_port: dport,
+                control: ctrl,
+                seq_number: TcpSeqNumber(1),
+                ack_number: None,
+                window_len: 1024,
+                window_scale: None,
+                max_seg_size: None,
+                sack_permitted: false,
+                sack_ranges: [None, None, None],
+                timestamp: None,
+                payload: &[],
+            };
+            let ip_repr = Ipv4Repr {
+                src_addr: src,
+                dst_addr: dst,
+                next_header: IpProtocol::Tcp,
+                payload_len: tcp_repr.buffer_len(),
+                hop_limit: 64,
+            };
+            // buffer_len() is the header only (smoltcp emits no IP options), so the
+            // frame is eth(14) + IP header + TCP segment.
+            let tcp_off = 14 + ip_repr.buffer_len();
+            let mut buf = vec![0u8; tcp_off + tcp_repr.buffer_len()];
+            {
+                let mut eth = EthernetFrame::new_unchecked(&mut buf);
+                eth.set_src_addr(EthernetAddress([2, 2, 2, 2, 2, 2]));
+                eth.set_dst_addr(EthernetAddress(MAC));
+                eth.set_ethertype(EthernetProtocol::Ipv4);
+            }
+            let src_ip = IpAddress::Ipv4(src);
+            let dst_ip = IpAddress::Ipv4(dst);
+            let caps = ChecksumCapabilities::default();
+            {
+                let mut ip = Ipv4Packet::new_unchecked(&mut buf[14..]);
+                ip_repr.emit(&mut ip, &caps);
+            }
+            {
+                let mut tcp = TcpPacket::new_unchecked(&mut buf[tcp_off..]);
+                tcp_repr.emit(&mut tcp, &src_ip, &dst_ip, &caps);
+            }
+            buf
+        }
+
+        /// Re-validate both header checksums (new_checked only checks structure).
+        fn checksums_ok(frame: &[u8]) -> bool {
+            let eth = EthernetFrame::new_checked(frame).unwrap();
+            let ip = Ipv4Packet::new_checked(eth.payload()).unwrap();
+            if !ip.verify_checksum() {
+                return false;
+            }
+            let src = IpAddress::Ipv4(ip.src_addr());
+            let dst = IpAddress::Ipv4(ip.dst_addr());
+            let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+            tcp.verify_checksum(&src, &dst)
+        }
+
+        #[test]
+        fn tcp_tuple_parses_a_valid_syn() {
+            let f = build(GUEST, Ipv4Address::new(93, 184, 216, 34), 50000, 80, TcpControl::Syn);
+            assert!(checksums_ok(&f));
+            let (src, dst, sp, dp, syn, ack) = tcp_tuple(&f).unwrap();
+            assert_eq!(src, Ipv4Addr::new(10, 0, 0, 2));
+            assert_eq!(dst, Ipv4Addr::new(93, 184, 216, 34));
+            assert_eq!((sp, dp, syn, ack), (50000, 80, true, false));
+        }
+
+        #[test]
+        fn tcp_tuple_rejects_non_tcp_and_short() {
+            assert!(tcp_tuple(&[0u8; 10]).is_none()); // shorter than an Ethernet header
+            let mut arp = vec![0u8; 60];
+            arp[12] = 0x08;
+            arp[13] = 0x06; // ARP ethertype, not IPv4
+            assert!(tcp_tuple(&arp).is_none());
+        }
+
+        #[test]
+        fn rewrite_dnat_in_changes_dst_and_fixes_checksums() {
+            let mut f = build(GUEST, Ipv4Address::new(1, 2, 3, 4), 50000, 80, TcpControl::Syn);
+            rewrite(&mut f, None, Some(GATEWAY), None, Some(40001));
+            assert!(checksums_ok(&f)); // checksums stay valid after the edit
+            let (src, dst, sp, dp, ..) = tcp_tuple(&f).unwrap();
+            assert_eq!(dst, Ipv4Addr::new(10, 0, 0, 1)); // dst -> gateway
+            assert_eq!(dp, 40001); // dport -> ephemeral
+            assert_eq!((src, sp), (Ipv4Addr::new(10, 0, 0, 2), 50000)); // src untouched
+        }
+
+        #[test]
+        fn rewrite_dnat_out_restores_source() {
+            // A reply gateway:40001 -> guest, rewritten to look like the external host.
+            let mut f = build(GATEWAY, GUEST, 40001, 50000, TcpControl::Syn);
+            let ext = Ipv4Address::new(1, 2, 3, 4);
+            rewrite(&mut f, Some(ext), None, Some(80), None);
+            assert!(checksums_ok(&f));
+            let (src, _, sp, ..) = tcp_tuple(&f).unwrap();
+            assert_eq!(src, Ipv4Addr::new(1, 2, 3, 4));
+            assert_eq!(sp, 80);
+        }
+
+        #[test]
+        fn rewrite_on_garbage_does_not_panic() {
+            let mut tiny = vec![0u8; 10];
+            rewrite(&mut tiny, Some(GATEWAY), None, None, None); // < 14 bytes: early out
+            let mut junk = vec![0xffu8; 14]; // Ethernet header, garbage L3
+            rewrite(&mut junk, None, Some(GATEWAY), None, None); // new_checked fails: no-op
+        }
+    }
 }
