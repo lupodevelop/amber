@@ -6,3 +6,7 @@
 # Private working notes and the local Claude harness config (personal paths).
 /dev_notes
 /.claude
+# Kernel build artifacts (resin): source cache, built Image, borrowed Alpine config.
+/kernel/.cache
+/kernel/Image.resin
+/kernel/alpine-virt.config
