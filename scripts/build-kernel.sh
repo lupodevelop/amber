@@ -62,6 +62,10 @@ docker run --rm -v "$ROOT:/work" -v "$CACHE:/cache" -w /work debian:bookworm bas
   echo "--> compile Image"
   make ARCH=arm64 -j'"$JOBS"' Image >/dev/null
   cp arch/arm64/boot/Image "/work/'"$OUT"'"
+  # Also surface vmlinux + System.map (symbols) for debugging a boot hang: map a
+  # runtime PC to its function. Kept next to the Image, both gitignored.
+  cp vmlinux /work/kernel/vmlinux 2>/dev/null || true
+  cp System.map /work/kernel/System.map 2>/dev/null || true
   ls -lh arch/arm64/boot/Image
 '
 echo "==> done: $OUT"

@@ -502,6 +502,31 @@ impl Vcpu for HvfVcpu {
         // here and resumed in place, and a busy boot does enough of them that
         // recursion would grow the stack without bound. Only MMIO/Idle/Shutdown/
         // Fault leave the loop and reach the backend-agnostic run loop in vm.rs.
+        // Timer preemption (swgic only). amber injects the guest timer IRQ from
+        // `swgic_prep`, which runs only when the vcpu exits hv_vcpu_run. A guest in
+        // a pure-compute loop that waits on jiffies (e.g. the kernel's raid6 / crypto
+        // boot-time benchmarks) never exits on its own, so the tick would never be
+        // delivered and the loop would spin forever. A low-rate thread forces the
+        // vcpu out periodically; the CANCELED handler below re-runs swgic_prep and
+        // resumes, so a due timer interrupt lands even mid-loop. The in-kernel vGIC
+        // wires the timer internally and needs none of this.
+        if self.swgic.is_some() {
+            static PREEMPT: std::sync::Once = std::sync::Once::new();
+            // ~500 Hz default: enough for jiffies to advance through a boot benchmark
+            // without flooding exits. AMBER_PREEMPT_MS tunes it; 0 disables.
+            let ms: u64 = std::env::var("AMBER_PREEMPT_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(2);
+            if ms > 0 {
+                let h = self.handle;
+                PREEMPT.call_once(move || {
+                    std::thread::spawn(move || loop {
+                        std::thread::sleep(std::time::Duration::from_millis(ms));
+                        let vcpus = [h];
+                        unsafe { hv_vcpus_exit(vcpus.as_ptr(), 1) };
+                    });
+                });
+            }
+        }
+
         loop {
             self.swgic_prep()?;
             unsafe { check(hv_vcpu_run(self.handle), "hv_vcpu_run")? };
@@ -597,7 +622,16 @@ impl Vcpu for HvfVcpu {
                     unsafe { check(hv_vcpu_set_vtimer_mask(self.handle, mask), "vtimer mask")? };
                     continue;
                 }
-                HV_EXIT_REASON_CANCELED => return Ok(VmExit::Idle),
+                HV_EXIT_REASON_CANCELED => {
+                    // Forced out by the timer-preemption thread (or a console-input
+                    // kick). Re-run the loop: swgic_prep at the top re-evaluates the
+                    // timer and injects a due IRQ, then we resume the guest in place.
+                    // Surface as Idle in vGIC mode (no preemption thread runs there).
+                    if self.swgic.is_some() {
+                        continue;
+                    }
+                    return Ok(VmExit::Idle);
+                }
                 _ => {
                     let pc = self.pc().unwrap_or(0);
                     return Ok(VmExit::Fault { pc, esr: 0, ipa: 0 });

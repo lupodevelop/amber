@@ -10,3 +10,5 @@
 /kernel/.cache
 /kernel/Image.resin
 /kernel/alpine-virt.config
+/kernel/vmlinux
+/kernel/System.map
