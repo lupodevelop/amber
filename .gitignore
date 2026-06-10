@@ -12,3 +12,5 @@
 /kernel/alpine-virt.config
 /kernel/vmlinux
 /kernel/System.map
+/kernel/resin-subtract.config
+/kernel/resin-effective.config

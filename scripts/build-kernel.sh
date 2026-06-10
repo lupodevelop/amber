@@ -48,15 +48,27 @@ docker run --rm -v "$ROOT:/work" -v "$CACHE:/cache" -w /work debian:bookworm bas
   cd "linux-'"$KVER"'"
 
   # Base config: Alpine'\''s linux-virt (a proven virt-guest config) if present,
-  # else the generic arm64 defconfig. Then overlay the resin fragment.
+  # else the generic arm64 defconfig.
   if [ -f /work/kernel/alpine-virt.config ]; then
-    echo "--> base: Alpine linux-virt config + resin fragment"
+    echo "--> base: Alpine linux-virt config (subtract modules) + resin overlay"
     cp /work/kernel/alpine-virt.config .config
+    # Subtraction: with modules off, olddefconfig would promote every Alpine =m to
+    # built-in (=y) and balloon the image. Pre-disable all of them; the overlay
+    # below pins back the few amber needs. Keeps resin == Alpine base + those.
+    grep "=m$" .config | sed "s/=m$//" | while read -r sym; do
+      case "$sym" in
+        CONFIG_VIRTIO|CONFIG_VIRTIO_MMIO|CONFIG_VIRTIO_BLK|CONFIG_VIRTIO_NET|\
+CONFIG_VIRTIO_BALLOON|CONFIG_HW_RANDOM_VIRTIO|CONFIG_NET_FAILOVER|CONFIG_FAILOVER|\
+CONFIG_SQUASHFS|CONFIG_OVERLAY_FS) echo "$sym=y" ;;
+        *) echo "# $sym is not set" ;;
+      esac
+    done > resin-subtract.config
   else
-    echo "--> base: arm64 defconfig + resin fragment"
+    echo "--> base: arm64 defconfig + resin overlay"
     make ARCH=arm64 defconfig >/dev/null
+    : > resin-subtract.config
   fi
-  ./scripts/kconfig/merge_config.sh -m -O . .config /work/kernel/resin.config >/dev/null
+  ./scripts/kconfig/merge_config.sh -m -O . .config resin-subtract.config /work/kernel/resin.config >/dev/null
   make ARCH=arm64 olddefconfig >/dev/null
 
   echo "--> compile Image"
