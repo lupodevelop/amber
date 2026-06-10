@@ -60,10 +60,8 @@ impl NetBackend for CaptureBackend {
 /// so it is zeroed except num_buffers on receive.
 const VIRTIO_NET_HDR_LEN: usize = 12;
 
-/// Ceiling on a single transmitted frame (virtio-net header + Ethernet). We
-/// negotiate no segmentation offload, so a legitimate frame never exceeds the MTU
-/// by much; this caps how large a frame a hostile guest can make us assemble out
-/// of a long descriptor chain.
+/// Ceiling on one assembled tx frame. No segmentation offload is negotiated, so a
+/// real frame stays near the MTU; this caps what a long hostile chain can build.
 const MAX_TX_FRAME: usize = 64 * 1024;
 
 /// virtio-net (device id 1). Queue 0 is receive (filled asynchronously as frames

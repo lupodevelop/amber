@@ -55,17 +55,14 @@ const FEATURE_VERSION_1_WORD: u32 = 1;
 const VIRTQ_DESC_F_NEXT: u16 = 1;
 const VIRTQ_DESC_F_WRITE: u16 = 2;
 
-/// Largest single descriptor buffer the transport will hand a device. The guest
-/// chooses descriptor lengths; no legitimate blk/net/rng/balloon buffer comes near
-/// this, so it is purely a ceiling on a hostile guest's per-buffer allocation.
+/// Per-buffer length ceiling — a guest can't make a device allocate more. No real
+/// blk/net/rng/balloon buffer comes near it.
 const MAX_DESC_LEN: u32 = 16 << 20; // 16 MiB
 
-/// One descriptor's buffer, as gathered from a chain.
+/// One descriptor's buffer, gathered from a chain.
 ///
-/// Invariant established by [`collect_chain`]: `[addr, addr+len)` lies entirely
-/// within guest RAM and `len <= MAX_DESC_LEN`. A device may size an allocation
-/// from `len` without fear of an out-of-range or astronomically large value. (The
-/// underlying `GuestRam::read`/`write` still bounds-check every access regardless.)
+/// [`collect_chain`] guarantees `[addr, addr+len)` is within guest RAM and
+/// `len <= MAX_DESC_LEN`, so a device may size an allocation from `len` safely.
 pub struct Buf {
     pub addr: u64,
     pub len: u32,
@@ -339,12 +336,10 @@ impl VirtioMmio {
     }
 }
 
-/// Walk a descriptor chain into its buffers. Every value here is guest-controlled,
-/// so each step is bounded: a descriptor index must point inside the declared table
-/// (`i < qsz`), a chain visits at most `qsz` descriptors (so a `next` cycle can't
-/// loop forever), each buffer is clamped to `MAX_DESC_LEN`, and a buffer not wholly
-/// inside guest RAM is downgraded to zero length (the device then skips it). All
-/// address arithmetic wraps rather than panicking on a crafted base.
+/// Walk a guest-controlled descriptor chain into buffers, bounding every step:
+/// index `< qsz`, at most `qsz` descriptors (a `next` cycle can't loop), each
+/// buffer clamped to `MAX_DESC_LEN`, out-of-RAM buffers downgraded to zero length,
+/// and wrapping arithmetic so a crafted base can't panic.
 fn collect_chain(ram: &GuestRam, desc: u64, head: u16, qsz: u16) -> Vec<Buf> {
     let mut bufs = Vec::new();
     let mut i = head;

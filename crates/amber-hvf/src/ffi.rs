@@ -69,8 +69,8 @@ extern "C" {
     ) -> hv_return_t;
     pub fn hv_vcpu_destroy(vcpu: hv_vcpu_t) -> hv_return_t;
     pub fn hv_vcpu_run(vcpu: hv_vcpu_t) -> hv_return_t;
-    // Force the listed vcpus out of hv_vcpu_run (from another thread). Used by the
-    // debug spin-watchdog to sample the PC of a guest stuck in a non-MMIO loop.
+    // Force the listed vcpus out of hv_vcpu_run from another thread — the timer
+    // preemption thread uses it to deliver a tick to a compute-bound guest.
     pub fn hv_vcpus_exit(vcpus: *const hv_vcpu_t, vcpu_count: u32) -> hv_return_t;
 
     pub fn hv_vcpu_get_reg(vcpu: hv_vcpu_t, reg: hv_reg_t, value: *mut u64) -> hv_return_t;

@@ -127,9 +127,8 @@ impl GuestRam {
         (off.checked_add(n)? <= self.len).then_some(off)
     }
 
-    /// Whether `[gpa, gpa+n)` lies entirely within guest RAM. Device emulation uses
-    /// it to discard a hostile guest's out-of-range descriptor before trusting its
-    /// length for an allocation.
+    /// Whether `[gpa, gpa+n)` lies within guest RAM — device code uses it to reject
+    /// a hostile descriptor before trusting its length.
     pub fn in_range(&self, gpa: u64, n: usize) -> bool {
         self.offset(gpa, n).is_some()
     }

@@ -41,10 +41,9 @@ mod smoltcp_backend {
     const GUEST: Ipv4Address = Ipv4Address::new(10, 0, 0, 2);
     const MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
     const MTU: usize = 1500;
-    /// Ceilings on guest-driven resource growth. Each flow holds 128 KiB of smoltcp
-    /// buffers; each in-flight DNS query holds a host UDP socket (a file descriptor).
-    /// A hostile guest could otherwise open these without bound, so new ones past the
-    /// cap are dropped (the guest sees the connection/query fail, the host stays up).
+    /// Caps on guest-driven growth: each flow holds 128 KiB of smoltcp buffers, each
+    /// in-flight DNS query a host UDP socket. Past the cap new ones are dropped, so a
+    /// hostile guest can't exhaust host RAM/fds.
     const MAX_FLOWS: usize = 256;
     const MAX_PENDING_DNS: usize = 256;
 

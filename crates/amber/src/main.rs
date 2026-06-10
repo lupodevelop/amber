@@ -756,10 +756,9 @@ fn build_bootstrap(config: &amber_image::ImageConfig, argv: &[String]) -> std::i
     cpio.finish_gz()
 }
 
-/// `<MODULES_ROOT>/<version>/kernel` for the first kernel version present, or
-/// `None` when no modules ship — a built-in-everything kernel (resin) needs none,
-/// so the bootstrap skips insmod entirely. This is what lets one amber binary boot
-/// either the modular Alpine kernel or a trimmed built-in one, chosen by `assets/`.
+/// `<MODULES_ROOT>/<version>/kernel`, or `None` when no modules ship — a built-in
+/// kernel (resin) needs none, so the bootstrap skips insmod. Lets one binary boot
+/// either the modular Alpine kernel or a built-in one, chosen by `assets/`.
 fn first_module_dir() -> Option<std::path::PathBuf> {
     // The modules root holds a versioned dir (e.g. `6.12.81-0-virt`) and may also
     // hold a sibling `firmware` dir, so pick the entry that actually has a `kernel`
