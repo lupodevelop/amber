@@ -41,6 +41,12 @@ mod smoltcp_backend {
     const GUEST: Ipv4Address = Ipv4Address::new(10, 0, 0, 2);
     const MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
     const MTU: usize = 1500;
+    /// Ceilings on guest-driven resource growth. Each flow holds 128 KiB of smoltcp
+    /// buffers; each in-flight DNS query holds a host UDP socket (a file descriptor).
+    /// A hostile guest could otherwise open these without bound, so new ones past the
+    /// cap are dropped (the guest sees the connection/query fail, the host stays up).
+    const MAX_FLOWS: usize = 256;
+    const MAX_PENDING_DNS: usize = 256;
 
     type Frames = Arc<Mutex<VecDeque<Vec<u8>>>>;
 
@@ -304,6 +310,9 @@ mod smoltcp_backend {
                     Ok((data, meta)) => (data.to_vec(), meta.endpoint),
                     Err(_) => break,
                 };
+                if self.pending_dns.len() >= MAX_PENDING_DNS {
+                    continue; // too many queries in flight: drop (the guest retries)
+                }
                 if let Ok(h) = UdpSocket::bind("0.0.0.0:0") {
                     let _ = h.set_nonblocking(true);
                     if h.connect(RESOLVER).is_ok() && h.send(&payload).is_ok() {
@@ -343,6 +352,10 @@ mod smoltcp_backend {
                 return;
             }
             if self.flows.iter().any(|f| f.guest_port == sport && f.ext_ip == dst && f.ext_port == dport) {
+                return;
+            }
+            if self.flows.len() >= MAX_FLOWS {
+                log::warn!("net: flow cap ({MAX_FLOWS}) reached, dropping SYN to {dst}:{dport}");
                 return;
             }
             // Connect on a thread so the vcpu is never blocked; the stream arrives
