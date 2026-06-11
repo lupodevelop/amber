@@ -38,6 +38,8 @@ fn main() -> ExitCode {
         Some("logs") => cmd_logs(&args),
         Some("budget") => cmd_budget(),
         Some("balloon") => cmd_balloon(&args),
+        Some("pause") => cmd_pause(&args),
+        Some("resume") => cmd_resume(&args),
         Some("pull") => cmd_pull(&args),
         Some("restore") => cmd_restore(&args),
         Some("template") => cmd_template(&args),
@@ -75,8 +77,9 @@ usage: amber <command> [args]
 
   daemon & fleet
     up | down                               start / stop the amberd daemon
-    ps                                      list VMs (ID PID AGE CAP RSS IMAGE)
+    ps                                      list VMs (ID PID STATE AGE CAP RSS IMAGE)
     logs <id>                               stream a VM's output
+    pause <id> | resume <id>                freeze / unfreeze a running VM
     rm <id>                                 kill a VM
     budget                                  fleet RAM: budget / reserved / real / host
     balloon <id> <MiB>                      ask a VM to give RAM back
@@ -279,19 +282,47 @@ fn cmd_ps() -> ExitCode {
     }
     match daemon::list() {
         Ok(vms) => {
+            if vms.is_empty() {
+                println!("no running VMs");
+                return ExitCode::SUCCESS;
+            }
+            let tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
             let now = proto::now_secs();
-            println!("{:<8} {:<8} {:<6} {:<8} {:<8} IMAGE", "ID", "PID", "AGE", "CAP", "RSS");
-            for v in vms {
+            let mib = |b: u64| format!("{}M", b / (1024 * 1024));
+            // Color only on a terminal; in a pipe the output stays plain and parseable.
+            let (bold, dim, rst) = if tty { ("\x1b[1m", "\x1b[2m", "\x1b[0m") } else { ("", "", "") };
+            println!(
+                "{bold}{:<8} {:<7} {:<8} {:>5} {:>6} {:>6}  IMAGE{rst}",
+                "ID", "PID", "STATE", "AGE", "CAP", "RSS"
+            );
+            let paused = vms.iter().filter(|v| v.paused).count();
+            for v in &vms {
+                // Pad to the visible width first, then wrap in color, so the ANSI
+                // escapes don't throw off column alignment.
+                let cell = format!("{:<8}", if v.paused { "paused" } else { "running" });
+                let state = if tty {
+                    let color = if v.paused { "33" } else { "32" }; // yellow / green
+                    format!("\x1b[{color}m{cell}\x1b[0m")
+                } else {
+                    cell
+                };
                 println!(
-                    "{:<8} {:<8} {:<6} {:<8} {:<8} {}",
+                    "{:<8} {:<7} {} {:>5} {:>6} {:>6}  {}",
                     v.id,
                     v.pid,
+                    state,
                     fmt_age(now.saturating_sub(v.started)),
-                    format!("{}M", v.ram_bytes / (1024 * 1024)),
-                    format!("{}M", v.rss_bytes / (1024 * 1024)),
+                    mib(v.ram_bytes),
+                    mib(v.rss_bytes),
                     v.reference
                 );
             }
+            let foot = if paused > 0 {
+                format!("{} VM(s), {paused} paused", vms.len())
+            } else {
+                format!("{} VM(s)", vms.len())
+            };
+            println!("{dim}{foot}{rst}");
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -313,6 +344,40 @@ fn cmd_rm(args: &[String]) -> ExitCode {
         }
         Err(e) => {
             eprintln!("rm failed: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn cmd_pause(args: &[String]) -> ExitCode {
+    let Some(id) = args.get(2) else {
+        eprintln!("usage: amber pause <id>");
+        return ExitCode::FAILURE;
+    };
+    match daemon::pause(id) {
+        Ok(()) => {
+            println!("paused {id}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("pause failed: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn cmd_resume(args: &[String]) -> ExitCode {
+    let Some(id) = args.get(2) else {
+        eprintln!("usage: amber resume <id>");
+        return ExitCode::FAILURE;
+    };
+    match daemon::resume(id) {
+        Ok(()) => {
+            println!("resumed {id}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("resume failed: {e}");
             ExitCode::FAILURE
         }
     }

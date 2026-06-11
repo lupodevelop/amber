@@ -103,8 +103,9 @@ amber fork [-i] <template-dir>                    fork a template (-i attaches t
 amber restore <snapshot-dir>                      resume a snapshot mid-execution
 
 amber up | down                                  start / stop the amberd daemon
-amber ps                                         list VMs (ID PID AGE CAP RSS IMAGE)
+amber ps                                         list VMs (ID PID STATE AGE CAP RSS IMAGE)
 amber logs <id>                                  stream a detached VM's output
+amber pause <id> | resume <id>                   freeze / unfreeze a running VM in place
 amber rm <id>                                    kill a VM
 amber budget                                     fleet RAM: budget, reserved, real, host
 amber balloon <id> <MiB>                         ask a VM to give RAM back (active reclaim)

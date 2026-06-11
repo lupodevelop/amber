@@ -128,6 +128,7 @@ fn reserve(
                 started: proto::now_secs(),
                 ram_bytes: requested,
                 rss_bytes: 0,
+                paused: false,
             },
             kill: kill.clone(),
             control: None,
@@ -284,6 +285,31 @@ fn release(reg: &Registry, id: &str) -> bool {
             io::Write::write_all(&mut w, &[1u8]).is_ok()
         }
         None => false,
+    }
+}
+
+/// Send one control frame to a VM by id and optionally record its paused state.
+/// The reply is an `Ok`, or an error if the VM is unknown / has no channel.
+fn control_op(reg: &Registry, id: &str, frame: &[u8], set_paused: Option<bool>) -> Reply {
+    let mut g = reg.lock().unwrap();
+    let Some(e) = g.get_mut(id) else {
+        return Reply::Error { message: format!("no such vm: {id}") };
+    };
+    let wrote = match e.control.as_ref() {
+        Some(ctl) => {
+            let mut w: &UnixStream = ctl;
+            w.write_all(frame).and_then(|_| w.flush())
+        }
+        None => return Reply::Error { message: format!("vm {id} has no control channel") },
+    };
+    match wrote {
+        Ok(()) => {
+            if let Some(p) = set_paused {
+                e.info.paused = p;
+            }
+            Reply::Ok
+        }
+        Err(err) => Reply::Error { message: format!("control write: {err}") },
     }
 }
 
@@ -515,19 +541,17 @@ fn handle(
             )?;
         }
         Request::Balloon { id, mib } => {
-            let reply = {
-                let g = reg.lock().unwrap();
-                match g.get(&id).and_then(|e| e.control.as_ref()) {
-                    Some(ctl) => {
-                        let mut w: &UnixStream = ctl;
-                        match w.write_all(&mib.to_le_bytes()).and_then(|_| w.flush()) {
-                            Ok(()) => Reply::Ok,
-                            Err(e) => Reply::Error { message: format!("control write: {e}") },
-                        }
-                    }
-                    None => Reply::Error { message: format!("no such vm: {id}") },
-                }
-            };
+            let mut frame = vec![amber_core::control::BALLOON];
+            frame.extend_from_slice(&mib.to_le_bytes());
+            let reply = control_op(&reg, &id, &frame, None);
+            write_reply(&mut stream, &reply)?;
+        }
+        Request::Pause { id } => {
+            let reply = control_op(&reg, &id, &[amber_core::control::PAUSE], Some(true));
+            write_reply(&mut stream, &reply)?;
+        }
+        Request::Resume { id } => {
+            let reply = control_op(&reg, &id, &[amber_core::control::RESUME], Some(false));
             write_reply(&mut stream, &reply)?;
         }
         Request::Fork { template, interactive } => {
@@ -979,6 +1003,24 @@ pub fn balloon(id: &str, mib: u64) -> io::Result<()> {
 
 pub fn kill(id: &str) -> io::Result<()> {
     match request(&Request::Kill { id: id.to_string() })? {
+        Reply::Ok => Ok(()),
+        Reply::Error { message } => Err(io::Error::other(message)),
+        _ => Ok(()),
+    }
+}
+
+/// Freeze a running VM in place.
+pub fn pause(id: &str) -> io::Result<()> {
+    match request(&Request::Pause { id: id.to_string() })? {
+        Reply::Ok => Ok(()),
+        Reply::Error { message } => Err(io::Error::other(message)),
+        _ => Ok(()),
+    }
+}
+
+/// Resume a paused VM.
+pub fn resume(id: &str) -> io::Result<()> {
+    match request(&Request::Resume { id: id.to_string() })? {
         Reply::Ok => Ok(()),
         Reply::Error { message } => Err(io::Error::other(message)),
         _ => Ok(()),

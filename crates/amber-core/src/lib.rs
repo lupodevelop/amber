@@ -55,6 +55,17 @@ impl GicKind {
 /// The guest-physical memory map. The QEMU `virt` layout, which is the reference
 /// every arm64 microVM follows and what the kernel's `earlycon` expects. Devices
 /// sit below RAM; RAM starts at 1 GiB.
+/// Opcodes on the amberd→VM control channel (read by `vm::control_reader`, after
+/// the one-time warm-pool go byte). A frame is one opcode byte plus its payload.
+pub mod control {
+    /// Set the balloon target; payload is a u64 LE MiB value.
+    pub const BALLOON: u8 = 1;
+    /// Freeze the vcpu in place. No payload.
+    pub const PAUSE: u8 = 2;
+    /// Resume a paused vcpu. No payload.
+    pub const RESUME: u8 = 3;
+}
+
 pub mod layout {
     /// Guest RAM base. 2 MiB-aligned, so a kernel placed at `KERNEL_OFFSET` above
     /// it is also 2 MiB-aligned as the arm64 boot protocol requires.

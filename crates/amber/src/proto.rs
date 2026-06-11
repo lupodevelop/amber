@@ -45,6 +45,10 @@ pub enum Request {
     Budget,
     /// Ask a VM's balloon to reclaim toward `mib` MiB (active reclaim).
     Balloon { id: String, mib: u64 },
+    /// Freeze a running VM in place (vcpu parks; RAM/registers intact).
+    Pause { id: String },
+    /// Resume a paused VM.
+    Resume { id: String },
     /// Fork a VM from a warm template (a snapshot directory): hand off a
     /// pre-staged paused worker if the pool has one, else stage one now.
     /// `interactive` streams the resumed guest's console I/O to the client (like
@@ -89,6 +93,9 @@ pub struct VmInfo {
     pub ram_bytes: u64,
     /// Real resident memory of the VM process, sampled when listed (0 otherwise).
     pub rss_bytes: u64,
+    /// Whether the VM is currently paused (frozen via `pause`).
+    #[serde(default)]
+    pub paused: bool,
 }
 
 /// Current Unix time in whole seconds.

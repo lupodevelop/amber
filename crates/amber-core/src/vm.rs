@@ -339,19 +339,32 @@ impl Vm {
         // latency when it is parked waiting for the timer (software-GIC mode).
         let vcpu_thread = std::thread::current();
         let vcpu_thread = &vcpu_thread;
+        // Live pause gate: the control reader sets this on PAUSE; the vcpu loop
+        // blocks on it until RESUME. Separate from the warm-pool startup gate above.
+        let pause = (Mutex::new(false), std::sync::Condvar::new());
+        let pause = &pause;
         std::thread::scope(|s| {
             // Console reader: host stdin -> UART RX -> GIC line -> wake the vcpu.
             s.spawn(move || console_reader(hv, pl011, pl011_intid, running, vcpu_thread));
 
-            // Control reader: a control-channel target -> balloon inflate. Moving
-            // the target and raising the device's config interrupt makes the guest
-            // give pages back (active reclaim). Only when amberd passed a fd.
-            if let (Some(fd), Some((handle, intid))) = (control_fd, balloon) {
-                s.spawn(move || control_reader(hv, fd, handle, *intid, running));
+            // Control reader: dispatches amberd control frames — balloon targets
+            // (active reclaim) and live pause/resume. Runs whenever amberd passed a fd.
+            if let Some(fd) = control_fd {
+                s.spawn(move || control_reader(hv, fd, balloon, running, pause));
             }
 
             // vcpu loop on this thread.
             let mut step = || -> Result<bool> {
+                // Live pause: block the vcpu here while paused (the control reader
+                // flips the flag and notifies). Guest RAM and registers stay put.
+                {
+                    let (m, cv) = pause;
+                    let mut p = m.lock().unwrap();
+                    while *p {
+                        p = cv.wait(p).unwrap();
+                    }
+                }
+
                 // Deliver any frames that arrived from the network backend into the
                 // guest's receive queue and raise the device interrupt.
                 for d in virtio.iter_mut() {
@@ -516,27 +529,59 @@ fn console_reader<H: Hypervisor>(
 /// Read balloon targets (8-byte LE MiB values) from the control fd and apply them:
 /// move the device target and raise its config-change interrupt so the guest
 /// inflates. Polls so it can notice shutdown and let the scope join.
+/// Read exactly `buf.len()` bytes from a blocking fd; false on EOF/error.
+fn read_exact_fd(fd: RawFd, buf: &mut [u8]) -> bool {
+    let mut off = 0;
+    while off < buf.len() {
+        let r = unsafe {
+            libc::read(fd, buf[off..].as_mut_ptr() as *mut libc::c_void, buf.len() - off)
+        };
+        if r <= 0 {
+            return false;
+        }
+        off += r as usize;
+    }
+    true
+}
+
+/// Dispatch amberd control frames (one opcode byte + payload): balloon targets
+/// (active reclaim, only if this VM has a balloon) and live pause/resume.
 fn control_reader<H: Hypervisor>(
     hv: &H,
     fd: RawFd,
-    balloon: &BalloonHandle,
-    intid: u32,
+    balloon: Option<&(BalloonHandle, u32)>,
     running: &AtomicBool,
+    pause: &(Mutex<bool>, std::sync::Condvar),
 ) {
-    let mut buf = [0u8; 8];
     while running.load(Ordering::Relaxed) {
         let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
         let n = unsafe { libc::poll(&mut pfd, 1, 100) };
         if n <= 0 {
             continue;
         }
-        let r = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-        if r != 8 {
-            break; // EOF/short read: amberd closed the channel
+        let mut op = [0u8; 1];
+        if unsafe { libc::read(fd, op.as_mut_ptr() as *mut libc::c_void, 1) } != 1 {
+            break; // EOF: amberd closed the channel
         }
-        let mib = u64::from_le_bytes(buf);
-        balloon.target_pages.store(mib * 256, Ordering::Relaxed); // 1 MiB = 256 * 4 KiB
-        balloon.config_dirty.store(true, Ordering::Relaxed);
-        let _ = hv.set_irq(intid, true);
+        match op[0] {
+            crate::control::BALLOON => {
+                let mut buf = [0u8; 8];
+                if !read_exact_fd(fd, &mut buf) {
+                    break;
+                }
+                if let Some((handle, intid)) = balloon {
+                    let mib = u64::from_le_bytes(buf);
+                    handle.target_pages.store(mib * 256, Ordering::Relaxed); // 1 MiB = 256 * 4 KiB
+                    handle.config_dirty.store(true, Ordering::Relaxed);
+                    let _ = hv.set_irq(*intid, true);
+                }
+            }
+            crate::control::PAUSE => *pause.0.lock().unwrap() = true,
+            crate::control::RESUME => {
+                *pause.0.lock().unwrap() = false;
+                pause.1.notify_all();
+            }
+            _ => {}
+        }
     }
 }
