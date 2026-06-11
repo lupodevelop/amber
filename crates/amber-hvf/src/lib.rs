@@ -80,7 +80,7 @@ impl Hypervisor for HvfVm {
         }
     }
 
-    fn create_vcpu(&mut self, _id: u8) -> Result<HvfVcpu> {
+    fn create_vcpu(&mut self, id: u8) -> Result<HvfVcpu> {
         let mut handle: hv_vcpu_t = 0;
         let mut exit: *mut hv_vcpu_exit_t = std::ptr::null_mut();
         unsafe {
@@ -89,13 +89,19 @@ impl Hypervisor for HvfVm {
                 "hv_vcpu_create",
             )?;
             // GICv3 routes by affinity, so the redistributor HVF allocated for
-            // this vcpu is found via MPIDR. vcpu 0 -> affinity 0; bit 31 is RES1.
+            // this vcpu is found via MPIDR. Affinity = vcpu id; bit 31 is RES1.
             check(
-                hv_vcpu_set_sys_reg(handle, HV_SYS_REG_MPIDR_EL1, 0x8000_0000),
+                hv_vcpu_set_sys_reg(handle, HV_SYS_REG_MPIDR_EL1, 0x8000_0000 | id as u64),
                 "set MPIDR_EL1",
             )?;
         }
-        Ok(HvfVcpu { handle, exit, swgic: self.swgic.clone(), vtimer_masked: false })
+        Ok(HvfVcpu {
+            handle,
+            exit,
+            cpu: id as usize,
+            swgic: self.swgic.clone(),
+            vtimer_masked: false,
+        })
     }
 
     fn gic_info(&self) -> Option<GicInfo> {
@@ -104,7 +110,8 @@ impl Hypervisor for HvfVm {
 
     fn set_irq(&self, intid: u32, level: bool) -> Result<()> {
         if let Some(gic) = &self.swgic {
-            gic.lock().unwrap().set_level(intid, level);
+            // Device lines are SPIs (shared); the cpu index is irrelevant for them.
+            gic.lock().unwrap().set_level(0, intid, level);
             Ok(())
         } else {
             unsafe { check(hv_gic_set_spi(intid, level), "hv_gic_set_spi") }
@@ -243,6 +250,8 @@ impl Drop for HvfVm {
 pub struct HvfVcpu {
     handle: hv_vcpu_t,
     exit: *mut hv_vcpu_exit_t,
+    /// This vcpu's index — its bank in the software GIC (and its MPIDR affinity).
+    cpu: usize,
     /// Shared software GICv2 in `swgic` mode (None for the in-kernel vGIC).
     swgic: Option<Arc<Mutex<GicV2>>>,
     /// Whether HVF's virtual timer is currently masked. In `swgic` mode we keep it
@@ -281,8 +290,9 @@ impl HvfVcpu {
         let due = ctl & 0b001 != 0 && ctl & 0b010 == 0 && ctl & 0b100 != 0;
         let pend = {
             let mut g = gic.lock().unwrap();
-            g.set_level(VTIMER_INTID, due);
-            g.irq_pending()
+            // The virtual timer is a PPI: banked, this vcpu's own line.
+            g.set_level(self.cpu, VTIMER_INTID, due);
+            g.irq_pending(self.cpu)
         };
         // HVF auto-clears the pending interrupt after each run, so only the `true`
         // case needs a syscall — skipping the common `false` case halves the cost.
@@ -315,9 +325,9 @@ impl HvfVcpu {
         match access.op {
             MmioOp::Read { reg } => {
                 let v = if is_cpu {
-                    g.cpu_read(off, access.size)
+                    g.cpu_read(self.cpu, off, access.size)
                 } else {
-                    g.dist_read(off, access.size)
+                    g.dist_read(self.cpu, off, access.size)
                 };
                 drop(g);
                 if reg != 31 {
@@ -326,9 +336,9 @@ impl HvfVcpu {
             }
             MmioOp::Write { value, .. } => {
                 if is_cpu {
-                    g.cpu_write(off, access.size, value);
+                    g.cpu_write(self.cpu, off, access.size, value);
                 } else {
-                    g.dist_write(off, access.size, value);
+                    g.dist_write(self.cpu, off, access.size, value);
                 }
             }
         }
