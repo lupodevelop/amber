@@ -34,7 +34,7 @@ on Apple Silicon at all (the in-kernel vGIC can't restore the timer).
 | --- | --- |
 | **Run** | boot an OCI image (squashfs base + tmpfs overlay), interactive console, virtio-blk/rng; SMP up to 8 vcpus (PSCI CPU_ON through the software GIC) |
 | **Networking** | outbound TCP + DNS by hostname, inbound port-forward; on by default, rootless |
-| **Snapshot / restore** | capture + resume a VM mid-execution — RAM + vcpu + interrupt controller + PL011/virtio device state; periodic timer survives |
+| **Snapshot / restore** | capture + resume a VM mid-execution — RAM + every vcpu (SMP included) + interrupt controller + PL011/virtio device state; periodic timer survives |
 | **Fork** | copy-on-write from a template (~10 MiB/fork) + warm pool (~ms handoff) + budget-aware sizing/eviction; interactive `fork -i` |
 | **Exec** | `amber exec <template> -- <cmd>` — a fresh command in a warm fork (~15 ms), with exit codes |
 | **RAM budget** | fleet ceiling + admission control, real-RSS accounting, virtio-balloon reclaim (passive + active), pool eviction |

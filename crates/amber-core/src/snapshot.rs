@@ -15,7 +15,7 @@ use std::path::Path;
 /// registers amber reads directly, an opaque (id, value) list of system
 /// registers, and the SIMD/FP file. KVM would fill the same shape with its own
 /// register ids.
-#[derive(Serialize, Deserialize, Default, Debug)]
+#[derive(Serialize, Deserialize, Default, Debug, Clone)]
 pub struct CpuSnapshot {
     pub x: Vec<u64>, // x0..x30
     pub pc: u64,
@@ -46,6 +46,14 @@ pub struct Meta {
     /// restored VM gets a network device.
     #[serde(default)]
     pub net: bool,
+    /// Guest CPUs captured. vcpu 0 lives in `cpu.json`, the rest in `cpu<i>.json`;
+    /// a restore recreates all of them already running. Pre-SMP snapshots omit it.
+    #[serde(default = "one")]
+    pub vcpus: usize,
+}
+
+fn one() -> usize {
+    1
 }
 
 /// Host-side device-emulation state that does not live in guest RAM and so must
@@ -74,7 +82,10 @@ pub struct VirtioDevState {
 /// Everything a snapshot directory holds except the bulk RAM (loaded separately).
 pub struct Loaded {
     pub meta: Meta,
+    /// vcpu 0's registers (the primary).
     pub cpu: CpuSnapshot,
+    /// Secondary vcpus' registers (cpu1..), in order. Empty on 1-vcpu snapshots.
+    pub cpus: Vec<CpuSnapshot>,
     pub gic: Vec<u8>,
     pub dev: DevState,
 }
@@ -83,12 +94,13 @@ fn snap_err<E: std::fmt::Display>(e: E) -> Error {
     Error::Snapshot(e.to_string())
 }
 
-/// Write a snapshot directory from the captured state.
+/// Write a snapshot directory from the captured state. `cpus[0]` is the primary
+/// (written as `cpu.json`); the rest land in `cpu<i>.json`.
 #[allow(clippy::too_many_arguments)]
 pub fn write(
     dir: &Path,
     mem: &GuestMemory,
-    cpu: &CpuSnapshot,
+    cpus: &[CpuSnapshot],
     gic: &[u8],
     disk: Option<&Path>,
     gic_kind: Option<crate::GicKind>,
@@ -99,8 +111,8 @@ pub fn write(
     std::fs::write(dir.join("dev.json"), serde_json::to_vec(dev).map_err(snap_err)?)
         .map_err(snap_err)?;
 
-    // Raw guest RAM. SAFETY: the region is valid for `len` bytes and the guest is
-    // stopped, so no concurrent writes.
+    // Raw guest RAM. SAFETY: the region is valid for `len` bytes and every vcpu is
+    // stopped (the snapshot barrier), so no concurrent writes.
     let ram = unsafe { std::slice::from_raw_parts(mem.host_ptr(), mem.len()) };
     std::fs::write(dir.join("mem.bin"), ram).map_err(snap_err)?;
     std::fs::write(dir.join("gic.bin"), gic).map_err(snap_err)?;
@@ -111,27 +123,37 @@ pub fn write(
         disk: disk.map(|p| p.to_string_lossy().into_owned()),
         gic_kind: gic_kind.map(|k| k.as_str().to_string()),
         net,
+        vcpus: cpus.len().max(1),
     };
     std::fs::write(dir.join("meta.json"), serde_json::to_vec(&meta).map_err(snap_err)?)
         .map_err(snap_err)?;
-    std::fs::write(dir.join("cpu.json"), serde_json::to_vec(cpu).map_err(snap_err)?)
-        .map_err(snap_err)?;
+    for (i, cpu) in cpus.iter().enumerate() {
+        let name = if i == 0 { "cpu.json".to_string() } else { format!("cpu{i}.json") };
+        std::fs::write(dir.join(name), serde_json::to_vec(cpu).map_err(snap_err)?)
+            .map_err(snap_err)?;
+    }
     Ok(())
 }
 
-/// Read the metadata, cpu state, and GIC blob (not the bulk RAM) from a snapshot.
+/// Read the metadata, cpu state(s), and GIC blob (not the bulk RAM) from a snapshot.
 pub fn read(dir: &Path) -> Result<Loaded> {
-    let meta = serde_json::from_slice(&std::fs::read(dir.join("meta.json")).map_err(snap_err)?)
-        .map_err(snap_err)?;
+    let meta: Meta =
+        serde_json::from_slice(&std::fs::read(dir.join("meta.json")).map_err(snap_err)?)
+            .map_err(snap_err)?;
     let cpu = serde_json::from_slice(&std::fs::read(dir.join("cpu.json")).map_err(snap_err)?)
         .map_err(snap_err)?;
+    let mut cpus = Vec::new();
+    for i in 1..meta.vcpus {
+        let b = std::fs::read(dir.join(format!("cpu{i}.json"))).map_err(snap_err)?;
+        cpus.push(serde_json::from_slice(&b).map_err(snap_err)?);
+    }
     let gic = std::fs::read(dir.join("gic.bin")).map_err(snap_err)?;
     // dev.json is newer than the first snapshots; default it if absent.
     let dev = std::fs::read(dir.join("dev.json"))
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or_default();
-    Ok(Loaded { meta, cpu, gic, dev })
+    Ok(Loaded { meta, cpu, cpus, gic, dev })
 }
 
 /// Load the snapshot's RAM image into `mem`.
@@ -159,6 +181,7 @@ mod tests {
         assert_eq!(m.gic_kind, None);
         assert!(!m.net);
         assert_eq!(m.disk, None);
+        assert_eq!(m.vcpus, 1, "pre-SMP snapshots default to one vcpu");
     }
 
     #[test]
@@ -169,11 +192,13 @@ mod tests {
             disk: Some("/tmp/base.img".into()),
             gic_kind: Some("v2".into()),
             net: true,
+            vcpus: 2,
         };
         let back: Meta = serde_json::from_slice(&serde_json::to_vec(&m).unwrap()).unwrap();
         assert_eq!(back.mem_base, m.mem_base);
         assert_eq!(back.gic_kind.as_deref(), Some("v2"));
         assert!(back.net);
+        assert_eq!(back.vcpus, 2);
     }
 
     #[test]

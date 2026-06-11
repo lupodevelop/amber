@@ -54,6 +54,9 @@ struct VmShared {
     /// Set when the VM is going down: vcpus return from `run` instead of
     /// resuming after a forced exit, so their threads can be joined.
     stop: std::sync::atomic::AtomicBool,
+    /// Set while the run loop needs every vcpu back (snapshot quiesce, pause):
+    /// forced exits return Idle instead of resuming in place.
+    yield_now: std::sync::atomic::AtomicBool,
 }
 
 pub struct HvfVm {
@@ -89,6 +92,7 @@ impl Hypervisor for HvfVm {
             ),
             handles: Mutex::new(Vec::new()),
             stop: std::sync::atomic::AtomicBool::new(false),
+            yield_now: std::sync::atomic::AtomicBool::new(false),
         });
         if swgic_mode() {
             // Software GICv2: no in-kernel vGIC. The distributor and CPU interface
@@ -191,6 +195,16 @@ impl Hypervisor for HvfVm {
         let hs = self.shared.handles.lock().unwrap().clone();
         if !hs.is_empty() {
             unsafe { hv_vcpus_exit(hs.as_ptr(), hs.len() as u32) };
+        }
+    }
+
+    fn set_yield(&self, on: bool) {
+        self.shared.yield_now.store(on, std::sync::atomic::Ordering::Relaxed);
+        if on {
+            let hs = self.shared.handles.lock().unwrap().clone();
+            if !hs.is_empty() {
+                unsafe { hv_vcpus_exit(hs.as_ptr(), hs.len() as u32) };
+            }
         }
     }
 
@@ -523,6 +537,12 @@ impl Vcpu for HvfVcpu {
     }
 
     fn restore(&mut self, cpu: &CpuSnapshot) -> Result<()> {
+        // A restored vcpu was running when captured: it must not park waiting for
+        // a PSCI CPU_ON that already happened in the snapshotted guest.
+        self.started = true;
+        if let Some(slot) = self.shared.cpu_on.0.lock().unwrap().get_mut(self.cpu) {
+            *slot = CpuOn::On;
+        }
         for (i, &v) in cpu.x.iter().enumerate() {
             self.set_reg(HV_REG_X0 + i as u32, v)?;
         }
@@ -769,7 +789,8 @@ impl Vcpu for HvfVcpu {
                     // (injects a due tick) and resume in place — unless the VM is
                     // stopping, in which case surface so the thread can be joined.
                     // vGIC mode has no preemption thread; a cancel there is an idle.
-                    if self.shared.stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let ord = std::sync::atomic::Ordering::Relaxed;
+                    if self.shared.stop.load(ord) || self.shared.yield_now.load(ord) {
                         return Ok(VmExit::Idle);
                     }
                     if self.swgic.is_some() {

@@ -118,11 +118,6 @@ impl Vm {
     /// DTB is deferred to `run`, because its interrupt-controller node depends on
     /// the GIC the backend creates.
     pub fn prepare(cfg: &VmConfig, net: Option<Box<dyn crate::net::NetBackend>>) -> Result<Self> {
-        // Snapshots capture one vcpu's state; multi-vcpu snapshot/fork is a
-        // later milestone, so refuse the combination instead of mis-capturing.
-        if cfg.snapshot.is_some() && cfg.vcpus > 1 {
-            return Err(crate::Error::Snapshot("snapshot requires vcpus = 1 (for now)".into()));
-        }
         let mem = GuestMemory::new(layout::RAM_BASE, cfg.mem_size)?;
 
         let kernel = loader::load_kernel(&mem, &cfg.kernel)?;
@@ -195,7 +190,7 @@ impl Vm {
 
         Ok(Self {
             mem,
-            vcpus: 1, // snapshots are single-vcpu (see prepare)
+            vcpus: loaded.meta.vcpus.clamp(1, 8),
             bus: MmioBus::default(),
             pl011: Pl011::new(Box::new(std::io::stdout())),
             virtio,
@@ -374,6 +369,14 @@ impl Vm {
         // blocks on it until RESUME. Separate from the warm-pool startup gate above.
         let pause = (Mutex::new(false), std::sync::Condvar::new());
         let pause = &pause;
+        // Snapshot quiesce barrier (only armed for a multi-vcpu snapshot).
+        let snap_coord = SnapCoord {
+            want: AtomicBool::new(false),
+            states: Mutex::new(vec![None; vcpus.saturating_sub(1)]),
+            cv: std::sync::Condvar::new(),
+        };
+        let snap_coord = &snap_coord;
+        let restore = &restore;
         std::thread::scope(|s| {
             // Console reader: host stdin -> UART RX -> GIC line -> wake the vcpu.
             s.spawn(move || console_reader(hv, pl011, pl011_intid, running, vcpu_thread));
@@ -385,11 +388,14 @@ impl Vm {
             }
 
             // Secondary vcpus: one thread each, created on its own thread (the
-            // backend binds a vcpu to its creating thread). Each parks inside
-            // `Vcpu::run` until the guest PSCI-CPU_ONs it, then services its own
-            // exits against the shared devices.
+            // backend binds a vcpu to its creating thread). On a fresh boot each
+            // parks inside `Vcpu::run` until the guest PSCI-CPU_ONs it; on a
+            // restore it resumes from its captured state immediately.
             for id in 1..vcpus {
-                s.spawn(move || secondary_loop::<H>(hv, id as u8, pl011, pl011_intid, virtio, bus, running));
+                let init = restore.as_ref().and_then(|l| l.cpus.get(id - 1));
+                s.spawn(move || {
+                    secondary_loop::<H>(hv, id as u8, init, pl011, pl011_intid, virtio, bus, running, pause, snap_coord)
+                });
             }
 
             // Primary vcpu loop on this thread.
@@ -418,7 +424,28 @@ impl Vm {
                 // vcpus == 1 when a snapshot is armed.
                 if let Some(req) = snapshot {
                     if started.elapsed() >= req.after {
-                        let cpu = vcpu.capture()?;
+                        // Quiesce: every secondary must be out of guest execution
+                        // (registers self-captured, parked) before RAM is dumped.
+                        let mut cpus = vec![vcpu.capture()?];
+                        if vcpus > 1 {
+                            snap_coord.want.store(true, Ordering::Relaxed);
+                            hv.set_yield(true);
+                            let mut st = snap_coord.states.lock().unwrap();
+                            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                            while st.iter().any(|x| x.is_none()) {
+                                if std::time::Instant::now() > deadline {
+                                    return Err(crate::Error::Snapshot(
+                                        "vcpus did not quiesce for snapshot".into(),
+                                    ));
+                                }
+                                let (g, _) = snap_coord
+                                    .cv
+                                    .wait_timeout(st, std::time::Duration::from_millis(100))
+                                    .unwrap();
+                                st = g;
+                            }
+                            cpus.extend(st.iter().map(|x| x.clone().unwrap()));
+                        }
                         let gic = hv.capture_gic()?;
                         let gic_kind = hv.gic_info().map(|g| g.kind);
                         let v = virtio.lock().unwrap();
@@ -428,8 +455,8 @@ impl Vm {
                         };
                         let has_net = v.iter().any(|d| d.mmio.device_id() == 1);
                         drop(v);
-                        crate::snapshot::write(&req.dir, mem, &cpu, &gic, disk_path, gic_kind, &dev, has_net)?;
-                        log::info!("snapshot captured to {}", req.dir.display());
+                        crate::snapshot::write(&req.dir, mem, &cpus, &gic, disk_path, gic_kind, &dev, has_net)?;
+                        log::info!("snapshot captured to {} ({} vcpus)", req.dir.display(), cpus.len());
                         return Ok(false);
                     }
                 }
@@ -489,6 +516,16 @@ impl Vm {
     }
 }
 
+/// Multi-vcpu snapshot coordination: the primary raises `want`, every secondary
+/// captures its own registers at its next exit and parks; the primary proceeds
+/// once all slots are filled (the snapshot then stops the VM).
+struct SnapCoord {
+    want: AtomicBool,
+    /// states[i] = vcpu i+1's captured registers.
+    states: Mutex<Vec<Option<crate::snapshot::CpuSnapshot>>>,
+    cv: std::sync::Condvar,
+}
+
 /// Service one MMIO exit against the shared devices, from any vcpu thread, and
 /// step the vcpu past the faulting instruction (arm64 insns are 4 bytes and a
 /// syndrome-decodable access is one insn).
@@ -542,16 +579,21 @@ fn dispatch_mmio<H: Hypervisor>(
 }
 
 /// A secondary vcpu's whole life: create on this thread, park inside `run` until
-/// the guest PSCI-CPU_ONs it, then service exits against the shared devices.
-/// Any fault or shutdown from a secondary stops the VM.
+/// the guest PSCI-CPU_ONs it (or resume from `init` on a restore), then service
+/// exits against the shared devices, honoring the pause gate and the snapshot
+/// quiesce barrier. Any fault or shutdown from a secondary stops the VM.
+#[allow(clippy::too_many_arguments)]
 fn secondary_loop<H: Hypervisor>(
     hv: &H,
     id: u8,
+    init: Option<&crate::snapshot::CpuSnapshot>,
     pl011: &Mutex<Pl011>,
     pl011_intid: u32,
     virtio: &Mutex<Vec<VirtioDev>>,
     bus: &Mutex<MmioBus>,
     running: &AtomicBool,
+    pause: &(Mutex<bool>, std::sync::Condvar),
+    snap: &SnapCoord,
 ) {
     // Stopping from a secondary must also pull the primary out of guest
     // execution (it may be blocked inside its own `run`), hence request_stop.
@@ -567,7 +609,45 @@ fn secondary_loop<H: Hypervisor>(
             return;
         }
     };
+    if let Some(state) = init {
+        if let Err(e) = vcpu.restore(state) {
+            log::error!("vcpu{id}: restore failed: {e}");
+            stop();
+            return;
+        }
+    }
     while running.load(Ordering::Relaxed) {
+        // Snapshot quiesce: deposit this vcpu's registers and park; the VM stops
+        // once the capture is written, so this parks until shutdown.
+        if snap.want.load(Ordering::Relaxed) {
+            let mut st = snap.states.lock().unwrap();
+            if st[id as usize - 1].is_none() {
+                match vcpu.capture() {
+                    Ok(s) => st[id as usize - 1] = Some(s),
+                    Err(e) => {
+                        log::error!("vcpu{id}: capture failed: {e}");
+                        drop(st);
+                        stop();
+                        continue;
+                    }
+                }
+                snap.cv.notify_all();
+            }
+            let _ = snap
+                .cv
+                .wait_timeout(st, std::time::Duration::from_millis(100))
+                .unwrap();
+            continue;
+        }
+        // Live pause gate (same one the primary blocks on).
+        {
+            let (m, cv) = pause;
+            let mut p = m.lock().unwrap();
+            while *p && running.load(Ordering::Relaxed) {
+                let (g, _) = cv.wait_timeout(p, std::time::Duration::from_millis(100)).unwrap();
+                p = g;
+            }
+        }
         match vcpu.run() {
             Ok(VmExit::Mmio { access }) => {
                 if let Err(e) =
@@ -700,9 +780,15 @@ fn control_reader<H: Hypervisor>(
                     let _ = hv.set_irq(*intid, true);
                 }
             }
-            crate::control::PAUSE => *pause.0.lock().unwrap() = true,
+            crate::control::PAUSE => {
+                *pause.0.lock().unwrap() = true;
+                // Make compute-bound vcpus return to their loops and block on
+                // the gate (a vcpu that never exits would otherwise keep running).
+                hv.set_yield(true);
+            }
             crate::control::RESUME => {
                 *pause.0.lock().unwrap() = false;
+                hv.set_yield(false);
                 pause.1.notify_all();
             }
             _ => {}

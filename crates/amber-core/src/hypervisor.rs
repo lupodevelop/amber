@@ -48,6 +48,12 @@ pub trait Hypervisor: Sized {
     /// The run loop calls it once after the primary stops, so secondary vcpu
     /// threads blocked in guest execution return and can be joined.
     fn request_stop(&self) {}
+
+    /// While on, every vcpu returns from `run` (as Idle) at its next forced exit
+    /// instead of resuming in place — so the run loop's gates (snapshot quiesce,
+    /// pause) are observed even by compute-bound vcpus that never exit on their
+    /// own. Off restores normal resume-in-place behavior.
+    fn set_yield(&self, _on: bool) {}
 }
 
 pub trait Vcpu {
