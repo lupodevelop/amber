@@ -69,6 +69,12 @@ const MAX_TX_FRAME: usize = 64 * 1024;
 pub struct NetDevice {
     backend: Box<dyn NetBackend>,
     mac: [u8; 6],
+    /// Per-direction rate caps (`AMBER_NET_BPS`); None = unlimited. Transmit
+    /// blocks (backpressure in the notify); receive defers via `pending_rx`.
+    tx_limit: Option<crate::limiter::TokenBucket>,
+    rx_limit: Option<crate::limiter::TokenBucket>,
+    /// A received frame the rate cap deferred; retried on the next rx pump.
+    pending_rx: Option<Vec<u8>>,
 }
 
 impl NetDevice {
@@ -80,7 +86,13 @@ impl NetDevice {
 
     pub fn new(backend: Box<dyn NetBackend>) -> Self {
         let mac = backend.mac();
-        Self { backend, mac }
+        Self {
+            backend,
+            mac,
+            tx_limit: crate::limiter::TokenBucket::from_env("AMBER_NET_BPS"),
+            rx_limit: crate::limiter::TokenBucket::from_env("AMBER_NET_BPS"),
+            pending_rx: None,
+        }
     }
 }
 
@@ -113,7 +125,9 @@ impl VirtioDevice for NetDevice {
         Some(Self::RX)
     }
     fn wants_poll(&self) -> bool {
-        self.backend.wants_poll()
+        // A rate-deferred frame needs the loop to keep polling so it lands as
+        // soon as the bucket refills.
+        self.pending_rx.is_some() || self.backend.wants_poll()
     }
     fn handle(&mut self, queue: usize, ram: &GuestRam, bufs: &[Buf]) -> u32 {
         if queue == Self::TX {
@@ -130,6 +144,9 @@ impl VirtioDevice for NetDevice {
                 frame.extend_from_slice(&d);
             }
             if frame.len() > VIRTIO_NET_HDR_LEN {
+                if let Some(l) = &mut self.tx_limit {
+                    l.throttle((frame.len() - VIRTIO_NET_HDR_LEN) as u64);
+                }
                 self.backend.send(&frame[VIRTIO_NET_HDR_LEN..]);
             }
         }
@@ -137,7 +154,19 @@ impl VirtioDevice for NetDevice {
         0
     }
     fn poll_rx(&mut self) -> Option<Vec<u8>> {
-        let frame = self.backend.poll()?;
+        // A deferred frame goes first (ordering); otherwise pull from the backend.
+        let frame = match self.pending_rx.take() {
+            Some(f) => f,
+            None => self.backend.poll()?,
+        };
+        // Receive cap: never sleep on the rx pump (it runs on the vcpu loop) —
+        // stash the frame and deliver once the bucket refills.
+        if let Some(l) = &mut self.rx_limit {
+            if !l.try_take(frame.len() as u64) {
+                self.pending_rx = Some(frame);
+                return None;
+            }
+        }
         // Prepend a zeroed modern header with num_buffers = 1 (LE u16 at byte 10).
         let mut out = vec![0u8; VIRTIO_NET_HDR_LEN];
         out[10] = 1;
@@ -242,6 +271,39 @@ mod tests {
         assert_eq!(out.len(), VIRTIO_NET_HDR_LEN + 4);
         assert_eq!(out[10], 1); // num_buffers = 1
         assert_eq!(&out[VIRTIO_NET_HDR_LEN..], &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn tx_rate_cap_applies_backpressure() {
+        let be = RecBackend::default();
+        let sent = be.sent.clone();
+        let mut dev = NetDevice::new(Box::new(be));
+        let mut bucket = crate::limiter::TokenBucket::new(20 * 1024); // 20 KiB/s
+        assert!(bucket.try_take(20 * 1024)); // drain the burst
+        dev.tx_limit = Some(bucket);
+        let m = ram(0x2000);
+        let r = m.ram();
+        let len = VIRTIO_NET_HDR_LEN as u32 + 2048; // 2 KiB payload ≈ 100 ms debt
+        let bufs = vec![Buf { addr: DATA, len, writable: false }];
+        let t0 = std::time::Instant::now();
+        dev.handle(NetDevice::TX, &r, &bufs);
+        assert!(t0.elapsed() >= std::time::Duration::from_millis(60));
+        assert_eq!(sent.lock().unwrap().len(), 1); // throttled, not dropped
+    }
+
+    #[test]
+    fn rx_rate_cap_defers_not_drops() {
+        let be = RecBackend::default();
+        be.inq.lock().unwrap().push(vec![7u8; 64]);
+        let mut dev = NetDevice::new(Box::new(be));
+        let mut bucket = crate::limiter::TokenBucket::new(1024); // 1 KiB/s
+        assert!(bucket.try_take(1024)); // drain: 64 B need ~62 ms to refill
+        dev.rx_limit = Some(bucket);
+        assert!(dev.poll_rx().is_none()); // deferred...
+        assert!(dev.wants_poll()); // ...and the loop is told to keep polling
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let out = dev.poll_rx().expect("delivered after refill");
+        assert_eq!(&out[VIRTIO_NET_HDR_LEN..], &[7u8; 64]); // same frame, in order
     }
 
     #[test]

@@ -412,6 +412,8 @@ fn inject_one(ram: &GuestRam, q: &mut Queue, data: &[u8]) -> bool {
 pub struct BlkDevice {
     disk: File,
     capacity_sectors: u64,
+    /// Read-rate cap (`AMBER_DISK_BPS`); None = unlimited.
+    limit: Option<crate::limiter::TokenBucket>,
 }
 
 impl BlkDevice {
@@ -428,6 +430,7 @@ impl BlkDevice {
         Ok(Self {
             disk,
             capacity_sectors: bytes / SECTOR,
+            limit: crate::limiter::TokenBucket::from_env("AMBER_DISK_BPS"),
         })
     }
 
@@ -465,6 +468,13 @@ impl VirtioDevice for BlkDevice {
         let mut written = 0;
 
         if req_type == Self::T_IN {
+            // Rate cap: pay for the whole request up front. Blocking here is the
+            // backpressure — the guest is inside the notify and sees a slow disk.
+            if let Some(l) = &mut self.limit {
+                let total: u64 =
+                    bufs[1..status_idx].iter().filter(|b| b.writable).map(|b| b.len as u64).sum();
+                l.throttle(total);
+            }
             let mut offset = sector * SECTOR;
             for b in &bufs[1..status_idx] {
                 if !b.writable {
@@ -935,6 +945,25 @@ mod tests {
         r.read(DATA + 16, &mut data);
         assert!(data.iter().all(|&b| b == 0xAB));
         assert_eq!(r.read_u32(DATA + 16 + 512) & 0xff, 0); // VIRTIO_BLK_S_OK
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn blk_rate_cap_applies_backpressure() {
+        let path = tmp("blk-rate.img");
+        std::fs::write(&path, vec![0u8; 4096]).unwrap();
+        let mut blk = BlkDevice::open(&path).unwrap();
+        let mut bucket = crate::limiter::TokenBucket::new(20 * 1024); // 20 KiB/s
+        assert!(bucket.try_take(20 * 1024)); // drain: 2 KiB ≈ 100 ms debt
+        blk.limit = Some(bucket);
+        let m = ram();
+        let r = m.ram();
+        r.write_u32(DATA, BlkDevice::T_IN);
+        r.write(DATA + 8, &0u64.to_le_bytes());
+        let t0 = std::time::Instant::now();
+        let written = blk.handle(0, &r, &blk_chain(2048));
+        assert!(t0.elapsed() >= std::time::Duration::from_millis(60));
+        assert_eq!(written, 2048 + 1); // request completed in full
         std::fs::remove_file(&path).ok();
     }
 

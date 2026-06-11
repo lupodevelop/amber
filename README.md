@@ -211,6 +211,7 @@ ram_cap = "384MiB"      # guest RAM and the amount accounted against the budget
 | `AMBER_GIC` | `sw` (default) software GICv2; `hw` the in-kernel vGIC (faster boot, no working snapshot timer) |
 | `AMBER_NET` | `smoltcp` (default) userspace netstack; `none` no network; `capture` log tx frames |
 | `AMBER_PORTS` | inbound forwards, `hostport:guestport,...` |
+| `AMBER_DISK_BPS` / `AMBER_NET_BPS` | I/O rate caps in bytes/s (`K`/`M`/`G` suffix), token-bucket with 1 s burst; unset = unlimited |
 | `AMBER_SNAPSHOT` / `AMBER_SNAPSHOT_AFTER_MS` | capture a snapshot to a dir after N ms (default 2000), then stop |
 | `AMBER_TIME` | print a `build / prep / boot+run` latency breakdown |
 | `AMBER_VERBOSE` | restore the kernel boot dmesg (off by default — it ~doubles boot via char-per-vmexit) |

@@ -9,6 +9,7 @@
 pub mod bus;
 pub mod dtb;
 pub mod hypervisor;
+pub mod limiter;
 pub mod loader;
 pub mod lockdown;
 pub mod memory;
