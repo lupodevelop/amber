@@ -1,0 +1,18 @@
+[package]
+name = "amber-kvm"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# The KVM backend exists only on Linux. On other targets the crate compiles to
+# nothing (the impl is cfg-gated), so the workspace still builds on macOS — the
+# `amber` binary just doesn't depend on it there.
+[dependencies]
+amber-core.workspace = true
+log.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+kvm-ioctls = "0.19"
+kvm-bindings = "0.10"

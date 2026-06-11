@@ -80,6 +80,14 @@ pub trait Vcpu {
     /// blocks that thread and nothing async ever touches the hot path.
     fn run(&mut self) -> Result<VmExit>;
 
+    /// Deliver the value a device computed for the last MMIO read. HVF writes it
+    /// into the syndrome's transfer register; KVM into the exit's data buffer.
+    fn complete_mmio_read(&mut self, value: u64) -> Result<()>;
+
+    /// Advance past the faulting MMIO instruction. HVF steps PC by 4; KVM already
+    /// advanced it, so this is a no-op there.
+    fn advance_mmio(&mut self) -> Result<()>;
+
     /// Nanoseconds until the guest's virtual timer is next due, for the run loop
     /// to bound how long it parks on a WFI. `Some(0)` means already due, `None`
     /// means no armed timer (park until another event, e.g. console input).
@@ -115,17 +123,12 @@ pub enum VmExit {
 #[derive(Debug, Clone, Copy)]
 pub struct MmioAccess {
     pub ipa: u64,
-    pub op: MmioOp,
     /// Access width in bytes: 1, 2, 4, or 8.
     pub size: u8,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum MmioOp {
-    /// Guest read. The bus computes a value; the run loop writes it into `reg`.
-    Read { reg: u8 },
-    /// Guest write of `value` from register `reg`.
-    Write { reg: u8, value: u64 },
+    /// `Some(value)` for a guest write; `None` for a read (the device computes a
+    /// value, which the run loop hands back via [`Vcpu::complete_mmio_read`]).
+    /// Backend-neutral: the destination register is HVF-internal (KVM hides it).
+    pub write: Option<u64>,
 }
 
 /// ESR_EL2 data-abort decoding, shared by both backends. On a data abort the
@@ -136,7 +139,10 @@ pub enum MmioOp {
 /// ESR layout: EC = bits[31:26], ISS = bits[24:0].
 /// Data abort from a lower EL: EC == 0x24.
 /// ISS for a data abort: ISV[24], SAS[23:22], SSE[21], SRT[20:16], WnR[6].
-pub fn decode_data_abort(esr: u64, ipa: u64, get_x: impl Fn(u8) -> u64) -> Option<MmioAccess> {
+/// Returns the access plus the syndrome's transfer register (`srt`), which the
+/// HVF backend stashes to deliver a read result / source a write value. KVM does
+/// not use this path (its MMIO exit carries the data directly).
+pub fn decode_data_abort(esr: u64, ipa: u64, get_x: impl Fn(u8) -> u64) -> Option<(MmioAccess, u8)> {
     const EC_DATA_ABORT_LOWER_EL: u64 = 0x24;
     let ec = (esr >> 26) & 0x3f;
     if ec != EC_DATA_ABORT_LOWER_EL {
@@ -152,10 +158,6 @@ pub fn decode_data_abort(esr: u64, ipa: u64, get_x: impl Fn(u8) -> u64) -> Optio
     let srt = ((iss >> 16) & 0x1f) as u8;
     let wnr = (iss >> 6) & 1;
 
-    let op = if wnr == 1 {
-        MmioOp::Write { reg: srt, value: get_x(srt) }
-    } else {
-        MmioOp::Read { reg: srt }
-    };
-    Some(MmioAccess { ipa, op, size })
+    let write = if wnr == 1 { Some(get_x(srt)) } else { None };
+    Some((MmioAccess { ipa, size, write }, srt))
 }

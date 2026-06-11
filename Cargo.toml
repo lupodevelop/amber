@@ -1,14 +1,14 @@
 [workspace]
 resolver = "2"
-members = ["crates/amber-core", "crates/amber-hvf", "crates/amber-image", "crates/amber-net", "crates/amber"]
+members = ["crates/amber-core", "crates/amber-hvf", "crates/amber-kvm", "crates/amber-image", "crates/amber-net", "crates/amber"]
 
 [workspace.package]
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/USER/amber"
 
-# arm64 only, for now. The HVF backend links only on macOS; the KVM backend
-# (amber-kvm) is M8 and not in this workspace yet.
+# arm64 only. The HVF backend links only on macOS; the KVM backend (amber-kvm)
+# only on Linux. Each is a per-target dependency of the `amber` binary.
 [workspace.dependencies]
 libc = "0.2"
 vm-fdt = "0.3"
@@ -16,5 +16,6 @@ log = "0.4"
 env_logger = "0.11"
 amber-core = { path = "crates/amber-core" }
 amber-hvf = { path = "crates/amber-hvf" }
+amber-kvm = { path = "crates/amber-kvm" }
 amber-image = { path = "crates/amber-image" }
 amber-net = { path = "crates/amber-net" }

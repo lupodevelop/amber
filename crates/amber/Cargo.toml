@@ -25,7 +25,10 @@ serde_json = "1"
 # runtime with AMBER_GIC=sw. Build: `cargo build -p amber --features swgic`.
 swgic = ["amber-hvf/swgic"]
 
-# The HVF backend is linked into the binary only on macOS arm64. main.rs already
-# cfg-gates the call site, so off-target the binary builds without it.
+# Each backend links only on its host. main.rs cfg-gates the call sites, so the
+# binary builds with whichever backend fits the target (or neither, off-arch).
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
 amber-hvf.workspace = true
+
+[target.'cfg(all(target_os = "linux", target_arch = "aarch64"))'.dependencies]
+amber-kvm.workspace = true

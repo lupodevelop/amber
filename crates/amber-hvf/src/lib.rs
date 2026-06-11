@@ -6,7 +6,7 @@ mod ffi;
 mod gicv2;
 mod sysregs;
 
-use amber_core::hypervisor::{decode_data_abort, Hypervisor, MmioAccess, MmioOp, Vcpu, VmExit};
+use amber_core::hypervisor::{decode_data_abort, Hypervisor, MmioAccess, Vcpu, VmExit};
 use amber_core::snapshot::CpuSnapshot;
 use amber_core::{Error, GicInfo, GicKind, GuestMemory, Result};
 use ffi::*;
@@ -144,6 +144,7 @@ impl Hypervisor for HvfVm {
             exit,
             cpu: id as usize,
             started: id == 0,
+            pending_read_reg: 31,
             swgic: self.swgic.clone(),
             shared: self.shared.clone(),
             vtimer_masked: false,
@@ -321,6 +322,9 @@ pub struct HvfVcpu {
     cpu: usize,
     /// False for a secondary that has not been PSCI-CPU_ON'd yet; `run` parks it.
     started: bool,
+    /// Transfer register of the MMIO read currently being serviced by the run
+    /// loop; `complete_mmio_read` writes the device value here.
+    pending_read_reg: u8,
     /// Shared software GICv2 in `swgic` mode (None for the in-kernel vGIC).
     swgic: Option<Arc<Mutex<GicV2>>>,
     shared: Arc<VmShared>,
@@ -380,7 +384,7 @@ impl HvfVcpu {
     /// Service a GICD/GICC MMIO access against the software GIC. Returns true if the
     /// address was in the GIC (caller steps PC and resumes); false otherwise (or in
     /// vGIC mode), so the access falls through to the run loop's device model.
-    fn swgic_mmio(&mut self, access: &MmioAccess) -> Result<bool> {
+    fn swgic_mmio(&mut self, access: &MmioAccess, reg: u8) -> Result<bool> {
         let Some(gic) = self.swgic.clone() else { return Ok(false) };
         use amber_core::layout::{GIC_CPU_BASE, GIC_CPU_SIZE, GIC_DIST_BASE, GIC_DIST_SIZE};
         let ipa = access.ipa;
@@ -392,8 +396,8 @@ impl HvfVcpu {
             return Ok(false);
         };
         let mut g = gic.lock().unwrap();
-        match access.op {
-            MmioOp::Read { reg } => {
+        match access.write {
+            None => {
                 let v = if is_cpu {
                     g.cpu_read(self.cpu, off, access.size)
                 } else {
@@ -404,7 +408,7 @@ impl HvfVcpu {
                     self.set_x(reg, v)?;
                 }
             }
-            MmioOp::Write { value, .. } => {
+            Some(value) => {
                 if is_cpu {
                     g.cpu_write(self.cpu, off, access.size, value);
                 } else {
@@ -469,6 +473,20 @@ impl Vcpu for HvfVcpu {
     }
     fn set_pc(&mut self, pc: u64) -> Result<()> {
         self.set_reg(HV_REG_PC, pc)
+    }
+
+    fn complete_mmio_read(&mut self, value: u64) -> Result<()> {
+        // x31 as the transfer register means "discard" (the zero register).
+        if self.pending_read_reg != 31 {
+            self.set_x(self.pending_read_reg, value)?;
+        }
+        Ok(())
+    }
+
+    fn advance_mmio(&mut self) -> Result<()> {
+        // ELR points at the faulting load/store; arm64 instructions are 4 bytes.
+        let pc = self.pc()?;
+        self.set_pc(pc + 4)
     }
 
     #[allow(deprecated)] // libc's mach_* are fine here; mach2 is the only alternative
@@ -761,15 +779,17 @@ impl Vcpu for HvfVcpu {
                     }
 
                     let get = |i: u8| self.get_x(i).unwrap_or(0);
-                    if let Some(access) = decode_data_abort(esr, ipa, get) {
+                    if let Some((access, reg)) = decode_data_abort(esr, ipa, get) {
                         // GICD/GICC accesses are handled in-process by the software
                         // GIC and resumed; everything else is a device the run loop
-                        // models, so surface it.
-                        if self.swgic_mmio(&access)? {
+                        // models, so surface it (stashing the transfer register so a
+                        // read result lands in the right place via complete_mmio_read).
+                        if self.swgic_mmio(&access, reg)? {
                             let pc = self.pc()?;
                             self.set_pc(pc + 4)?;
                             continue;
                         }
+                        self.pending_read_reg = reg;
                         return Ok(VmExit::Mmio { access });
                     }
                     let pc = self.pc().unwrap_or(0);

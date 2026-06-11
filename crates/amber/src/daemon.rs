@@ -486,11 +486,29 @@ pub fn serve() -> io::Result<()> {
 }
 
 /// Reject any peer whose effective uid is not ours: the socket runs arbitrary
-/// images, so only the owner may drive it.
+/// images, so only the owner may drive it. The peer-uid syscall differs per OS
+/// (macOS `getpeereid`, Linux `SO_PEERCRED`).
+#[cfg(target_os = "macos")]
 fn authorized(stream: &UnixStream) -> bool {
     let (mut uid, mut gid) = (0u32, 0u32);
     let ok = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } == 0;
     ok && uid == unsafe { libc::geteuid() }
+}
+
+#[cfg(target_os = "linux")]
+fn authorized(stream: &UnixStream) -> bool {
+    let mut cred = libc::ucred { pid: 0, uid: 0, gid: 0 };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let ok = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut cred as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    } == 0;
+    ok && cred.uid == unsafe { libc::geteuid() }
 }
 
 fn handle(

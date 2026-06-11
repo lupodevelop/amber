@@ -14,3 +14,4 @@
 /kernel/System.map
 /kernel/resin-subtract.config
 /kernel/resin-effective.config
+/target-linux

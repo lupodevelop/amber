@@ -239,9 +239,13 @@ crates/
   amber        CLI + amberd control plane (run/exec/template/fork/ps/budget/...)
 ```
 
-The `Hypervisor`/`Vcpu` traits are the seam: a KVM backend (arm64 Linux) is a
-third crate implementing them. amberd is a supervisor — one `amber __vm` child per
-VM — because HVF is one-VM-per-process; that is also the per-sandbox isolation.
+The `Hypervisor`/`Vcpu` traits are the seam, and there are two backends behind
+it: `amber-hvf` (Apple HVF, macOS) and `amber-kvm` (Linux/KVM, via the rust-vmm
+`kvm-ioctls` crate). Each links only on its host; `amber-core` names neither. On
+KVM the interrupt controller (in-kernel vGICv3), the arch timer, and PSCI are the
+kernel's, so that backend is thin — no software GIC, no timer-preemption thread.
+amberd is a supervisor — one `amber __vm` child per VM — because HVF is
+one-VM-per-process; that is also the per-sandbox isolation.
 
 Each VM process additionally **locks itself down** before the first guest
 instruction: everything it needs is already open (guest RAM, disk fd, control
@@ -254,9 +258,11 @@ that can't spawn, drop files, or phone home.
 
 ## Limitations & roadmap
 
-- **macOS only** today; a KVM backend (arm64 Linux) — needs the hardware to
-  build and test. On KVM the in-kernel vGIC has a complete save/restore surface, so
-  the software GIC becomes optional there.
+- **macOS/HVF and Linux/KVM**, arm64. The KVM backend boots resin and runs; it is
+  tested hardware-free with `scripts/kvm-test.sh` (QEMU emulates EL2 under TCG, a
+  KVM-host Linux boots, and amber-kvm boots resin inside it). Snapshot/SMP under
+  KVM are not wired yet (the in-kernel vGIC has a complete save/restore surface,
+  so they are straightforward to add).
 - The kernel is amber's own (resin), but busybox/musl are still borrowed Alpine
   artifacts and `assets/` ships separately; bundling everything into the amber
   binary ("single binary") is future work.

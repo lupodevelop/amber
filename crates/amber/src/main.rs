@@ -1077,9 +1077,18 @@ fn run(vm: Vm) -> amber_core::Result<()> {
     vm.run::<amber_hvf::HvfVm>()
 }
 
-#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+fn run(vm: Vm) -> amber_core::Result<()> {
+    log::info!("booting on KVM");
+    vm.run::<amber_kvm::KvmVm>()
+}
+
+#[cfg(not(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(target_os = "linux", target_arch = "aarch64")
+)))]
 fn run(_vm: Vm) -> amber_core::Result<()> {
     Err(amber_core::Error::Backend(
-        "no hypervisor backend on this target; amber-hvf needs macOS arm64, amber-kvm is M8".into(),
+        "no hypervisor backend: amber needs macOS+HVF or Linux+KVM on arm64".into(),
     ))
 }

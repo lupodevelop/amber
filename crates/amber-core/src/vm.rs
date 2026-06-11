@@ -3,7 +3,7 @@
 //! it names no hypervisor, only the `Hypervisor`/`Vcpu` traits.
 
 use crate::bus::{MmioBus, Pl011};
-use crate::hypervisor::{Hypervisor, MmioAccess, MmioOp, Vcpu, VmExit};
+use crate::hypervisor::{Hypervisor, MmioAccess, Vcpu, VmExit};
 use crate::virtio::{BalloonDevice, BalloonHandle, BlkDevice, RngDevice, VirtioDevice, VirtioMmio};
 use crate::{dtb, layout, loader, GuestMemory, Result};
 use std::os::fd::RawFd;
@@ -555,9 +555,9 @@ struct SnapCoord {
     cv: std::sync::Condvar,
 }
 
-/// Service one MMIO exit against the shared devices, from any vcpu thread, and
-/// step the vcpu past the faulting instruction (arm64 insns are 4 bytes and a
-/// syndrome-decodable access is one insn).
+/// Service one MMIO exit against the shared devices, from any vcpu thread.
+/// Backend-neutral: a read's value goes back via `complete_mmio_read`, and
+/// `advance_mmio` steps past the instruction (HVF) or no-ops (KVM auto-advances).
 fn dispatch_mmio<H: Hypervisor>(
     hv: &H,
     vcpu: &mut H::Vcpu,
@@ -572,39 +572,35 @@ fn dispatch_mmio<H: Hypervisor>(
     let ipa = access.ipa;
     if ipa >= pl011_lo && ipa < pl011_hi {
         let off = ipa - pl011_lo;
-        match access.op {
-            MmioOp::Write { value, .. } => {
-                pl011.lock().unwrap().write(off, access.size, value);
-            }
-            MmioOp::Read { reg } => {
+        match access.write {
+            Some(value) => pl011.lock().unwrap().write(off, access.size, value),
+            None => {
                 let v = pl011.lock().unwrap().read(off, access.size);
-                vcpu.set_x(reg, v)?;
+                vcpu.complete_mmio_read(v)?;
             }
         }
         let lvl = pl011.lock().unwrap().irq_level();
         hv.set_irq(pl011_intid, lvl)?;
     } else if let Some(d) = virtio.lock().unwrap().iter_mut().find(|d| d.contains(ipa)) {
         let off = ipa - d.base;
-        match access.op {
-            MmioOp::Write { value, .. } => d.mmio.write(off, access.size, value),
-            MmioOp::Read { reg } => {
+        match access.write {
+            Some(value) => d.mmio.write(off, access.size, value),
+            None => {
                 let v = d.mmio.read(off, access.size);
-                vcpu.set_x(reg, v)?;
+                vcpu.complete_mmio_read(v)?;
             }
         }
         hv.set_irq(d.intid, d.mmio.irq_level())?;
     } else {
-        match access.op {
-            MmioOp::Write { value, .. } => bus.lock().unwrap().write(ipa, access.size, value),
-            MmioOp::Read { reg } => {
+        match access.write {
+            Some(value) => bus.lock().unwrap().write(ipa, access.size, value),
+            None => {
                 let v = bus.lock().unwrap().read(ipa, access.size);
-                vcpu.set_x(reg, v)?;
+                vcpu.complete_mmio_read(v)?;
             }
         }
     }
-    let pc = vcpu.pc()?;
-    vcpu.set_pc(pc + 4)?;
-    Ok(())
+    vcpu.advance_mmio()
 }
 
 /// A secondary vcpu's whole life: create on this thread, park inside `run` until
