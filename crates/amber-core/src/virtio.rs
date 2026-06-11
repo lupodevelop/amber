@@ -70,8 +70,9 @@ pub struct Buf {
     pub writable: bool,
 }
 
-/// The device-specific half of a virtio-mmio device.
-pub trait VirtioDevice {
+/// The device-specific half of a virtio-mmio device. `Send` because the device
+/// set lives behind a Mutex shared with the secondary-vcpu threads.
+pub trait VirtioDevice: Send {
     fn device_id(&self) -> u32;
     /// Device-type feature bits for 32-bit selector word `sel` (0 = low).
     fn device_features(&self, _sel: u32) -> u32 {
@@ -642,10 +643,10 @@ impl VirtioDevice for BalloonDevice {
 mod tests {
     use super::*;
     use crate::memory::GuestMemory;
-    use std::cell::RefCell;
-    use std::rc::Rc;
+
+
     use std::sync::atomic::{AtomicBool, AtomicU64};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     const BASE: u64 = 0x4000_0000;
     const RAMSZ: usize = 0x4_0000; // 256 KiB
@@ -683,6 +684,7 @@ mod tests {
     type Chain = Vec<(u64, u32, bool)>;
 
     /// A device that records every chain it is handed and reports a fixed length.
+    /// (Arc/Mutex, not Rc/RefCell: VirtioDevice is Send.)
     #[derive(Default)]
     struct RecState {
         calls: Vec<(usize, Chain)>,
@@ -690,11 +692,11 @@ mod tests {
     struct Rec {
         id: u32,
         nq: usize,
-        st: Rc<RefCell<RecState>>,
+        st: Arc<Mutex<RecState>>,
         written: u32,
     }
-    fn rec(id: u32, nq: usize, written: u32) -> (Box<Rec>, Rc<RefCell<RecState>>) {
-        let st = Rc::new(RefCell::new(RecState::default()));
+    fn rec(id: u32, nq: usize, written: u32) -> (Box<Rec>, Arc<Mutex<RecState>>) {
+        let st = Arc::new(Mutex::new(RecState::default()));
         (Box::new(Rec { id, nq, st: st.clone(), written }), st)
     }
     impl VirtioDevice for Rec {
@@ -706,7 +708,7 @@ mod tests {
         }
         fn handle(&mut self, queue: usize, _ram: &GuestRam, bufs: &[Buf]) -> u32 {
             let row = bufs.iter().map(|b| (b.addr, b.len, b.writable)).collect();
-            self.st.borrow_mut().calls.push((queue, row));
+            self.st.lock().unwrap().calls.push((queue, row));
             self.written
         }
     }
@@ -818,7 +820,7 @@ mod tests {
         avail_set(&r, 0, 0, 1);
         mmio.write(QUEUE_NOTIFY, 4, 0);
 
-        let calls = &st.borrow().calls;
+        let calls = &st.lock().unwrap().calls;
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, 0);
         assert_eq!(calls[0].1, vec![(DATA, 64, true)]);
@@ -840,7 +842,7 @@ mod tests {
         }
         r.write_u16(AVAIL + 2, 60000); // hostile available index
         mmio.write(QUEUE_NOTIFY, 4, 0);
-        assert_eq!(st.borrow().calls.len(), 4); // capped at qsz, not 60000
+        assert_eq!(st.lock().unwrap().calls.len(), 4); // capped at qsz, not 60000
     }
 
     #[test]
@@ -855,7 +857,7 @@ mod tests {
         put_desc(&r, 0, DATA, 8, 0, 0);
         avail_set(&r, 0, 0, 1);
         mmio.write(QUEUE_NOTIFY, 4, 0);
-        assert!(st.borrow().calls.is_empty());
+        assert!(st.lock().unwrap().calls.is_empty());
     }
 
     #[test]

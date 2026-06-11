@@ -3,7 +3,7 @@
 //! it names no hypervisor, only the `Hypervisor`/`Vcpu` traits.
 
 use crate::bus::{MmioBus, Pl011};
-use crate::hypervisor::{Hypervisor, MmioOp, Vcpu, VmExit};
+use crate::hypervisor::{Hypervisor, MmioAccess, MmioOp, Vcpu, VmExit};
 use crate::virtio::{BalloonDevice, BalloonHandle, BlkDevice, RngDevice, VirtioDevice, VirtioMmio};
 use crate::{dtb, layout, loader, GuestMemory, Result};
 use std::os::fd::RawFd;
@@ -47,6 +47,8 @@ fn push_balloon(virtio: &mut Vec<VirtioDev>) -> (BalloonHandle, u32) {
 
 pub struct VmConfig {
     pub mem_size: usize,
+    /// Guest CPUs. Secondaries boot via PSCI CPU_ON, one host thread each.
+    pub vcpus: usize,
     pub kernel: Vec<u8>,
     pub initrd: Option<Vec<u8>>,
     pub cmdline: String,
@@ -70,6 +72,7 @@ impl Default for VmConfig {
     fn default() -> Self {
         Self {
             mem_size: 512 * 1024 * 1024,
+            vcpus: 1,
             kernel: Vec::new(),
             initrd: None,
             // console=ttyAMA0 is the real tty (app output, interactive). `quiet`
@@ -87,6 +90,7 @@ impl Default for VmConfig {
 
 pub struct Vm {
     mem: GuestMemory,
+    vcpus: usize,
     bus: MmioBus,
     pl011: Pl011,
     virtio: Vec<VirtioDev>,
@@ -114,6 +118,11 @@ impl Vm {
     /// DTB is deferred to `run`, because its interrupt-controller node depends on
     /// the GIC the backend creates.
     pub fn prepare(cfg: &VmConfig, net: Option<Box<dyn crate::net::NetBackend>>) -> Result<Self> {
+        // Snapshots capture one vcpu's state; multi-vcpu snapshot/fork is a
+        // later milestone, so refuse the combination instead of mis-capturing.
+        if cfg.snapshot.is_some() && cfg.vcpus > 1 {
+            return Err(crate::Error::Snapshot("snapshot requires vcpus = 1 (for now)".into()));
+        }
         let mem = GuestMemory::new(layout::RAM_BASE, cfg.mem_size)?;
 
         let kernel = loader::load_kernel(&mem, &cfg.kernel)?;
@@ -138,6 +147,7 @@ impl Vm {
 
         Ok(Self {
             mem,
+            vcpus: cfg.vcpus.clamp(1, 8),
             bus: MmioBus::default(),
             pl011: Pl011::new(Box::new(std::io::stdout())),
             virtio,
@@ -185,6 +195,7 @@ impl Vm {
 
         Ok(Self {
             mem,
+            vcpus: 1, // snapshots are single-vcpu (see prepare)
             bus: MmioBus::default(),
             pl011: Pl011::new(Box::new(std::io::stdout())),
             virtio,
@@ -226,7 +237,8 @@ impl Vm {
     pub fn run<H: Hypervisor + Sync>(self) -> Result<()> {
         let Vm {
             mem,
-            mut bus,
+            vcpus,
+            bus,
             mut pl011,
             mut virtio,
             balloon,
@@ -242,7 +254,7 @@ impl Vm {
             initrd,
         } = self;
 
-        let mut hv = H::create(&mem)?;
+        let hv = H::create(&mem, vcpus)?;
 
         // Give each device its view of guest RAM (it reads rings/buffers).
         for d in &mut virtio {
@@ -290,6 +302,7 @@ impl Vm {
                 .collect();
             let blob = dtb::build(&dtb::DtbParams {
                 mem_size,
+                vcpus,
                 cmdline: &cmdline,
                 initrd,
                 gic: hv.gic_info(),
@@ -333,14 +346,19 @@ impl Vm {
             }
         }
 
-        let pl011_lo = layout::PL011_BASE;
-        let pl011_hi = layout::PL011_BASE + layout::PL011_SIZE;
         let pl011_intid = layout::GIC_SPI_BASE + layout::PL011_SPI;
 
+        // Shared device model: secondary vcpus take MMIO exits on their own
+        // threads, so every device sits behind a Mutex. MMIO is rare relative to
+        // guest execution; contention is not a hot path.
         let pl011 = Mutex::new(pl011);
+        let virtio = Mutex::new(virtio);
+        let bus = Mutex::new(bus);
         let running = AtomicBool::new(true);
         let hv = &hv;
         let pl011 = &pl011;
+        let virtio = &virtio;
+        let bus = &bus;
         let running = &running;
         let mem = &mem;
         let snapshot = snapshot.as_ref();
@@ -366,7 +384,15 @@ impl Vm {
                 s.spawn(move || control_reader(hv, fd, balloon, running, pause));
             }
 
-            // vcpu loop on this thread.
+            // Secondary vcpus: one thread each, created on its own thread (the
+            // backend binds a vcpu to its creating thread). Each parks inside
+            // `Vcpu::run` until the guest PSCI-CPU_ONs it, then services its own
+            // exits against the shared devices.
+            for id in 1..vcpus {
+                s.spawn(move || secondary_loop::<H>(hv, id as u8, pl011, pl011_intid, virtio, bus, running));
+            }
+
+            // Primary vcpu loop on this thread.
             let mut step = || -> Result<bool> {
                 // Live pause: block the vcpu here while paused (the control reader
                 // flips the flag and notifies). Guest RAM and registers stay put.
@@ -380,7 +406,7 @@ impl Vm {
 
                 // Deliver any frames that arrived from the network backend into the
                 // guest's receive queue and raise the device interrupt.
-                for d in virtio.iter_mut() {
+                for d in virtio.lock().unwrap().iter_mut() {
                     if d.mmio.pump_rx() {
                         hv.set_irq(d.intid, d.mmio.irq_level())?;
                     }
@@ -388,17 +414,20 @@ impl Vm {
 
                 // Snapshot point: the guest is stopped between runs, so its RAM
                 // and registers are consistent. Capture once the deadline passes,
-                // then stop (restore is a separate path).
+                // then stop (restore is a separate path). prepare() guarantees
+                // vcpus == 1 when a snapshot is armed.
                 if let Some(req) = snapshot {
                     if started.elapsed() >= req.after {
                         let cpu = vcpu.capture()?;
                         let gic = hv.capture_gic()?;
                         let gic_kind = hv.gic_info().map(|g| g.kind);
+                        let v = virtio.lock().unwrap();
                         let dev = crate::snapshot::DevState {
                             pl011: pl011.lock().unwrap().regs().to_vec(),
-                            virtio: virtio.iter().map(|d| d.mmio.capture()).collect(),
+                            virtio: v.iter().map(|d| d.mmio.capture()).collect(),
                         };
-                        let has_net = virtio.iter().any(|d| d.mmio.device_id() == 1);
+                        let has_net = v.iter().any(|d| d.mmio.device_id() == 1);
+                        drop(v);
                         crate::snapshot::write(&req.dir, mem, &cpu, &gic, disk_path, gic_kind, &dev, has_net)?;
                         log::info!("snapshot captured to {}", req.dir.display());
                         return Ok(false);
@@ -406,43 +435,7 @@ impl Vm {
                 }
                 match vcpu.run()? {
                     VmExit::Mmio { access } => {
-                        let ipa = access.ipa;
-                        if ipa >= pl011_lo && ipa < pl011_hi {
-                            let off = ipa - pl011_lo;
-                            match access.op {
-                                MmioOp::Write { value, .. } => {
-                                    pl011.lock().unwrap().write(off, access.size, value);
-                                }
-                                MmioOp::Read { reg } => {
-                                    let v = pl011.lock().unwrap().read(off, access.size);
-                                    vcpu.set_x(reg, v)?;
-                                }
-                            }
-                            let lvl = pl011.lock().unwrap().irq_level();
-                            hv.set_irq(pl011_intid, lvl)?;
-                        } else if let Some(d) = virtio.iter_mut().find(|d| d.contains(ipa)) {
-                            let off = ipa - d.base;
-                            match access.op {
-                                MmioOp::Write { value, .. } => d.mmio.write(off, access.size, value),
-                                MmioOp::Read { reg } => {
-                                    let v = d.mmio.read(off, access.size);
-                                    vcpu.set_x(reg, v)?;
-                                }
-                            }
-                            hv.set_irq(d.intid, d.mmio.irq_level())?;
-                        } else {
-                            match access.op {
-                                MmioOp::Write { value, .. } => bus.write(ipa, access.size, value),
-                                MmioOp::Read { reg } => {
-                                    let v = bus.read(ipa, access.size);
-                                    vcpu.set_x(reg, v)?;
-                                }
-                            }
-                        }
-                        // Step past the faulting load/store: arm64 instructions
-                        // are 4 bytes, and a syndrome-decodable access is one insn.
-                        let pc = vcpu.pc()?;
-                        vcpu.set_pc(pc + 4)?;
+                        dispatch_mmio::<H>(hv, &mut vcpu, &access, pl011, pl011_intid, virtio, bus)?;
                         Ok(true)
                     }
                     // On a fresh boot the in-kernel vGIC handles WFI internally and
@@ -455,7 +448,7 @@ impl Vm {
                         // Cap the park hard when a device (the network backend) is
                         // awaiting async host-side replies, so they reach the guest
                         // in ~ms; otherwise park until the timer is due (50 ms cap).
-                        let cap = if virtio.iter().any(|d| d.mmio.wants_poll()) {
+                        let cap = if virtio.lock().unwrap().iter().any(|d| d.mmio.wants_poll()) {
                             1_000_000
                         } else {
                             50_000_000
@@ -478,7 +471,7 @@ impl Vm {
             };
 
             let mut result = Ok(());
-            loop {
+            while running.load(Ordering::Relaxed) {
                 match step() {
                     Ok(true) => continue,
                     Ok(false) => break,
@@ -488,10 +481,128 @@ impl Vm {
                     }
                 }
             }
-            // Let the reader thread exit so the scope can join it.
+            // Let the reader and secondary-vcpu threads exit so the scope joins.
             running.store(false, Ordering::Relaxed);
+            hv.request_stop();
             result
         })
+    }
+}
+
+/// Service one MMIO exit against the shared devices, from any vcpu thread, and
+/// step the vcpu past the faulting instruction (arm64 insns are 4 bytes and a
+/// syndrome-decodable access is one insn).
+fn dispatch_mmio<H: Hypervisor>(
+    hv: &H,
+    vcpu: &mut H::Vcpu,
+    access: &MmioAccess,
+    pl011: &Mutex<Pl011>,
+    pl011_intid: u32,
+    virtio: &Mutex<Vec<VirtioDev>>,
+    bus: &Mutex<MmioBus>,
+) -> Result<()> {
+    let pl011_lo = layout::PL011_BASE;
+    let pl011_hi = layout::PL011_BASE + layout::PL011_SIZE;
+    let ipa = access.ipa;
+    if ipa >= pl011_lo && ipa < pl011_hi {
+        let off = ipa - pl011_lo;
+        match access.op {
+            MmioOp::Write { value, .. } => {
+                pl011.lock().unwrap().write(off, access.size, value);
+            }
+            MmioOp::Read { reg } => {
+                let v = pl011.lock().unwrap().read(off, access.size);
+                vcpu.set_x(reg, v)?;
+            }
+        }
+        let lvl = pl011.lock().unwrap().irq_level();
+        hv.set_irq(pl011_intid, lvl)?;
+    } else if let Some(d) = virtio.lock().unwrap().iter_mut().find(|d| d.contains(ipa)) {
+        let off = ipa - d.base;
+        match access.op {
+            MmioOp::Write { value, .. } => d.mmio.write(off, access.size, value),
+            MmioOp::Read { reg } => {
+                let v = d.mmio.read(off, access.size);
+                vcpu.set_x(reg, v)?;
+            }
+        }
+        hv.set_irq(d.intid, d.mmio.irq_level())?;
+    } else {
+        match access.op {
+            MmioOp::Write { value, .. } => bus.lock().unwrap().write(ipa, access.size, value),
+            MmioOp::Read { reg } => {
+                let v = bus.lock().unwrap().read(ipa, access.size);
+                vcpu.set_x(reg, v)?;
+            }
+        }
+    }
+    let pc = vcpu.pc()?;
+    vcpu.set_pc(pc + 4)?;
+    Ok(())
+}
+
+/// A secondary vcpu's whole life: create on this thread, park inside `run` until
+/// the guest PSCI-CPU_ONs it, then service exits against the shared devices.
+/// Any fault or shutdown from a secondary stops the VM.
+fn secondary_loop<H: Hypervisor>(
+    hv: &H,
+    id: u8,
+    pl011: &Mutex<Pl011>,
+    pl011_intid: u32,
+    virtio: &Mutex<Vec<VirtioDev>>,
+    bus: &Mutex<MmioBus>,
+    running: &AtomicBool,
+) {
+    // Stopping from a secondary must also pull the primary out of guest
+    // execution (it may be blocked inside its own `run`), hence request_stop.
+    let stop = || {
+        running.store(false, Ordering::Relaxed);
+        hv.request_stop();
+    };
+    let mut vcpu = match hv.create_vcpu(id) {
+        Ok(v) => v,
+        Err(e) => {
+            log::error!("vcpu{id}: create failed: {e}");
+            stop();
+            return;
+        }
+    };
+    while running.load(Ordering::Relaxed) {
+        match vcpu.run() {
+            Ok(VmExit::Mmio { access }) => {
+                if let Err(e) =
+                    dispatch_mmio::<H>(hv, &mut vcpu, &access, pl011, pl011_intid, virtio, bus)
+                {
+                    log::error!("vcpu{id}: mmio: {e}");
+                    stop();
+                }
+            }
+            // WFI (or a not-yet-started park timeout): wait out the timer, with a
+            // tight cap — an IPI posted to this parked CPU is only noticed on
+            // wake, so the cap bounds rescheduling latency (the cost: ~500
+            // wakeups/s per idle secondary).
+            Ok(VmExit::Idle) => {
+                let ns = match vcpu.pending_timer_ns() {
+                    Ok(Some(n)) => n.min(2_000_000),
+                    _ => 2_000_000,
+                };
+                if ns > 0 {
+                    std::thread::park_timeout(std::time::Duration::from_nanos(ns));
+                }
+            }
+            Ok(VmExit::Shutdown) => {
+                log::info!("vcpu{id}: guest requested shutdown");
+                stop();
+            }
+            Ok(VmExit::Fault { pc, esr, ipa }) => {
+                log::error!("vcpu{id}: fault pc={pc:#x} esr={esr:#x} ipa={ipa:#x}");
+                stop();
+            }
+            Err(e) => {
+                log::error!("vcpu{id}: {e}");
+                stop();
+            }
+        }
     }
 }
 

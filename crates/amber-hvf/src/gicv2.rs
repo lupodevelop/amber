@@ -127,6 +127,7 @@ impl Default for GicV2 {
 }
 
 impl GicV2 {
+    #[allow(dead_code)] // single-cpu convenience (tests; with_cpus is the real entry)
     pub fn new() -> Self {
         Self::default()
     }

@@ -16,6 +16,9 @@ const GIC_PHANDLE: u32 = 1;
 
 pub struct DtbParams<'a> {
     pub mem_size: u64,
+    /// Guest CPUs; every node gets `enable-method = "psci"` (CPU_ON boots the
+    /// secondaries).
+    pub vcpus: usize,
     pub cmdline: &'a str,
     pub initrd: Option<(u64, u64)>,
     /// The backend's GIC, if it created one. Some -> a functional GICv3 node;
@@ -57,16 +60,19 @@ pub fn build(p: &DtbParams) -> Result<Vec<u8>> {
     fdt.property_array_u64("reg", &[layout::RAM_BASE, p.mem_size]).map_err(fdt_err)?;
     fdt.end_node(mem).map_err(fdt_err)?;
 
-    // /cpus
+    // /cpus: one node per vcpu; `reg` is the MPIDR affinity the backend gives
+    // each vcpu, which is how PSCI CPU_ON names its target.
     let cpus = fdt.begin_node("cpus").map_err(fdt_err)?;
     fdt.property_u32("#address-cells", 1).map_err(fdt_err)?;
     fdt.property_u32("#size-cells", 0).map_err(fdt_err)?;
-    let cpu0 = fdt.begin_node("cpu@0").map_err(fdt_err)?;
-    fdt.property_string("device_type", "cpu").map_err(fdt_err)?;
-    fdt.property_string("compatible", "arm,arm-v8").map_err(fdt_err)?;
-    fdt.property_u32("reg", 0).map_err(fdt_err)?;
-    fdt.property_string("enable-method", "psci").map_err(fdt_err)?;
-    fdt.end_node(cpu0).map_err(fdt_err)?;
+    for i in 0..p.vcpus.max(1) as u32 {
+        let cpu = fdt.begin_node(&format!("cpu@{i}")).map_err(fdt_err)?;
+        fdt.property_string("device_type", "cpu").map_err(fdt_err)?;
+        fdt.property_string("compatible", "arm,arm-v8").map_err(fdt_err)?;
+        fdt.property_u32("reg", i).map_err(fdt_err)?;
+        fdt.property_string("enable-method", "psci").map_err(fdt_err)?;
+        fdt.end_node(cpu).map_err(fdt_err)?;
+    }
     fdt.end_node(cpus).map_err(fdt_err)?;
 
     // /psci: method "hvc". Lets the guest request SYSTEM_OFF, which we trap.

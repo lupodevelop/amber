@@ -11,11 +11,14 @@ use crate::Result;
 pub trait Hypervisor: Sized {
     type Vcpu: Vcpu;
 
-    /// Create the VM and map `mem` into guest-physical space at its base.
-    fn create(mem: &GuestMemory) -> Result<Self>;
+    /// Create the VM for `vcpus` guest CPUs and map `mem` into guest-physical
+    /// space at its base. The count sizes the interrupt controller.
+    fn create(mem: &GuestMemory, vcpus: usize) -> Result<Self>;
 
-    /// Create vcpu `id`. M0 only ever asks for vcpu 0.
-    fn create_vcpu(&mut self, id: u8) -> Result<Self::Vcpu>;
+    /// Create vcpu `id`. Takes `&self`: each vcpu is created on the OS thread
+    /// that will run it (HVF binds a vcpu to its creating thread), and secondary
+    /// vcpu threads hold only a shared reference to the VM.
+    fn create_vcpu(&self, id: u8) -> Result<Self::Vcpu>;
 
     /// The interrupt controller the backend created, if any, so the device tree
     /// can describe it. A backend with no GIC returns None and the guest boots
@@ -40,6 +43,11 @@ pub trait Hypervisor: Sized {
     fn restore_gic(&self, _blob: &[u8]) -> Result<()> {
         Err(crate::Error::Snapshot("backend has no GIC restore".into()))
     }
+
+    /// Ask every vcpu to leave its `run` loop promptly (the VM is going down).
+    /// The run loop calls it once after the primary stops, so secondary vcpu
+    /// threads blocked in guest execution return and can be joined.
+    fn request_stop(&self) {}
 }
 
 pub trait Vcpu {

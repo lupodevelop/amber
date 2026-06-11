@@ -112,14 +112,21 @@ impl GuestMemory {
 }
 
 /// A raw, copyable window into guest RAM. Holds no lifetime, so the caller is
-/// responsible for keeping the owning `GuestMemory` alive (it does: both live on
-/// the vcpu thread for the VM's duration). Out-of-range accesses are rejected.
+/// responsible for keeping the owning `GuestMemory` alive (it does: the devices
+/// holding views live inside the run scope, which the `GuestMemory` outlives).
+/// Out-of-range accesses are rejected.
 #[derive(Clone, Copy)]
 pub struct GuestRam {
     host: *mut u8,
     base: u64,
     len: usize,
 }
+
+// Devices hold a GuestRam and now live behind a Mutex shared with secondary
+// vcpu threads. The pointed-to region outlives them (see above), and guest RAM
+// is inherently concurrently mutated by the guest's own CPUs anyway; every host
+// access is bounds-checked.
+unsafe impl Send for GuestRam {}
 
 impl GuestRam {
     fn offset(&self, gpa: u64, n: usize) -> Option<usize> {

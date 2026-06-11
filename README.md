@@ -32,7 +32,7 @@ on Apple Silicon at all (the in-kernel vGIC can't restore the timer).
 
 | Capability | What works |
 | --- | --- |
-| **Run** | boot an OCI image (squashfs base + tmpfs overlay), interactive console, virtio-blk/rng |
+| **Run** | boot an OCI image (squashfs base + tmpfs overlay), interactive console, virtio-blk/rng; SMP up to 8 vcpus (PSCI CPU_ON through the software GIC) |
 | **Networking** | outbound TCP + DNS by hostname, inbound port-forward; on by default, rootless |
 | **Snapshot / restore** | capture + resume a VM mid-execution — RAM + vcpu + interrupt controller + PL011/virtio device state; periodic timer survives |
 | **Fork** | copy-on-write from a template (~10 MiB/fork) + warm pool (~ms handoff) + budget-aware sizing/eviction; interactive `fork -i` |
@@ -198,6 +198,7 @@ pool_size  = 2          # warm forks to keep per template
 [template.pytools]
 image    = "docker.io/library/python:3.12-slim"
 ram_cap  = "384MiB"     # guest RAM and the amount accounted against the budget
+vcpus    = 2            # guest CPUs (default 1)
 disk_bps = "50MiB"      # optional I/O rate caps (token bucket, 1s burst)
 net_bps  = "10MiB"
   [template.pytools.env]
@@ -213,6 +214,7 @@ net_bps  = "10MiB"
 | `AMBER_GIC` | `sw` (default) software GICv2; `hw` the in-kernel vGIC (faster boot, no working snapshot timer) |
 | `AMBER_NET` | `smoltcp` (default) userspace netstack; `none` no network; `capture` log tx frames |
 | `AMBER_PORTS` | inbound forwards, `hostport:guestport,...` |
+| `AMBER_VCPUS` | guest CPUs (1–8, default 1); secondaries boot via PSCI CPU_ON, one host thread each |
 | `AMBER_DISK_BPS` / `AMBER_NET_BPS` | I/O rate caps in bytes/s (`K`/`M`/`G` suffix), token-bucket with 1 s burst; unset = unlimited |
 | `AMBER_SNAPSHOT` / `AMBER_SNAPSHOT_AFTER_MS` | capture a snapshot to a dir after N ms (default 2000), then stop |
 | `AMBER_TIME` | print a `build / prep / boot+run` latency breakdown |

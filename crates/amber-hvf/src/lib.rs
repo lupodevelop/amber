@@ -37,18 +37,39 @@ fn align_up(x: u64, a: u64) -> u64 {
     }
 }
 
+/// PSCI life-cycle of one vcpu: parked at creation (secondaries), released by a
+/// guest CPU_ON with an entry point + context id, then on.
+enum CpuOn {
+    Off,
+    Posted { entry: u64, ctx: u64 },
+    On,
+}
+
+/// Shared between the VM and its vcpus: per-cpu PSCI state (+ condvar a parked
+/// secondary waits on) and the registry of live vcpu handles for the preemption
+/// thread / cross-vcpu kicks.
+struct VmShared {
+    cpu_on: (Mutex<Vec<CpuOn>>, std::sync::Condvar),
+    handles: Mutex<Vec<hv_vcpu_t>>,
+    /// Set when the VM is going down: vcpus return from `run` instead of
+    /// resuming after a forced exit, so their threads can be joined.
+    stop: std::sync::atomic::AtomicBool,
+}
+
 pub struct HvfVm {
     gic: GicInfo,
     /// The software GICv2, when running in `swgic` mode; None means the in-kernel
     /// vGIC. Shared (Arc/Mutex) because `set_irq` is called from the console reader
     /// thread while the vcpu thread reads/writes it in the run loop.
     swgic: Option<Arc<Mutex<GicV2>>>,
+    shared: Arc<VmShared>,
 }
 
 impl Hypervisor for HvfVm {
     type Vcpu = HvfVcpu;
 
-    fn create(mem: &GuestMemory) -> Result<Self> {
+    fn create(mem: &GuestMemory, vcpus: usize) -> Result<Self> {
+        let vcpus = vcpus.max(1);
         unsafe {
             check(hv_vm_create(std::ptr::null_mut()), "hv_vm_create")?;
             check(
@@ -61,6 +82,14 @@ impl Hypervisor for HvfVm {
                 "hv_vm_map",
             )?;
         }
+        let shared = Arc::new(VmShared {
+            cpu_on: (
+                Mutex::new((0..vcpus).map(|_| CpuOn::Off).collect()),
+                std::sync::Condvar::new(),
+            ),
+            handles: Mutex::new(Vec::new()),
+            stop: std::sync::atomic::AtomicBool::new(false),
+        });
         if swgic_mode() {
             // Software GICv2: no in-kernel vGIC. The distributor and CPU interface
             // live at the QEMU `virt` GICv2 addresses; both are emulated MMIO.
@@ -73,14 +102,19 @@ impl Hypervisor for HvfVm {
                 redist_size: GIC_CPU_SIZE,
                 kind: GicKind::V2,
             };
-            Ok(HvfVm { gic, swgic: Some(Arc::new(Mutex::new(GicV2::new()))) })
+            Ok(HvfVm { gic, swgic: Some(Arc::new(Mutex::new(GicV2::with_cpus(vcpus)))), shared })
         } else {
+            if vcpus > 1 {
+                return Err(Error::Backend(
+                    "multi-vcpu needs the software GIC (unset AMBER_GIC=hw)".into(),
+                ));
+            }
             let gic = Self::create_gic()?;
-            Ok(HvfVm { gic, swgic: None })
+            Ok(HvfVm { gic, swgic: None, shared })
         }
     }
 
-    fn create_vcpu(&mut self, id: u8) -> Result<HvfVcpu> {
+    fn create_vcpu(&self, id: u8) -> Result<HvfVcpu> {
         let mut handle: hv_vcpu_t = 0;
         let mut exit: *mut hv_vcpu_exit_t = std::ptr::null_mut();
         unsafe {
@@ -95,11 +129,19 @@ impl Hypervisor for HvfVm {
                 "set MPIDR_EL1",
             )?;
         }
+        self.shared.handles.lock().unwrap().push(handle);
+        // vcpu 0 boots directly (set_boot_regs / snapshot restore); secondaries
+        // park in `run` until the guest PSCI-CPU_ONs them.
+        if id == 0 {
+            self.shared.cpu_on.0.lock().unwrap()[0] = CpuOn::On;
+        }
         Ok(HvfVcpu {
             handle,
             exit,
             cpu: id as usize,
+            started: id == 0,
             swgic: self.swgic.clone(),
+            shared: self.shared.clone(),
             vtimer_masked: false,
         })
     }
@@ -138,6 +180,17 @@ impl Hypervisor for HvfVm {
             )?;
             // `state` is an os_object; leak it (snapshot is a one-time event).
             Ok(buf)
+        }
+    }
+
+    fn request_stop(&self) {
+        self.shared.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        // Wake parked secondaries (their CPU_ON wait re-checks via timeout) and
+        // force running ones out of hv_vcpu_run.
+        self.shared.cpu_on.1.notify_all();
+        let hs = self.shared.handles.lock().unwrap().clone();
+        if !hs.is_empty() {
+            unsafe { hv_vcpus_exit(hs.as_ptr(), hs.len() as u32) };
         }
     }
 
@@ -252,8 +305,11 @@ pub struct HvfVcpu {
     exit: *mut hv_vcpu_exit_t,
     /// This vcpu's index — its bank in the software GIC (and its MPIDR affinity).
     cpu: usize,
+    /// False for a secondary that has not been PSCI-CPU_ON'd yet; `run` parks it.
+    started: bool,
     /// Shared software GICv2 in `swgic` mode (None for the in-kernel vGIC).
     swgic: Option<Arc<Mutex<GicV2>>>,
+    shared: Arc<VmShared>,
     /// Whether HVF's virtual timer is currently masked. In `swgic` mode we keep it
     /// masked and drive the timer line ourselves; the flag avoids redundant calls.
     vtimer_masked: bool,
@@ -339,6 +395,16 @@ impl HvfVcpu {
                     g.cpu_write(self.cpu, off, access.size, value);
                 } else {
                     g.dist_write(self.cpu, off, access.size, value);
+                    // An SGI (IPI) posted to another vcpu that is executing guest
+                    // code is only noticed at its next exit; kick everyone so it
+                    // lands now. (A vcpu parked in WFI re-checks within its park
+                    // cap instead.)
+                    if off == 0xf00 {
+                        drop(g);
+                        let hs = self.shared.handles.lock().unwrap().clone();
+                        unsafe { hv_vcpus_exit(hs.as_ptr(), hs.len() as u32) };
+                        return Ok(true);
+                    }
                 }
             }
         }
@@ -516,21 +582,59 @@ impl Vcpu for HvfVcpu {
         // A compute-bound guest loop that waits on jiffies (the kernel's raid6/crypto
         // boot benchmarks) never exits, so the tick never lands and it spins forever.
         // This thread forces a periodic exit; the CANCELED arm below re-runs
-        // swgic_prep to inject a due tick. The in-kernel vGIC needs none of this.
+        // swgic_prep to inject a due tick. It kicks every registered vcpu, which
+        // also bounds cross-vcpu IPI latency (an SGI posted to a running vcpu is
+        // re-evaluated within ~ms). The in-kernel vGIC needs none of this.
         if self.swgic.is_some() {
             static PREEMPT: std::sync::Once = std::sync::Once::new();
             // ~500 Hz: enough for jiffies to advance through a benchmark, not a flood.
             // AMBER_PREEMPT_MS tunes it; 0 disables.
             let ms: u64 = std::env::var("AMBER_PREEMPT_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(2);
             if ms > 0 {
-                let h = self.handle;
+                let shared = self.shared.clone();
                 PREEMPT.call_once(move || {
                     std::thread::spawn(move || loop {
                         std::thread::sleep(std::time::Duration::from_millis(ms));
-                        let vcpus = [h];
-                        unsafe { hv_vcpus_exit(vcpus.as_ptr(), 1) };
+                        let hs = shared.handles.lock().unwrap().clone();
+                        if !hs.is_empty() {
+                            unsafe { hv_vcpus_exit(hs.as_ptr(), hs.len() as u32) };
+                        }
                     });
                 });
+            }
+        }
+
+        // A secondary parks here until the guest PSCI-CPU_ONs it: wait for the
+        // posted entry/context, then enter at EL1 with interrupts masked — the
+        // arm64 boot contract, same as the primary. The wait times out so the
+        // outer run loop can observe a VM shutdown and drop the thread.
+        if !self.started {
+            let (lock, cv) = &self.shared.cpu_on;
+            let mut slots = lock.lock().unwrap();
+            loop {
+                match slots[self.cpu] {
+                    CpuOn::Posted { entry, ctx } => {
+                        slots[self.cpu] = CpuOn::On;
+                        drop(slots);
+                        self.set_reg(HV_REG_CPSR, 0x3c5)?; // EL1h, DAIF masked
+                        self.set_pc(entry)?;
+                        self.set_x(0, ctx)?;
+                        self.started = true;
+                        break;
+                    }
+                    _ => {
+                        if self.shared.stop.load(std::sync::atomic::Ordering::Relaxed) {
+                            return Ok(VmExit::Idle);
+                        }
+                        let (s, timeout) = cv
+                            .wait_timeout(slots, std::time::Duration::from_millis(100))
+                            .unwrap();
+                        slots = s;
+                        if timeout.timed_out() {
+                            return Ok(VmExit::Idle); // let the caller check shutdown
+                        }
+                    }
+                }
             }
         }
 
@@ -581,7 +685,38 @@ impl Vcpu for HvfVcpu {
                             0x8400_0008 | 0x8400_0009 => return Ok(VmExit::Shutdown),
                             // PSCI_VERSION -> 1.0 (major in [31:16], minor in [15:0]).
                             0x8400_0000 => self.set_x(0, 0x0001_0000)?,
-                            // FEATURES, MIGRATE_INFO, CPU_ON on a single-vcpu M0.
+                            // CPU_ON (SMC32/SMC64): x1 = target MPIDR affinity,
+                            // x2 = entry point, x3 = context id. Post to the
+                            // target's slot; its parked thread wakes, sets the
+                            // boot registers, and runs.
+                            0x8400_0003 | 0xc400_0003 => {
+                                let target = (self.get_x(1)? & 0xff) as usize;
+                                let entry = self.get_x(2)?;
+                                let ctx = self.get_x(3)?;
+                                let (lock, cv) = &self.shared.cpu_on;
+                                let mut slots = lock.lock().unwrap();
+                                let rc: i64 = match slots.get(target) {
+                                    Some(CpuOn::Off) => {
+                                        slots[target] = CpuOn::Posted { entry, ctx };
+                                        cv.notify_all();
+                                        0 // SUCCESS
+                                    }
+                                    Some(_) => -4, // ALREADY_ON
+                                    None => -2,    // INVALID_PARAMETERS
+                                };
+                                drop(slots);
+                                self.set_x(0, rc as u64)?;
+                            }
+                            // AFFINITY_INFO: 0 = on, 1 = off.
+                            0x8400_0004 | 0xc400_0004 => {
+                                let target = (self.get_x(1)? & 0xff) as usize;
+                                let on = matches!(
+                                    self.shared.cpu_on.0.lock().unwrap().get(target),
+                                    Some(CpuOn::On) | Some(CpuOn::Posted { .. })
+                                );
+                                self.set_x(0, if on { 0 } else { 1 })?;
+                            }
+                            // FEATURES, MIGRATE_INFO, ...: not supported.
                             _ => self.set_x(0, (-1i64) as u64)?,
                         }
                         continue;
@@ -631,8 +766,12 @@ impl Vcpu for HvfVcpu {
                 }
                 HV_EXIT_REASON_CANCELED => {
                     // Forced out by the preemption thread: loop so swgic_prep re-runs
-                    // (injects a due tick) and resume in place. vGIC mode has no such
-                    // thread, so a cancel there is a real idle.
+                    // (injects a due tick) and resume in place — unless the VM is
+                    // stopping, in which case surface so the thread can be joined.
+                    // vGIC mode has no preemption thread; a cancel there is an idle.
+                    if self.shared.stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        return Ok(VmExit::Idle);
+                    }
                     if self.swgic.is_some() {
                         continue;
                     }

@@ -560,6 +560,19 @@ fn cmd_vm(args: &[String]) -> ExitCode {
     if let Some(bytes) = mem_size {
         cfg.mem_size = bytes;
     }
+    // Guest CPUs: AMBER_VCPUS (operator) wins over the template's `vcpus`.
+    cfg.vcpus = std::env::var("AMBER_VCPUS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .or_else(|| {
+            manifest
+                .as_ref()
+                .and_then(|m| m.template(target))
+                .and_then(|t| t.vcpus)
+                .map(|n| n as usize)
+        })
+        .unwrap_or(1)
+        .clamp(1, 8);
     // Control channel from amberd (balloon targets, etc.), if it passed one.
     cfg.control_fd = std::env::var("AMBER_CONTROL_FD").ok().and_then(|s| s.parse().ok());
     // Snapshot trigger (M3, de-risk): AMBER_SNAPSHOT=<dir> captures the VM after
