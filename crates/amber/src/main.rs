@@ -25,6 +25,14 @@ fn main() -> ExitCode {
         // Internal worker: run one VM in-process (spawned by amberd).
         Some("__vm") => cmd_vm(&args),
         Some("__lockdown-probe") => cmd_lockdown_probe(),
+        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+        Some("__kvm-selftest") => match amber_kvm::selftest() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("kvm selftest failed: {e}");
+                ExitCode::FAILURE
+            }
+        },
         Some("serve") => match daemon::serve() {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {

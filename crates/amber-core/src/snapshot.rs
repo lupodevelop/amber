@@ -28,6 +28,12 @@ pub struct CpuSnapshot {
     pub mono: u64,
     pub sysregs: Vec<(u16, u64)>,
     pub fp: Vec<[u8; 16]>, // V0..V31
+    /// KVM backend: the full register file as `(KVM reg id, little-endian bytes)`
+    /// from `KVM_GET_REG_LIST` (the HVF shape above doesn't fit KVM's id space or
+    /// its variable-width registers). Empty for an HVF snapshot; the two never mix
+    /// (the gic_kind guard refuses a cross-backend restore).
+    #[serde(default)]
+    pub kvm_regs: Vec<(u64, Vec<u8>)>,
 }
 
 #[derive(Serialize, Deserialize, Default, Debug)]

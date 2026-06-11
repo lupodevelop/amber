@@ -60,7 +60,7 @@ docker run --rm -v "$ROOT:/work" -v "$WORK:/out" -w /work rust:bookworm bash -eu
   done
   cp /work/assets/Image $oo/resin
   cp /out/inner.gz $oo/inner.gz
-  printf "#!/bin/busybox sh\n/bin/busybox --install -s /bin\nexport PATH=/bin\nmount -t proc proc /proc\nmount -t sysfs sysfs /sys\nmount -t devtmpfs dev /dev\nRUST_LOG=info /amber boot /resin /inner.gz\necho amber-boot-rc=\$?\npoweroff -f\n" > $oo/init
+  printf "#!/bin/busybox sh\n/bin/busybox --install -s /bin\nexport PATH=/bin\nmount -t proc proc /proc\nmount -t sysfs sysfs /sys\nmount -t devtmpfs dev /dev\nRUST_LOG=info /amber __kvm-selftest\nRUST_LOG=info /amber boot /resin /inner.gz\necho amber-boot-rc=\$?\npoweroff -f\n" > $oo/init
   chmod +x $oo/init
   ( cd $oo && find . | cpio -o -H newc 2>/dev/null | gzip > /out/initramfs.gz )'
 

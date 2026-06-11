@@ -15,4 +15,4 @@ log.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 libc.workspace = true
 kvm-ioctls = "0.19"
-kvm-bindings = "0.10"
+kvm-bindings = { version = "0.10", features = ["fam-wrappers"] }

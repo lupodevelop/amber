@@ -10,4 +10,4 @@
 #![cfg(target_os = "linux")]
 
 mod backend;
-pub use backend::KvmVm;
+pub use backend::{selftest, KvmVm};

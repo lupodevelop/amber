@@ -551,6 +551,7 @@ impl Vcpu for HvfVcpu {
             mono: unsafe { libc::mach_absolute_time() },
             sysregs,
             fp,
+            kvm_regs: Vec::new(), // HVF uses the structured fields above
         })
     }
 

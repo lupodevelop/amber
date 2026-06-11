@@ -8,6 +8,7 @@
 //! PC itself, so `advance_mmio` is a no-op).
 
 use amber_core::hypervisor::{Hypervisor, MmioAccess, Vcpu, VmExit};
+use amber_core::snapshot::CpuSnapshot;
 use amber_core::{Error, GicInfo, GicKind, GuestMemory, Result};
 use kvm_bindings::*;
 use kvm_ioctls::{DeviceFd, Kvm, VcpuFd, VmFd};
@@ -247,6 +248,65 @@ impl Vcpu for KvmVcpu {
 
     fn advance_mmio(&mut self) -> Result<()> {
         Ok(()) // KVM advances the PC past the MMIO instruction itself.
+    }
+
+    /// Capture every register KVM exposes for this vcpu (`KVM_GET_REG_LIST` +
+    /// `GET_ONE_REG`). Stored as raw `(id, bytes)` in `kvm_regs`; widths vary
+    /// (the id encodes the size), so we read each into a sized buffer. This covers
+    /// the core regs, the system registers, the FP/SIMD file, and the arch timer.
+    fn capture(&self) -> Result<CpuSnapshot> {
+        // Size the list to the real count: a small probe gets E2BIG with the
+        // required `n` written back, then allocate exactly that.
+        let mut list = RegList::new(1).map_err(|e| Error::Snapshot(format!("reg list: {e}")))?;
+        if self.fd.get_reg_list(&mut list).is_err() {
+            let n = list.as_fam_struct_ref().n as usize;
+            list = RegList::new(n).map_err(|e| Error::Snapshot(format!("reg list {n}: {e}")))?;
+            self.fd.get_reg_list(&mut list).map_err(kvm_err("KVM_GET_REG_LIST"))?;
+        }
+        let mut kvm_regs = Vec::with_capacity(list.as_slice().len());
+        for &id in list.as_slice() {
+            let size = 1usize << ((id >> 52) & 0xf); // KVM_REG_SIZE_* in bits [55:52]
+            let mut buf = vec![0u8; size];
+            self.fd.get_one_reg(id, &mut buf).map_err(kvm_err("GET_ONE_REG"))?;
+            kvm_regs.push((id, buf));
+        }
+        Ok(CpuSnapshot { kvm_regs, ..Default::default() })
+    }
+
+    /// Restore the captured register file. A few registers KVM lists are
+    /// read-only (some ID registers); skip a failing write rather than abort, so
+    /// one RO entry doesn't sink the whole restore.
+    fn restore(&mut self, cpu: &CpuSnapshot) -> Result<()> {
+        if cpu.kvm_regs.is_empty() {
+            return Err(Error::Snapshot("snapshot has no KVM registers".into()));
+        }
+        for (id, bytes) in &cpu.kvm_regs {
+            if let Err(e) = self.fd.set_one_reg(*id, bytes) {
+                log::debug!("kvm restore: skip reg {id:#x}: {e}");
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Self-test the vcpu register round-trip against a real `/dev/kvm` (run inside
+/// the QEMU/KVM test env). Fast — no guest boot. Prints `KVM_SELFTEST_OK`.
+pub fn selftest() -> Result<()> {
+    let mem = GuestMemory::new(0x4000_0000, 0x10_0000)?;
+    let vm = KvmVm::create(&mem, 1)?;
+    let mut v = vm.create_vcpu(0)?;
+    v.set_boot_regs(0x4001_2340, 0x4000_0000)?;
+    v.set_x(5, 0xdead_beef_cafe_f00d)?;
+    let snap = v.capture()?;
+    v.set_x(5, 0)?; // clobber, then restore should bring it back
+    v.set_pc(0)?;
+    v.restore(&snap)?;
+    let (pc, x5) = (v.pc()?, v.get_x(5)?);
+    if pc == 0x4001_2340 && x5 == 0xdead_beef_cafe_f00d {
+        println!("KVM_SELFTEST_OK regs={}", snap.kvm_regs.len());
+        Ok(())
+    } else {
+        Err(Error::Snapshot(format!("register round-trip mismatch: pc={pc:#x} x5={x5:#x}")))
     }
 }
 
