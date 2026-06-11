@@ -738,8 +738,10 @@ fn cmd_fork(args: &[String]) -> ExitCode {
     }
 }
 
-/// Guest assets borrowed from the Alpine `virt` artifacts for M1. These move into
-/// a bundled, built-in-everything kernel later (the single-binary promise).
+/// Guest asset paths. The kernel is resin (`make kernel`), built-in-everything so
+/// no modules exist; with the borrowed Alpine kernel (`fetch-assets --alpine-kernel`)
+/// a modules dir appears and the bootstrap insmods MODULES. busybox/musl are
+/// borrowed Alpine artifacts until the single-binary bundling.
 mod guest {
     pub const KERNEL: &str = "assets/Image";
     pub const BUSYBOX: &str = "assets/irx/bin/busybox";

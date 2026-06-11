@@ -41,7 +41,8 @@ on Apple Silicon at all (the in-kernel vGIC can't restore the timer).
 | **VMM lockdown** | the VM process drops privileges before the guest runs: no exec/fork, filesystem read-only, network only if the VM has a net device |
 | **Daemon** | `amberd` over a unix socket; `ps`/`logs`/`pause`/`resume`/`rm`/`budget`; templates and budget from `amber.toml` |
 
-Rough numbers (Apple Silicon, alpine): warm boot `amber run -- true` ~100 ms; warm
+Rough numbers (Apple Silicon, resin kernel, alpine:3 image): warm boot `amber run
+-- true` ~100 ms; warm
 `amber exec` ~15 ms; a fork costs ~10 MiB private RAM; free-page reporting shrinks a
 VM's real footprint (e.g. 264 MiB → 52 MiB after the guest frees memory).
 
@@ -62,16 +63,21 @@ cargo build --release
 codesign --entitlements amber.entitlements -s - target/release/amber
 ```
 
-The guest kernel, busybox/musl, and kernel modules are borrowed Alpine `virt`
-artifacts (not redistributed here). Fetch and assemble them into `assets/`:
+amber boots its own guest kernel — **resin**, a trimmed arm64 kernel with
+everything amber needs built in (no loadable modules; 20M, boots in ~60 ms). The
+defconfig is committed; the build compiles upstream kernel source in an
+arm64-native Docker container. The minimal userland (busybox + musl) is a
+borrowed Alpine artifact (not redistributed here):
 
 ```sh
-brew install squashfs        # one-time: to unpack the kernel modules (modloop)
-./scripts/fetch-assets.sh    # downloads the Alpine virt kernel + modules + busybox
+brew install squashfs        # one-time: amber packs OCI images with mksquashfs
+./scripts/fetch-assets.sh    # busybox + musl into assets/
+make kernel                  # build resin into assets/Image (Docker required)
 ```
 
-(Override the release with `ALPINE_VER=3.22.1`. A bundled, trimmed kernel is future
-work.)
+(`./scripts/fetch-assets.sh --alpine-kernel` fetches the borrowed modular Alpine
+`virt` kernel + modules instead — the pre-resin setup, kept as a fallback. Same
+amber binary boots either: it loads modules only if a modules dir exists.)
 
 The software GIC is the default. To build the in-kernel-vGIC-only variant (no
 software GIC): `cargo build --release --no-default-features`.
@@ -242,8 +248,9 @@ that can't spawn, drop files, or phone home.
 - **macOS only** today; a KVM backend (arm64 Linux) — needs the hardware to
   build and test. On KVM the in-kernel vGIC has a complete save/restore surface, so
   the software GIC becomes optional there.
-- Borrowed Alpine kernel/modules under `assets/`; a bundled, trimmed, built-in-everything
-  kernel ("single binary") is future work.
+- The kernel is amber's own (resin), but busybox/musl are still borrowed Alpine
+  artifacts and `assets/` ships separately; bundling everything into the amber
+  binary ("single binary") is future work.
 - Networking is outbound + inbound-forward over a userspace netstack; IPv6 /
   arbitrary UDP / kernel-speed need the alternative backends (documented, not built).
 - Every `cargo build` invalidates the codesignature — re-codesign before running.

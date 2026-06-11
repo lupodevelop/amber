@@ -1,16 +1,23 @@
 #!/usr/bin/env bash
-# Fetch the guest assets amber boots: the arm64 Alpine `virt` kernel, its loadable
-# modules, and a static busybox + musl loader. These are borrowed Alpine artifacts
-# (not redistributed in this repo); this script assembles them into ./assets in the
-# layout the code expects:
+# Fetch the guest userland amber's bootstrap needs: a static busybox + the musl
+# loader (borrowed Alpine artifacts, not redistributed in this repo).
 #
-#   assets/Image                                 arm64 kernel (Alpine vmlinuz-virt)
+# The kernel is resin — amber's own built-in-everything arm64 kernel — built by
+# `make kernel` into assets/Image. resin loads no modules, so the default fetch
+# is just the userland:
+#
 #   assets/irx/bin/busybox                       static busybox
 #   assets/irx/lib/ld-musl-aarch64.so.1          musl loader
+#
+# --alpine-kernel additionally fetches the borrowed Alpine `virt` kernel and its
+# modules (the pre-resin setup, kept as a fallback/reference):
+#
+#   assets/Image                                 arm64 kernel (Alpine vmlinuz-virt)
 #   assets/irx/lib/modules/<ver>/...             kernel modules + modules.dep
 #
-# Requires: curl, tar, gzip, and unsquashfs (squashfs-tools — `brew install squashfs`).
-# Override the Alpine release with ALPINE_VER=3.22.1, the output dir with OUT=./assets.
+# Requires: curl, tar, gzip; with --alpine-kernel also unsquashfs (squashfs-tools
+# — `brew install squashfs`). Override the Alpine release with ALPINE_VER=3.22.1,
+# the output dir with OUT=./assets.
 set -euo pipefail
 
 ALPINE_VER="${ALPINE_VER:-3.22.1}"
@@ -19,8 +26,12 @@ BRANCH="v${ALPINE_VER%.*}"                # 3.22.1 -> v3.22
 CDN="https://dl-cdn.alpinelinux.org/alpine/${BRANCH}/releases/${ARCH}"
 NETBOOT="${CDN}/netboot-${ALPINE_VER}"
 OUT="${OUT:-assets}"
+ALPINE_KERNEL=0
+[ "${1:-}" = "--alpine-kernel" ] && ALPINE_KERNEL=1
 
-for tool in curl tar gzip unsquashfs; do
+TOOLS="curl tar gzip"
+[ "$ALPINE_KERNEL" = 1 ] && TOOLS="$TOOLS unsquashfs"
+for tool in $TOOLS; do
   command -v "$tool" >/dev/null 2>&1 || {
     echo "error: '$tool' not found." >&2
     [ "$tool" = unsquashfs ] && echo "  install squashfs-tools: brew install squashfs" >&2
@@ -32,12 +43,36 @@ tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$OUT/irx/bin" "$OUT/irx/lib"
 
-echo "==> Alpine ${ALPINE_VER} ${ARCH} -> ${OUT}/"
+echo "==> Alpine ${ALPINE_VER} ${ARCH} userland -> ${OUT}/"
 
-# 1. Kernel: download vmlinuz-virt. Modern Alpine ships it as an EFI zboot image
-# (a PE stub wrapping a compressed kernel); amber's loader wants the raw arm64
-# Image, so if it's zboot, extract the payload (offset/size in the header) and
-# decompress per the header's compression field.
+# busybox + musl loader, from the minirootfs tarball.
+echo "  - busybox + musl (minirootfs)"
+curl -fSL --retry 3 "${CDN}/alpine-minirootfs-${ALPINE_VER}-${ARCH}.tar.gz" -o "$tmp/root.tgz"
+tar -xzf "$tmp/root.tgz" -C "$tmp" bin/busybox lib/ld-musl-aarch64.so.1
+cp "$tmp/bin/busybox" "$OUT/irx/bin/busybox"
+cp "$tmp/lib/ld-musl-aarch64.so.1" "$OUT/irx/lib/ld-musl-aarch64.so.1"
+ln -sf ld-musl-aarch64.so.1 "$OUT/irx/lib/libc.musl-aarch64.so.1"
+chmod +x "$OUT/irx/bin/busybox"
+
+if [ "$ALPINE_KERNEL" = 0 ]; then
+  # resin path: the kernel comes from `make kernel`, which loads no modules. A
+  # stale Alpine modules dir would make the bootstrap insmod foreign .ko into
+  # resin (harmless vermagic failures, but noisy) — clear it.
+  rm -rf "$OUT/irx/lib/modules"
+  if [ -f "$OUT/Image" ]; then
+    echo "==> done: userland ready (existing ${OUT}/Image kept). Now: make"
+  else
+    echo "==> done: userland ready. Now: make kernel && make"
+  fi
+  exit 0
+fi
+
+# --alpine-kernel: the borrowed modular kernel + its modloop.
+#
+# Kernel: modern Alpine ships vmlinuz-virt as an EFI zboot image (a PE stub
+# wrapping a compressed kernel); amber's loader wants the raw arm64 Image, so if
+# it's zboot, extract the payload (offset/size in the header) and decompress per
+# the header's compression field.
 echo "  - kernel (vmlinuz-virt)"
 curl -fSL --retry 3 "${NETBOOT}/vmlinuz-virt" -o "$tmp/vmlinuz"
 if [ "$(dd if="$tmp/vmlinuz" bs=1 skip=4 count=4 2>/dev/null)" = "zimg" ]; then
@@ -56,16 +91,7 @@ else
   cp "$tmp/vmlinuz" "$OUT/Image"
 fi
 
-# 2. busybox + musl loader, from the minirootfs tarball.
-echo "  - busybox + musl (minirootfs)"
-curl -fSL --retry 3 "${CDN}/alpine-minirootfs-${ALPINE_VER}-${ARCH}.tar.gz" -o "$tmp/root.tgz"
-tar -xzf "$tmp/root.tgz" -C "$tmp" bin/busybox lib/ld-musl-aarch64.so.1
-cp "$tmp/bin/busybox" "$OUT/irx/bin/busybox"
-cp "$tmp/lib/ld-musl-aarch64.so.1" "$OUT/irx/lib/ld-musl-aarch64.so.1"
-ln -sf ld-musl-aarch64.so.1 "$OUT/irx/lib/libc.musl-aarch64.so.1"
-chmod +x "$OUT/irx/bin/busybox"
-
-# 3. Modules: the modloop is a squashfs of /lib/modules for this exact kernel.
+# Modules: the modloop is a squashfs of /lib/modules for this exact kernel.
 echo "  - modules (modloop-virt, unsquashing)"
 curl -fSL --retry 3 "${NETBOOT}/modloop-virt" -o "$tmp/modloop"
 unsquashfs -q -f -d "$tmp/ml" "$tmp/modloop" >/dev/null
@@ -78,4 +104,4 @@ for d in "$tmp/ml/modules"/*/; do
 done
 
 ver="$(ls "$OUT/irx/lib/modules" | head -1)"
-echo "==> done: kernel + modules ${ver}, busybox + musl. Now: make"
+echo "==> done: alpine kernel + modules ${ver}, busybox + musl. Now: make"
