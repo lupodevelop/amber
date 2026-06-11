@@ -38,7 +38,8 @@ on Apple Silicon at all (the in-kernel vGIC can't restore the timer).
 | **Fork** | copy-on-write from a template (~10 MiB/fork) + warm pool (~ms handoff) + budget-aware sizing/eviction; interactive `fork -i` |
 | **Exec** | `amber exec <template> -- <cmd>` — a fresh command in a warm fork (~15 ms), with exit codes |
 | **RAM budget** | fleet ceiling + admission control, real-RSS accounting, virtio-balloon reclaim (passive + active), pool eviction |
-| **Daemon** | `amberd` over a unix socket; `ps`/`logs`/`rm`/`budget`; templates and budget from `amber.toml` |
+| **VMM lockdown** | the VM process drops privileges before the guest runs: no exec/fork, filesystem read-only, network only if the VM has a net device |
+| **Daemon** | `amberd` over a unix socket; `ps`/`logs`/`pause`/`resume`/`rm`/`budget`; templates and budget from `amber.toml` |
 
 Rough numbers (Apple Silicon, alpine): warm boot `amber run -- true` ~100 ms; warm
 `amber exec` ~15 ms; a fork costs ~10 MiB private RAM; free-page reporting shrinks a
@@ -226,6 +227,15 @@ crates/
 The `Hypervisor`/`Vcpu` traits are the seam: a KVM backend (arm64 Linux) is a
 third crate implementing them. amberd is a supervisor — one `amber __vm` child per
 VM — because HVF is one-VM-per-process; that is also the per-sandbox isolation.
+
+Each VM process additionally **locks itself down** before the first guest
+instruction: everything it needs is already open (guest RAM, disk fd, control
+channel, listeners), so it drops the ability to acquire more — no exec/fork, the
+filesystem turns read-only (except a snapshot destination), and the network is
+denied unless the VM has a net device. The policy is platform-agnostic
+(`amber-core::lockdown`); the mechanism is per-OS (macOS seatbelt today, Linux
+seccomp with the KVM backend). A guest escape into the VMM lands in a process
+that can't spawn, drop files, or phone home.
 
 ## Limitations & roadmap
 
