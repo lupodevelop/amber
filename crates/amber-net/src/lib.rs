@@ -34,8 +34,6 @@ mod smoltcp_backend {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    /// Where the gateway forwards the guest's DNS queries.
-    const RESOLVER: &str = "1.1.1.1:53";
 
     const GATEWAY: Ipv4Address = Ipv4Address::new(10, 0, 0, 1);
     const GUEST: Ipv4Address = Ipv4Address::new(10, 0, 0, 2);
@@ -124,6 +122,26 @@ mod smoltcp_backend {
         has_listeners: bool,
         next_eph: u16,
         start: std::time::Instant,
+        /// Upstream DNS the gateway forwards guest queries to. The host's own
+        /// resolver (from /etc/resolv.conf) when available — a fixed public DNS
+        /// is wrong on networks that block it — else 1.1.1.1.
+        resolver: SocketAddr,
+    }
+
+    /// The host's first usable nameserver (`/etc/resolv.conf`), else `1.1.1.1`.
+    /// Loopback entries are skipped: the gateway's forwarding socket lives on the
+    /// host, so 127.0.0.1 would hit the host's own (often absent) :53 listener.
+    fn host_resolver() -> SocketAddr {
+        std::fs::read_to_string("/etc/resolv.conf")
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .filter_map(|l| l.strip_prefix("nameserver "))
+                    .filter_map(|a| a.trim().parse::<Ipv4Addr>().ok())
+                    .find(|ip| !ip.is_loopback())
+                    .map(|ip| SocketAddr::from((ip, 53)))
+            })
+            .unwrap_or_else(|| SocketAddr::from(([1, 1, 1, 1], 53)))
     }
 
     /// Bridge bytes between a smoltcp socket and its host stream (shared by
@@ -258,6 +276,7 @@ mod smoltcp_backend {
                 has_listeners,
                 next_eph: 40000,
                 start: std::time::Instant::now(),
+                resolver: host_resolver(),
             }
         }
 
@@ -314,7 +333,7 @@ mod smoltcp_backend {
                 }
                 if let Ok(h) = UdpSocket::bind("0.0.0.0:0") {
                     let _ = h.set_nonblocking(true);
-                    if h.connect(RESOLVER).is_ok() && h.send(&payload).is_ok() {
+                    if h.connect(self.resolver).is_ok() && h.send(&payload).is_ok() {
                         self.pending_dns.push(DnsQuery { host: h, guest });
                     }
                 }
