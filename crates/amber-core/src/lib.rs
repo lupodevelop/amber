@@ -16,6 +16,7 @@ pub mod memory;
 pub mod net;
 pub mod snapshot;
 pub mod virtio;
+pub mod vsock;
 mod vm;
 
 pub use hypervisor::{Hypervisor, Vcpu};

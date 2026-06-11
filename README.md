@@ -35,6 +35,7 @@ on Apple Silicon at all (the in-kernel vGIC can't restore the timer).
 | **Run** | boot an OCI image (squashfs base + tmpfs overlay), interactive console, virtio-blk/rng; SMP up to 8 vcpus (PSCI CPU_ON through the software GIC) |
 | **Storage** | read-only squashfs root + ephemeral tmpfs overlay; persistent ext4 data disks (`amber disk create`, `AMBER_DISK=img[:ro]`) auto-mounted at `/data` |
 | **Networking** | outbound TCP + DNS by hostname, inbound port-forward; on by default, rootless |
+| **vsock** | guest↔host `AF_VSOCK` streams bridged to host unix sockets (Firecracker-hybrid), credit flow-controlled; `AMBER_VSOCK` |
 | **Snapshot / restore** | capture + resume a VM mid-execution — RAM + every vcpu (SMP included) + interrupt controller + PL011/virtio device state; periodic timer survives |
 | **Fork** | copy-on-write from a template (~10 MiB/fork) + warm pool (~ms handoff) + budget-aware sizing/eviction; interactive `fork -i` |
 | **Exec** | `amber exec <template> -- <cmd>` — a fresh command in a warm fork (~15 ms), with exit codes |
@@ -217,6 +218,7 @@ net_bps  = "10MiB"
 | `AMBER_PORTS` | inbound forwards, `hostport:guestport,...` |
 | `AMBER_VCPUS` | guest CPUs (1–8, default 1); secondaries boot via PSCI CPU_ON, one host thread each |
 | `AMBER_DISK` | data disk image(s), comma-separated, `path[:ro]`; ext4 images auto-mount at `/data` (make one with `amber disk create <path> <size>`) |
+| `AMBER_VSOCK` | guest↔host vsock channel over a host unix socket (guest gets CID 3); guest dials CID 2 ↔ host `<sock>_<port>`, Firecracker-hybrid |
 | `AMBER_DISK_BPS` / `AMBER_NET_BPS` | I/O rate caps in bytes/s (`K`/`M`/`G` suffix), token-bucket with 1 s burst; unset = unlimited |
 | `AMBER_SNAPSHOT` / `AMBER_SNAPSHOT_AFTER_MS` | capture a snapshot to a dir after N ms (default 2000), then stop |
 | `AMBER_TIME` | print a `build / prep / boot+run` latency breakdown |

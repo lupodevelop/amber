@@ -96,6 +96,7 @@ usage: amber <command> [args]
     AMBER_PORTS=8080:80   forward a host port to the guest
     AMBER_VCPUS=4         guest CPUs (1-8, default 1)
     AMBER_DISK=data.img   attach a data disk at /data (:ro for read-only)
+    AMBER_VSOCK=/tmp/v.sock  guest<->host vsock over a unix socket (guest CID 3)
     AMBER_GIC=hw          use the in-kernel vGIC (no snapshot timer)
 
 docs: README.md  ·  config: amber.toml
@@ -680,6 +681,8 @@ fn cmd_vm(args: &[String]) -> ExitCode {
         .unwrap_or(1)
         .clamp(1, 8);
     cfg.data_disks = data_disks;
+    // virtio-vsock: AMBER_VSOCK=<host-socket-path> opens a guest↔host channel.
+    cfg.vsock = std::env::var("AMBER_VSOCK").ok().filter(|s| !s.is_empty()).map(Into::into);
     // Control channel from amberd (balloon targets, etc.), if it passed one.
     cfg.control_fd = std::env::var("AMBER_CONTROL_FD").ok().and_then(|s| s.parse().ok());
     // Snapshot trigger (M3, de-risk): AMBER_SNAPSHOT=<dir> captures the VM after

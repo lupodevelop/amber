@@ -59,6 +59,9 @@ pub struct VmConfig {
     /// `(path, writable)`; writes persist to the backing files. A `run`-time
     /// feature, separate from the snapshot/template model (root-only).
     pub data_disks: Vec<(PathBuf, bool)>,
+    /// virtio-vsock: the host Unix-socket base path for the guest↔host channel,
+    /// if enabled. The guest gets CID 3.
+    pub vsock: Option<PathBuf>,
     /// If set, snapshot the VM to `dir` once it has run for `after`, then stop.
     pub snapshot: Option<SnapshotReq>,
     /// A control-channel fd (from amberd) carrying balloon targets, etc.
@@ -87,6 +90,7 @@ impl Default for VmConfig {
             cmdline: "console=ttyAMA0 quiet".into(),
             disk: None,
             data_disks: Vec::new(),
+            vsock: None,
             snapshot: None,
             control_fd: None,
         }
@@ -153,6 +157,15 @@ impl Vm {
         if let Some(backend) = net {
             let i = virtio.len();
             virtio.push(VirtioDev::new(i, Box::new(crate::net::NetDevice::new(backend))));
+        }
+        if let Some(path) = &cfg.vsock {
+            match crate::vsock::UdsBackend::new(path.clone()) {
+                Some(b) => {
+                    let i = virtio.len();
+                    virtio.push(VirtioDev::new(i, Box::new(crate::vsock::VsockDevice::new(3, Box::new(b)))));
+                }
+                None => log::warn!("vsock: cannot bind {}, disabled", path.display()),
+            }
         }
         let balloon = push_balloon(&mut virtio);
 
