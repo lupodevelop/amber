@@ -20,6 +20,9 @@ bad() { printf '  \033[31mFAIL\033[0m %s\n' "$1"; fail=$((fail + 1)); }
 [ -x "$BIN" ]        || { echo "no signed binary at $BIN — run 'make' first"; exit 1; }
 [ -f assets/Image ]  || { echo "no assets/Image — run ./scripts/fetch-assets.sh first"; exit 1; }
 
+echo "== vmm lockdown =="
+"$BIN" __lockdown-probe >/dev/null 2>&1 && ok "lockdown denies exec + fs writes" || bad "lockdown denies exec + fs writes"
+
 echo "== boot =="
 out="$("$BIN" run "$IMG" -- echo __AMBER_OK__ 2>/dev/null)"
 echo "$out" | grep -q __AMBER_OK__ && ok "boot + run echo" || bad "boot + run echo"

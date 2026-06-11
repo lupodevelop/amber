@@ -24,6 +24,7 @@ fn main() -> ExitCode {
         Some("run") => cmd_run(&args),
         // Internal worker: run one VM in-process (spawned by amberd).
         Some("__vm") => cmd_vm(&args),
+        Some("__lockdown-probe") => cmd_lockdown_probe(),
         Some("serve") => match daemon::serve() {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
@@ -346,6 +347,25 @@ fn cmd_rm(args: &[String]) -> ExitCode {
             eprintln!("rm failed: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Hidden self-test: apply the VMM lockdown, then verify the denies actually
+/// bite (exec and filesystem writes must fail). Used by the integration suite.
+fn cmd_lockdown_probe() -> ExitCode {
+    if let Err(e) = (amber_core::lockdown::Policy::default()).apply() {
+        eprintln!("lockdown apply failed: {e}");
+        return ExitCode::FAILURE;
+    }
+    let exec_blocked = std::process::Command::new("/usr/bin/true").status().is_err();
+    let write_blocked = std::fs::write("/tmp/amber-lockdown-probe", b"x").is_err();
+    let _ = std::fs::remove_file("/tmp/amber-lockdown-probe"); // in case it got through
+    if exec_blocked && write_blocked {
+        println!("LOCKDOWN_OK");
+        ExitCode::SUCCESS
+    } else {
+        eprintln!("LOCKDOWN_LEAK: exec_blocked={exec_blocked} write_blocked={write_blocked}");
+        ExitCode::FAILURE
     }
 }
 

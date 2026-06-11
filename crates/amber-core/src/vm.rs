@@ -300,6 +300,19 @@ impl Vm {
             vcpu.set_boot_regs(entry, dtb_addr)?;
         }
 
+        // Lockdown: everything the VM needs is open (RAM, disk fd, control fd,
+        // console, bound listeners); drop the ability to acquire more before any
+        // guest instruction runs. The snapshot dir stays writable for capture;
+        // new sockets only if a network device exists (the netstack dials at
+        // runtime). Platform mechanism behind lockdown::Policy (macOS: seatbelt).
+        let policy = crate::lockdown::Policy {
+            write_paths: snapshot.iter().map(|r| r.dir.clone()).collect(),
+            net: virtio.iter().any(|d| d.mmio.device_id() == 1),
+        };
+        if let Err(e) = policy.apply() {
+            return Err(crate::Error::Backend(format!("vmm lockdown: {e}")));
+        }
+
         // Warm-pool gate. All the costly work (VM + GIC + register restore) is now
         // done; if this is a pooled fork, signal the daemon we are ready and block
         // for a one-byte "go" before the guest runs. A fork is then just this
