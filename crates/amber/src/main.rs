@@ -42,6 +42,7 @@ fn main() -> ExitCode {
         Some("pause") => cmd_pause(&args),
         Some("resume") => cmd_resume(&args),
         Some("pull") => cmd_pull(&args),
+        Some("disk") => cmd_disk(&args),
         Some("restore") => cmd_restore(&args),
         Some("template") => cmd_template(&args),
         Some("exec") => cmd_exec(&args),
@@ -85,13 +86,16 @@ usage: amber <command> [args]
     budget                                  fleet RAM: budget / reserved / real / host
     balloon <id> <MiB>                      ask a VM to give RAM back
 
-  images
+  images & disks
     pull <image>                            pre-pull / refresh into the cache
+    disk create <path> <size>               make a writable data disk image
     boot <kernel-Image> [initramfs] [disk]  boot a raw kernel (no OCI)
 
   env
     AMBER_NET=none        disable networking (on by default)
     AMBER_PORTS=8080:80   forward a host port to the guest
+    AMBER_VCPUS=4         guest CPUs (1-8, default 1)
+    AMBER_DISK=data.img   attach a writable data disk (/dev/vdb)
     AMBER_GIC=hw          use the in-kernel vGIC (no snapshot timer)
 
 docs: README.md  ·  config: amber.toml
@@ -369,6 +373,47 @@ fn cmd_lockdown_probe() -> ExitCode {
     }
 }
 
+/// `amber disk create <path> <size>` — make a sparse raw image to attach as a
+/// writable data disk (`AMBER_DISK=<path>`). The guest formats and mounts it.
+fn cmd_disk(args: &[String]) -> ExitCode {
+    match args.get(2).map(String::as_str) {
+        Some("create") => {
+            let (Some(path), Some(size)) = (args.get(3), args.get(4)) else {
+                eprintln!("usage: amber disk create <path> <size>   (e.g. 1GiB)");
+                return ExitCode::FAILURE;
+            };
+            let Some(bytes) = manifest::parse_size(size) else {
+                eprintln!("bad size '{size}' (try 512MiB, 2GiB, 1048576)");
+                return ExitCode::FAILURE;
+            };
+            // Round up to a 512-byte sector so capacity is exact.
+            let bytes = (bytes as u64).div_ceil(512) * 512;
+            match std::fs::OpenOptions::new().write(true).create_new(true).open(path) {
+                Ok(f) => {
+                    if let Err(e) = f.set_len(bytes) {
+                        eprintln!("cannot size {path}: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                    println!("created {path} ({} MiB, sparse). attach: AMBER_DISK={path}", bytes / (1024 * 1024));
+                    ExitCode::SUCCESS
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    eprintln!("{path} already exists");
+                    ExitCode::FAILURE
+                }
+                Err(e) => {
+                    eprintln!("cannot create {path}: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        _ => {
+            eprintln!("usage: amber disk create <path> <size>");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn cmd_pause(args: &[String]) -> ExitCode {
     let Some(id) = args.get(2) else {
         eprintln!("usage: amber pause <id>");
@@ -573,6 +618,23 @@ fn cmd_vm(args: &[String]) -> ExitCode {
         })
         .unwrap_or(1)
         .clamp(1, 8);
+    // Writable data disks (persistent): AMBER_DISK=path[,path...] plus a template's
+    // `disks`. Attached after the root as /dev/vdb, /dev/vdc, … Missing files are a
+    // hard error — a typo'd disk path should fail loudly, not silently boot diskless.
+    let mut data_disks: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(list) = std::env::var("AMBER_DISK") {
+        data_disks.extend(list.split(',').filter(|s| !s.is_empty()).map(Into::into));
+    }
+    if let Some(t) = manifest.as_ref().and_then(|m| m.template(target)) {
+        data_disks.extend(t.disks.iter().map(Into::into));
+    }
+    for d in &data_disks {
+        if !d.exists() {
+            eprintln!("disk not found: {} (create one: amber disk create {} <size>)", d.display(), d.display());
+            return ExitCode::FAILURE;
+        }
+    }
+    cfg.data_disks = data_disks;
     // Control channel from amberd (balloon targets, etc.), if it passed one.
     cfg.control_fd = std::env::var("AMBER_CONTROL_FD").ok().and_then(|s| s.parse().ok());
     // Snapshot trigger (M3, de-risk): AMBER_SNAPSHOT=<dir> captures the VM after

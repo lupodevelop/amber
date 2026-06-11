@@ -33,6 +33,7 @@ on Apple Silicon at all (the in-kernel vGIC can't restore the timer).
 | Capability | What works |
 | --- | --- |
 | **Run** | boot an OCI image (squashfs base + tmpfs overlay), interactive console, virtio-blk/rng; SMP up to 8 vcpus (PSCI CPU_ON through the software GIC) |
+| **Storage** | read-only squashfs root + ephemeral tmpfs overlay; attach writable, persistent data disks (`amber disk create`, `AMBER_DISK`) as `/dev/vdb`… |
 | **Networking** | outbound TCP + DNS by hostname, inbound port-forward; on by default, rootless |
 | **Snapshot / restore** | capture + resume a VM mid-execution — RAM + every vcpu (SMP included) + interrupt controller + PL011/virtio device state; periodic timer survives |
 | **Fork** | copy-on-write from a template (~10 MiB/fork) + warm pool (~ms handoff) + budget-aware sizing/eviction; interactive `fork -i` |
@@ -215,6 +216,7 @@ net_bps  = "10MiB"
 | `AMBER_NET` | `smoltcp` (default) userspace netstack; `none` no network; `capture` log tx frames |
 | `AMBER_PORTS` | inbound forwards, `hostport:guestport,...` |
 | `AMBER_VCPUS` | guest CPUs (1–8, default 1); secondaries boot via PSCI CPU_ON, one host thread each |
+| `AMBER_DISK` | writable data disk image(s), comma-separated, attached as `/dev/vdb`…; writes persist (make one with `amber disk create`) |
 | `AMBER_DISK_BPS` / `AMBER_NET_BPS` | I/O rate caps in bytes/s (`K`/`M`/`G` suffix), token-bucket with 1 s burst; unset = unlimited |
 | `AMBER_SNAPSHOT` / `AMBER_SNAPSHOT_AFTER_MS` | capture a snapshot to a dir after N ms (default 2000), then stop |
 | `AMBER_TIME` | print a `build / prep / boot+run` latency breakdown |

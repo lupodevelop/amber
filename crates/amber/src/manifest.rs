@@ -37,6 +37,9 @@ pub struct Template {
     /// I/O rate caps in bytes/second, e.g. "50MiB" (token bucket, 1 s burst).
     pub disk_bps: Option<String>,
     pub net_bps: Option<String>,
+    /// Writable data disks attached as /dev/vdb, /dev/vdc, … (host image paths).
+    #[serde(default)]
+    pub disks: Vec<String>,
     #[serde(default)]
     pub env: HashMap<String, String>,
 

@@ -408,22 +408,44 @@ fn inject_one(ram: &GuestRam, q: &mut Queue, data: &[u8]) -> bool {
     true
 }
 
-/// virtio-blk, read-only. The base is a read-only image (squashfs); the guest
-/// layers a tmpfs overlay for writes, so only IN (read) is implemented.
+/// virtio-blk. The squashfs root opens read-only (the guest layers a tmpfs
+/// overlay for its writes); a data disk opens read-write, so IN, OUT and FLUSH
+/// are all implemented and writes persist to the backing host file.
 pub struct BlkDevice {
     disk: File,
     capacity_sectors: u64,
-    /// Read-rate cap (`AMBER_DISK_BPS`); None = unlimited.
+    writable: bool,
+    /// I/O-rate cap (`AMBER_DISK_BPS`); None = unlimited.
     limit: Option<crate::limiter::TokenBucket>,
 }
 
 impl BlkDevice {
     const DEVICE_ID: u32 = 2;
     const T_IN: u32 = 0;
+    const T_OUT: u32 = 1;
+    const T_FLUSH: u32 = 4;
+    const S_OK: u8 = 0;
+    const S_IOERR: u8 = 1;
+    const S_UNSUPP: u8 = 2;
+    /// VIRTIO_BLK_F_RO (bit 5): tells the guest the device is read-only.
+    const F_RO: u32 = 1 << 5;
 
+    /// Open a read-only backing image (the squashfs root).
     pub fn open(path: &Path) -> Result<Self> {
-        let disk =
-            File::open(path).map_err(|e| Error::Device(format!("open {}: {e}", path.display())))?;
+        Self::open_with(path, false)
+    }
+
+    /// Open a read-write data disk; OUT/FLUSH persist to `path`.
+    pub fn open_writable(path: &Path) -> Result<Self> {
+        Self::open_with(path, true)
+    }
+
+    fn open_with(path: &Path, writable: bool) -> Result<Self> {
+        let disk = std::fs::OpenOptions::new()
+            .read(true)
+            .write(writable)
+            .open(path)
+            .map_err(|e| Error::Device(format!("open {}: {e}", path.display())))?;
         let bytes = disk
             .metadata()
             .map_err(|e| Error::Device(format!("stat disk: {e}")))?
@@ -431,6 +453,7 @@ impl BlkDevice {
         Ok(Self {
             disk,
             capacity_sectors: bytes / SECTOR,
+            writable,
             limit: crate::limiter::TokenBucket::from_env("AMBER_DISK_BPS"),
         })
     }
@@ -449,6 +472,14 @@ impl VirtioDevice for BlkDevice {
         Self::DEVICE_ID
     }
 
+    fn device_features(&self, sel: u32) -> u32 {
+        if sel == 0 && !self.writable {
+            Self::F_RO
+        } else {
+            0
+        }
+    }
+
     fn config(&self, off: u64) -> u32 {
         match off {
             0 => self.capacity_sectors as u32,
@@ -457,8 +488,10 @@ impl VirtioDevice for BlkDevice {
         }
     }
 
-    /// Chain is [header(RO), data...(WO), status(WO,1)]. Fill data from disk for
-    /// an IN request and write status = OK.
+    /// Chain is [header(RO), data..., status(WO,1)]. IN fills the device-writable
+    /// data buffers from disk; OUT drains the device-readable ones to disk; FLUSH
+    /// fsyncs. The used-ring length is the bytes written back into guest RAM (the
+    /// IN payload) plus the one status byte.
     fn handle(&mut self, _queue: usize, ram: &GuestRam, bufs: &[Buf]) -> u32 {
         if bufs.len() < 2 {
             return 0;
@@ -466,29 +499,59 @@ impl VirtioDevice for BlkDevice {
         let req_type = ram.read_u32(bufs[0].addr);
         let sector = ram.read_u64(bufs[0].addr + 8);
         let status_idx = bufs.len() - 1;
-        let mut written = 0;
+        let data = &bufs[1..status_idx];
+        let mut written = 0u32;
 
-        if req_type == Self::T_IN {
-            // Rate cap: pay for the whole request up front. Blocking here is the
-            // backpressure — the guest is inside the notify and sees a slow disk.
-            if let Some(l) = &mut self.limit {
+        // Rate cap: pay for the whole transfer up front. Blocking here is the
+        // backpressure — the guest is inside the notify and sees a slow disk.
+        let rate = |limit: &mut Option<crate::limiter::TokenBucket>, want_writable: bool| {
+            if let Some(l) = limit {
                 let total: u64 =
-                    bufs[1..status_idx].iter().filter(|b| b.writable).map(|b| b.len as u64).sum();
+                    data.iter().filter(|b| b.writable == want_writable).map(|b| b.len as u64).sum();
                 l.throttle(total);
             }
-            let mut offset = sector * SECTOR;
-            for b in &bufs[1..status_idx] {
-                if !b.writable {
-                    continue;
+        };
+
+        let status = match req_type {
+            Self::T_IN => {
+                rate(&mut self.limit, true);
+                let mut offset = sector * SECTOR;
+                for b in data.iter().filter(|b| b.writable) {
+                    let mut d = vec![0u8; b.len as usize];
+                    self.read_disk(offset, &mut d);
+                    ram.write(b.addr, &d);
+                    offset += b.len as u64;
+                    written += b.len;
                 }
-                let mut data = vec![0u8; b.len as usize];
-                self.read_disk(offset, &mut data);
-                ram.write(b.addr, &data);
-                offset += b.len as u64;
-                written += b.len;
+                Self::S_OK
             }
-        }
-        ram.write(bufs[status_idx].addr, &[0u8]); // VIRTIO_BLK_S_OK
+            Self::T_OUT if self.writable => {
+                rate(&mut self.limit, false);
+                let mut offset = sector * SECTOR;
+                let mut ok = true;
+                for b in data.iter().filter(|b| !b.writable) {
+                    let mut d = vec![0u8; b.len as usize];
+                    ram.read(b.addr, &mut d);
+                    if self.disk.write_all_at(&d, offset).is_err() {
+                        ok = false;
+                        break;
+                    }
+                    offset += b.len as u64;
+                }
+                if ok { Self::S_OK } else { Self::S_IOERR }
+            }
+            // Write to a read-only disk: refuse rather than silently drop.
+            Self::T_OUT => Self::S_IOERR,
+            Self::T_FLUSH => {
+                if !self.writable || self.disk.sync_all().is_ok() {
+                    Self::S_OK
+                } else {
+                    Self::S_IOERR
+                }
+            }
+            _ => Self::S_UNSUPP,
+        };
+        ram.write(bufs[status_idx].addr, &[status]);
         written + 1
     }
 }
@@ -982,6 +1045,62 @@ mod tests {
         let mut data = [0xffu8; 512];
         r.read(DATA + 16, &mut data);
         assert!(data.iter().all(|&b| b == 0));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn blk_writable_persists_to_disk() {
+        let path = tmp("blk-w.img");
+        std::fs::write(&path, vec![0u8; 4096]).unwrap();
+        let mut blk = BlkDevice::open_writable(&path).unwrap();
+        let m = ram();
+        let r = m.ram();
+        r.write_u32(DATA, BlkDevice::T_OUT);
+        r.write(DATA + 8, &1u64.to_le_bytes()); // sector 1
+        let payload = [0xABu8; 512];
+        r.write(DATA + 16, &payload);
+        let bufs = vec![
+            Buf { addr: DATA, len: 16, writable: false },        // header
+            Buf { addr: DATA + 16, len: 512, writable: false },  // data: guest -> device
+            Buf { addr: DATA + 16 + 512, len: 1, writable: true }, // status
+        ];
+        assert_eq!(blk.handle(0, &r, &bufs), 1); // OUT writes nothing back, just status
+        assert_eq!(r.read_u32(DATA + 16 + 512) & 0xff, BlkDevice::S_OK as u32);
+        drop(blk);
+        let disk = std::fs::read(&path).unwrap();
+        assert_eq!(&disk[512..1024], &payload, "sector 1 persisted to the host file");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn blk_readonly_rejects_writes() {
+        let path = tmp("blk-ro.img");
+        std::fs::write(&path, vec![0u8; 1024]).unwrap();
+        let mut blk = BlkDevice::open(&path).unwrap(); // read-only
+        let m = ram();
+        let r = m.ram();
+        r.write_u32(DATA, BlkDevice::T_OUT);
+        r.write(DATA + 8, &0u64.to_le_bytes());
+        r.write(DATA + 16, &[0xABu8; 512]);
+        let bufs = vec![
+            Buf { addr: DATA, len: 16, writable: false },
+            Buf { addr: DATA + 16, len: 512, writable: false },
+            Buf { addr: DATA + 16 + 512, len: 1, writable: true },
+        ];
+        blk.handle(0, &r, &bufs);
+        assert_eq!(r.read_u32(DATA + 16 + 512) & 0xff, BlkDevice::S_IOERR as u32);
+        assert!(std::fs::read(&path).unwrap().iter().all(|&b| b == 0), "file untouched");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn blk_advertises_ro_feature_only_when_readonly() {
+        let path = tmp("blk-feat.img");
+        std::fs::write(&path, vec![0u8; 512]).unwrap();
+        let ro = BlkDevice::open(&path).unwrap();
+        let rw = BlkDevice::open_writable(&path).unwrap();
+        assert_eq!(ro.device_features(0) & BlkDevice::F_RO, BlkDevice::F_RO);
+        assert_eq!(rw.device_features(0) & BlkDevice::F_RO, 0);
         std::fs::remove_file(&path).ok();
     }
 

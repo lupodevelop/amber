@@ -55,6 +55,10 @@ pub struct VmConfig {
     /// Host image file to back the guest's virtio-blk root device (e.g. a
     /// squashfs base). None means no block device.
     pub disk: Option<PathBuf>,
+    /// Writable data disks attached after the root (`/dev/vdb`, `/dev/vdc`, …);
+    /// their writes persist to the backing files. A `run`-time feature, separate
+    /// from the snapshot/template model (which captures only the root).
+    pub data_disks: Vec<PathBuf>,
     /// If set, snapshot the VM to `dir` once it has run for `after`, then stop.
     pub snapshot: Option<SnapshotReq>,
     /// A control-channel fd (from amberd) carrying balloon targets, etc.
@@ -82,6 +86,7 @@ impl Default for VmConfig {
             // back for boot debugging).
             cmdline: "console=ttyAMA0 quiet".into(),
             disk: None,
+            data_disks: Vec::new(),
             snapshot: None,
             control_fd: None,
         }
@@ -127,10 +132,16 @@ impl Vm {
         // Block device first (so it is /dev/vda) if there is a disk, then an
         // entropy source, then the network (if any). Indices set each device's
         // MMIO window and interrupt.
+        // Block devices first and contiguous, so the kernel names them vda, vdb…
+        // in attach order: the read-only root, then any writable data disks.
         let mut virtio: Vec<VirtioDev> = Vec::new();
         if let Some(path) = &cfg.disk {
             let i = virtio.len();
             virtio.push(VirtioDev::new(i, Box::new(BlkDevice::open(path)?)));
+        }
+        for path in &cfg.data_disks {
+            let i = virtio.len();
+            virtio.push(VirtioDev::new(i, Box::new(BlkDevice::open_writable(path)?)));
         }
         let i = virtio.len();
         virtio.push(VirtioDev::new(i, Box::new(RngDevice::open()?)));
