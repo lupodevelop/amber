@@ -196,8 +196,10 @@ ram_budget = "4GiB"     # hard ceiling for the sum of live VMs (admission contro
 pool_size  = 2          # warm forks to keep per template
 
 [template.pytools]
-image   = "docker.io/library/python:3.12-slim"
-ram_cap = "384MiB"      # guest RAM and the amount accounted against the budget
+image    = "docker.io/library/python:3.12-slim"
+ram_cap  = "384MiB"     # guest RAM and the amount accounted against the budget
+disk_bps = "50MiB"      # optional I/O rate caps (token bucket, 1s burst)
+net_bps  = "10MiB"
   [template.pytools.env]
   PYTHONUNBUFFERED = "1"
 ```

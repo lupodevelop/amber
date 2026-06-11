@@ -489,6 +489,20 @@ fn cmd_vm(args: &[String]) -> ExitCode {
                 if t.ram_cap.is_some() && mem.is_none() {
                     eprintln!("warning: bad ram_cap for template '{target}', using default");
                 }
+                // Template I/O caps flow to the devices via the env knobs they
+                // read at construction (as plain bytes/s). An explicit env from
+                // the operator wins over the manifest.
+                for (var, cap) in
+                    [("AMBER_DISK_BPS", &t.disk_bps), ("AMBER_NET_BPS", &t.net_bps)]
+                {
+                    if std::env::var_os(var).is_none() {
+                        if let Some(b) = cap.as_deref().and_then(manifest::parse_size) {
+                            std::env::set_var(var, b.to_string());
+                        } else if cap.is_some() {
+                            eprintln!("warning: bad {var} value for template '{target}', ignoring");
+                        }
+                    }
+                }
                 (t.image.clone(), mem, t.env.clone())
             }
             None => (target.clone(), None, HashMap::new()),

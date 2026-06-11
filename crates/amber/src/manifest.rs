@@ -34,6 +34,9 @@ pub struct Template {
     pub image: String,
     /// Per-VM memory ceiling, e.g. "512MiB".
     pub ram_cap: Option<String>,
+    /// I/O rate caps in bytes/second, e.g. "50MiB" (token bucket, 1 s burst).
+    pub disk_bps: Option<String>,
+    pub net_bps: Option<String>,
     #[serde(default)]
     pub env: HashMap<String, String>,
 
