@@ -55,10 +55,10 @@ pub struct VmConfig {
     /// Host image file to back the guest's virtio-blk root device (e.g. a
     /// squashfs base). None means no block device.
     pub disk: Option<PathBuf>,
-    /// Writable data disks attached after the root (`/dev/vdb`, `/dev/vdc`, …);
-    /// their writes persist to the backing files. A `run`-time feature, separate
-    /// from the snapshot/template model (which captures only the root).
-    pub data_disks: Vec<PathBuf>,
+    /// Data disks attached after the root (`/dev/vdb`, `/dev/vdc`, …) as
+    /// `(path, writable)`; writes persist to the backing files. A `run`-time
+    /// feature, separate from the snapshot/template model (root-only).
+    pub data_disks: Vec<(PathBuf, bool)>,
     /// If set, snapshot the VM to `dir` once it has run for `after`, then stop.
     pub snapshot: Option<SnapshotReq>,
     /// A control-channel fd (from amberd) carrying balloon targets, etc.
@@ -139,9 +139,14 @@ impl Vm {
             let i = virtio.len();
             virtio.push(VirtioDev::new(i, Box::new(BlkDevice::open(path)?)));
         }
-        for path in &cfg.data_disks {
+        for (path, writable) in &cfg.data_disks {
             let i = virtio.len();
-            virtio.push(VirtioDev::new(i, Box::new(BlkDevice::open_writable(path)?)));
+            let dev = if *writable {
+                BlkDevice::open_writable(path)?
+            } else {
+                BlkDevice::open(path)?
+            };
+            virtio.push(VirtioDev::new(i, Box::new(dev)));
         }
         let i = virtio.len();
         virtio.push(VirtioDev::new(i, Box::new(RngDevice::open()?)));

@@ -88,14 +88,14 @@ usage: amber <command> [args]
 
   images & disks
     pull <image>                            pre-pull / refresh into the cache
-    disk create <path> <size>               make a writable data disk image
+    disk create <path> <size> [--raw]       make an ext4 data disk (mounts at /data)
     boot <kernel-Image> [initramfs] [disk]  boot a raw kernel (no OCI)
 
   env
     AMBER_NET=none        disable networking (on by default)
     AMBER_PORTS=8080:80   forward a host port to the guest
     AMBER_VCPUS=4         guest CPUs (1-8, default 1)
-    AMBER_DISK=data.img   attach a writable data disk (/dev/vdb)
+    AMBER_DISK=data.img   attach a data disk at /data (:ro for read-only)
     AMBER_GIC=hw          use the in-kernel vGIC (no snapshot timer)
 
 docs: README.md  ·  config: amber.toml
@@ -373,15 +373,19 @@ fn cmd_lockdown_probe() -> ExitCode {
     }
 }
 
-/// `amber disk create <path> <size>` — make a sparse raw image to attach as a
-/// writable data disk (`AMBER_DISK=<path>`). The guest formats and mounts it.
+/// `amber disk create <path> <size> [--raw]` — make a data-disk image and format
+/// it ext4 (Firecracker-style, the host formats; the guest only mounts, at /data).
+/// macOS has no mkfs.ext4, so formatting runs in the same Docker container the
+/// kernel build uses; `--raw` (or no Docker) leaves a blank image for the guest
+/// to format itself.
 fn cmd_disk(args: &[String]) -> ExitCode {
     match args.get(2).map(String::as_str) {
         Some("create") => {
             let (Some(path), Some(size)) = (args.get(3), args.get(4)) else {
-                eprintln!("usage: amber disk create <path> <size>   (e.g. 1GiB)");
+                eprintln!("usage: amber disk create <path> <size> [--raw]   (e.g. 1GiB)");
                 return ExitCode::FAILURE;
             };
+            let raw = args.iter().any(|a| a == "--raw");
             let Some(bytes) = manifest::parse_size(size) else {
                 eprintln!("bad size '{size}' (try 512MiB, 2GiB, 1048576)");
                 return ExitCode::FAILURE;
@@ -394,24 +398,56 @@ fn cmd_disk(args: &[String]) -> ExitCode {
                         eprintln!("cannot size {path}: {e}");
                         return ExitCode::FAILURE;
                     }
-                    println!("created {path} ({} MiB, sparse). attach: AMBER_DISK={path}", bytes / (1024 * 1024));
-                    ExitCode::SUCCESS
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     eprintln!("{path} already exists");
-                    ExitCode::FAILURE
+                    return ExitCode::FAILURE;
                 }
                 Err(e) => {
                     eprintln!("cannot create {path}: {e}");
-                    ExitCode::FAILURE
+                    return ExitCode::FAILURE;
+                }
+            }
+            let mib = bytes / (1024 * 1024);
+            if raw {
+                println!("created {path} ({mib} MiB, raw/unformatted). attach: AMBER_DISK={path}");
+                return ExitCode::SUCCESS;
+            }
+            match mkfs_ext4(path) {
+                Ok(()) => {
+                    println!("created {path} ({mib} MiB, ext4). attach: AMBER_DISK={path} (mounts at /data)");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("ext4 format failed ({e}); leaving a raw image (format it in the guest, or retry with Docker running)");
+                    ExitCode::SUCCESS
                 }
             }
         }
         _ => {
-            eprintln!("usage: amber disk create <path> <size>");
+            eprintln!("usage: amber disk create <path> <size> [--raw]");
             ExitCode::FAILURE
         }
     }
+}
+
+/// Format an image ext4 via `mke2fs` in a Linux container (macOS has none).
+fn mkfs_ext4(path: &str) -> std::io::Result<()> {
+    let abs = std::fs::canonicalize(path)?;
+    let dir = abs.parent().ok_or_else(|| std::io::Error::other("no parent dir"))?;
+    let name = abs.file_name().unwrap().to_string_lossy().into_owned();
+    let out = std::process::Command::new("docker")
+        .args(["run", "--rm", "-v"])
+        .arg(format!("{}:/work", dir.display()))
+        .args(["debian:bookworm", "mke2fs", "-t", "ext4", "-F", "-q"])
+        .arg(format!("/work/{name}"))
+        .output()?;
+    if !out.status.success() {
+        return Err(std::io::Error::other(
+            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn cmd_pause(args: &[String]) -> ExitCode {
@@ -581,7 +617,32 @@ fn cmd_vm(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let initrd = match build_bootstrap(&built.config, &argv) {
+    // Data disks (persistent): AMBER_DISK=path[:ro][,path...] plus a template's
+    // `disks`. Attached after the root as /dev/vdb, /dev/vdc, … Parsed before the
+    // bootstrap so the init can mount them. Missing files are a hard error — a
+    // typo'd disk path should fail loudly, not silently boot diskless.
+    let mut data_disks: Vec<(std::path::PathBuf, bool)> = Vec::new();
+    let mut parse_disk = |spec: &str| {
+        let (path, writable) = match spec.strip_suffix(":ro") {
+            Some(p) => (p, false),
+            None => (spec, true),
+        };
+        data_disks.push((path.into(), writable));
+    };
+    if let Ok(list) = std::env::var("AMBER_DISK") {
+        list.split(',').filter(|s| !s.is_empty()).for_each(&mut parse_disk);
+    }
+    if let Some(t) = manifest.as_ref().and_then(|m| m.template(target)) {
+        t.disks.iter().for_each(|s| parse_disk(s));
+    }
+    for (d, _) in &data_disks {
+        if !d.exists() {
+            eprintln!("disk not found: {} (create one: amber disk create {} <size>)", d.display(), d.display());
+            return ExitCode::FAILURE;
+        }
+    }
+
+    let initrd = match build_bootstrap(&built.config, &argv, data_disks.len()) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("bootstrap initramfs: {e}");
@@ -618,22 +679,6 @@ fn cmd_vm(args: &[String]) -> ExitCode {
         })
         .unwrap_or(1)
         .clamp(1, 8);
-    // Writable data disks (persistent): AMBER_DISK=path[,path...] plus a template's
-    // `disks`. Attached after the root as /dev/vdb, /dev/vdc, … Missing files are a
-    // hard error — a typo'd disk path should fail loudly, not silently boot diskless.
-    let mut data_disks: Vec<std::path::PathBuf> = Vec::new();
-    if let Ok(list) = std::env::var("AMBER_DISK") {
-        data_disks.extend(list.split(',').filter(|s| !s.is_empty()).map(Into::into));
-    }
-    if let Some(t) = manifest.as_ref().and_then(|m| m.template(target)) {
-        data_disks.extend(t.disks.iter().map(Into::into));
-    }
-    for d in &data_disks {
-        if !d.exists() {
-            eprintln!("disk not found: {} (create one: amber disk create {} <size>)", d.display(), d.display());
-            return ExitCode::FAILURE;
-        }
-    }
     cfg.data_disks = data_disks;
     // Control channel from amberd (balloon targets, etc.), if it passed one.
     cfg.control_fd = std::env::var("AMBER_CONTROL_FD").ok().and_then(|s| s.parse().ok());
@@ -853,9 +898,14 @@ mod guest {
 }
 
 /// Build the gzipped cpio that bootstraps the image: load the virtio/fs modules,
-/// mount the squashfs base read-only under a tmpfs overlay, and exec the command
-/// inside it. Env and working dir come from the image config.
-fn build_bootstrap(config: &amber_image::ImageConfig, argv: &[String]) -> std::io::Result<Vec<u8>> {
+/// mount the squashfs base read-only under a tmpfs overlay, mount any data disks
+/// at /data, and exec the command inside it. Env and working dir come from the
+/// image config.
+fn build_bootstrap(
+    config: &amber_image::ImageConfig,
+    argv: &[String],
+    data_disks: usize,
+) -> std::io::Result<Vec<u8>> {
     let busybox = std::fs::read(guest::BUSYBOX)?;
     let musl = std::fs::read(guest::MUSL)?;
     // None => a built-in-everything kernel (resin): no modules to insmod.
@@ -884,6 +934,19 @@ fn build_bootstrap(config: &amber_image::ImageConfig, argv: &[String]) -> std::i
     init.push_str("mount -t devtmpfs dev /newroot/dev\n");
     init.push_str("mount -t proc proc /newroot/proc\n");
     init.push_str("mount -t sysfs sysfs /newroot/sys\n");
+    // Data disks: mount pre-formatted ext4 images at /data, /data2, … Mount-only
+    // (Firecracker-style: formatting is the host's job — `amber disk create`);
+    // an unformatted or foreign disk stays accessible as the raw /dev/vdX.
+    for i in 0..data_disks {
+        let dev = format!("/dev/vd{}", (b'b' + i as u8) as char);
+        let mp = if i == 0 { "/newroot/data".into() } else { format!("/newroot/data{}", i + 1) };
+        // `noload` on the read-only fallback: an uncleanly-detached image has a
+        // dirty journal, and ext4 refuses ro-mounts that would need replay.
+        init.push_str(&format!(
+            "mkdir -p {mp}; mount -t ext4 {dev} {mp} 2>/dev/null || \
+             mount -t ext4 -o ro,noload {dev} {mp} 2>/dev/null || rmdir {mp} 2>/dev/null\n"
+        ));
+    }
     // Auto-configure networking when a virtio-net device is present (AMBER_NET set).
     // The static address and gateway must match amber-net's backend (guest
     // 10.0.0.2/24, gateway+resolver 10.0.0.1); resolv.conf goes into the chroot root
@@ -909,6 +972,15 @@ fn build_bootstrap(config: &amber_image::ImageConfig, argv: &[String]) -> std::i
         argv.iter().map(|a| sh_quote(a)).collect::<Vec<_>>().join(" ")
     );
     init.push_str(&format!("chroot /newroot /bin/sh -c {}\n", sh_quote(&inner)));
+    // Unmount data disks cleanly before poweroff: flushes writes and leaves the
+    // ext4 journal clean, so the image mounts read-only elsewhere without replay.
+    if data_disks > 0 {
+        init.push_str("sync\n");
+        for i in 0..data_disks {
+            let mp = if i == 0 { "/newroot/data".into() } else { format!("/newroot/data{}", i + 1) };
+            init.push_str(&format!("umount {mp} 2>/dev/null\n"));
+        }
+    }
     init.push_str("poweroff -f\n");
 
     let mut cpio = amber_image::Cpio::new();
