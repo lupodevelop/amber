@@ -551,7 +551,20 @@ fn cmd_boot(args: &[String]) -> ExitCode {
     let initrd = args.get(3).and_then(|p| std::fs::read(p).ok());
     let disk = args.get(4).map(std::path::PathBuf::from);
 
-    let cfg = VmConfig { kernel, initrd, disk, snapshot: snapshot_from_env(), ..Default::default() };
+    // AMBER_VCPUS=<n> for an SMP boot (clamped 1..8); default single-vcpu.
+    let vcpus = std::env::var("AMBER_VCPUS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1usize)
+        .clamp(1, 8);
+    let cfg = VmConfig {
+        kernel,
+        initrd,
+        disk,
+        vcpus,
+        snapshot: snapshot_from_env(),
+        ..Default::default()
+    };
 
     let vm = match Vm::prepare(&cfg, None) {
         Ok(vm) => vm,
