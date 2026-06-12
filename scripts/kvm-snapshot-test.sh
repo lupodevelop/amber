@@ -52,7 +52,7 @@ docker run --rm -v "$ROOT:/work" -v "$WORK:/out" -w /work rust:bookworm bash -eu
   # Run 1 boots and snapshots the parked guest — stdin is an open pipe with no
   # data (tail -f) so its `read` blocks until the snapshot stops it. Run 2 feeds
   # a line into the restored guest, which then prints KVM_E2E_POST and powers off.
-  printf "#!/bin/busybox sh\n/bin/busybox --install -s /bin\nexport PATH=/bin\nmount -t proc proc /proc\nmount -t sysfs sysfs /sys\nmount -t devtmpfs dev /dev\nmount -t tmpfs tmpfs /snap\necho ==BOOT==\ntail -f /dev/null | AMBER_NET=none RUST_LOG=info AMBER_SNAPSHOT=/snap AMBER_SNAPSHOT_MARKER=KVM_E2E_PRE AMBER_SNAPSHOT_AFTER_MS=600000 /amber boot /resin /e2e.gz\necho snap-rc=\$?\nls /snap\necho ==RESTORE==\necho hello-from-restore | RUST_LOG=info AMBER_NET=none /amber restore /snap\necho restore-rc=\$?\npoweroff -f\n" > $oo/init
+  printf "#!/bin/busybox sh\n/bin/busybox --install -s /bin\nexport PATH=/bin\nmount -t proc proc /proc\nmount -t sysfs sysfs /sys\nmount -t devtmpfs dev /dev\nmount -t tmpfs tmpfs /snap\necho ==BOOT==\nAMBER_NET=none RUST_LOG=info AMBER_SNAPSHOT=/snap AMBER_SNAPSHOT_MARKER=KVM_E2E_PRE AMBER_SNAPSHOT_AFTER_MS=600000 /amber boot /resin /e2e.gz < /dev/null\necho snap-rc=\$?\nls /snap\necho ==RESTORE==\necho hello-from-restore | RUST_LOG=info AMBER_NET=none /amber restore /snap\necho restore-rc=\$?\npoweroff -f\n" > $oo/init
   chmod +x $oo/init
   ( cd $oo && find . | cpio -o -H newc 2>/dev/null | gzip > /out/snap-initramfs.gz )'
 
