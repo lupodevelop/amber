@@ -194,12 +194,15 @@ impl Hypervisor for KvmVm {
     }
 
     fn kick(&self) {
-        // Interrupt any vcpu blocked in KVM_RUN (e.g. a halted WFI) so its run
-        // loop returns and re-checks deadlines. tgkill targets the exact thread.
-        let pid = unsafe { libc::getpid() };
-        for &tid in self.kick_tids.lock().unwrap().iter() {
-            unsafe { libc::syscall(libc::SYS_tgkill, pid as i64, tid as i64, libc::SIGUSR1) };
-        }
+        self.signal_vcpus();
+    }
+
+    fn request_stop(&self) {
+        // Same SIGUSR1 kick: break every vcpu out of a blocking KVM_RUN so its
+        // loop observes `running == false` and exits. The run loop sets the flag
+        // before calling this, so a kicked secondary leaves for good rather than
+        // resuming — that's the only way to join a vcpu halted on WFI.
+        self.signal_vcpus();
     }
 
     fn capture_gic(&self) -> Result<Vec<u8>> {
@@ -208,6 +211,18 @@ impl Hypervisor for KvmVm {
 
     fn restore_gic(&self, blob: &[u8]) -> Result<()> {
         gic::restore(&self.vgic, NR_IRQS, self.vcpus, blob)
+    }
+}
+
+impl KvmVm {
+    /// Interrupt every running vcpu with SIGUSR1 so a blocking KVM_RUN (e.g. a
+    /// halted WFI) returns EINTR and its loop re-checks flags/deadlines. tgkill
+    /// targets each vcpu's exact thread.
+    fn signal_vcpus(&self) {
+        let pid = unsafe { libc::getpid() };
+        for &tid in self.kick_tids.lock().unwrap().iter() {
+            unsafe { libc::syscall(libc::SYS_tgkill, pid as i64, tid as i64, libc::SIGUSR1) };
+        }
     }
 }
 

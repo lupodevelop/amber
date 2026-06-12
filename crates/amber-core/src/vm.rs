@@ -848,9 +848,13 @@ fn control_reader<H: Hypervisor>(
             }
             crate::control::PAUSE => {
                 *pause.0.lock().unwrap() = true;
-                // Make compute-bound vcpus return to their loops and block on
-                // the gate (a vcpu that never exits would otherwise keep running).
+                // Make every vcpu return to its loop and block on the gate. HVF
+                // uses the yield flag (compute-bound vcpus exit at the next forced
+                // exit); KVM needs a kick to break a WFI-halted vcpu out of a
+                // blocking KVM_RUN. The gate then parks it until RESUME, so one
+                // kick is enough. Each call is a no-op on the other backend.
                 hv.set_yield(true);
+                hv.kick();
             }
             crate::control::RESUME => {
                 *pause.0.lock().unwrap() = false;
