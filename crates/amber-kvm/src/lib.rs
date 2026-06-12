@@ -10,4 +10,5 @@
 #![cfg(target_os = "linux")]
 
 mod backend;
+mod gic;
 pub use backend::{selftest, KvmVm};

@@ -7,6 +7,7 @@
 //! exit's data buffer from amber-core's `complete_mmio_read` (KVM advances the
 //! PC itself, so `advance_mmio` is a no-op).
 
+use crate::gic;
 use amber_core::hypervisor::{Hypervisor, MmioAccess, Vcpu, VmExit};
 use amber_core::snapshot::CpuSnapshot;
 use amber_core::{Error, GicInfo, GicKind, GuestMemory, Result};
@@ -48,9 +49,10 @@ pub struct KvmVm {
     _kvm: Kvm,
     vm: Arc<VmFd>,
     gic: GicInfo,
+    vcpus: usize,
     run_size: usize,
-    // The vGIC device fd: kept alive for the VM's lifetime.
-    _vgic: DeviceFd,
+    // The vGIC device fd: kept alive for the VM's lifetime + used for save/restore.
+    vgic: DeviceFd,
 }
 
 fn set_vgic_attr(vgic: &DeviceFd, group: u32, attr: u64, value: u64) -> Result<()> {
@@ -111,7 +113,7 @@ impl Hypervisor for KvmVm {
         };
         let run_size = kvm.get_vcpu_mmap_size().map_err(kvm_err("mmap size"))?;
         log::info!("KVM: vGICv3, dist {GICD_BASE:#x}, redist {GICR_BASE:#x}");
-        Ok(KvmVm { _kvm: kvm, vm: Arc::new(vm), gic, run_size, _vgic: vgic })
+        Ok(KvmVm { _kvm: kvm, vm: Arc::new(vm), gic, vcpus: vcpus.max(1), run_size, vgic })
     }
 
     fn create_vcpu(&self, id: u8) -> Result<KvmVcpu> {
@@ -129,7 +131,7 @@ impl Hypervisor for KvmVm {
 
         // The vGIC is INIT'd once vcpu 0 (its redistributor) exists.
         if id == 0 {
-            set_vgic_attr(&self._vgic, KVM_DEV_ARM_VGIC_GRP_CTRL, KVM_DEV_ARM_VGIC_CTRL_INIT as u64, 0)?;
+            set_vgic_attr(&self.vgic, KVM_DEV_ARM_VGIC_GRP_CTRL, KVM_DEV_ARM_VGIC_CTRL_INIT as u64, 0)?;
         }
 
         let run = unsafe {
@@ -156,6 +158,14 @@ impl Hypervisor for KvmVm {
         // SPI: type(1) in bits[27:24], the GIC INTID (absolute, ≥32) in bits[15:0].
         let irq = (1u32 << 24) | intid;
         self.vm.set_irq_line(irq, level).map_err(kvm_err("KVM_IRQ_LINE"))
+    }
+
+    fn capture_gic(&self) -> Result<Vec<u8>> {
+        gic::capture(&self.vgic, NR_IRQS, self.vcpus)
+    }
+
+    fn restore_gic(&self, blob: &[u8]) -> Result<()> {
+        gic::restore(&self.vgic, NR_IRQS, self.vcpus, blob)
     }
 }
 
@@ -302,12 +312,13 @@ pub fn selftest() -> Result<()> {
     v.set_pc(0)?;
     v.restore(&snap)?;
     let (pc, x5) = (v.pc()?, v.get_x(5)?);
-    if pc == 0x4001_2340 && x5 == 0xdead_beef_cafe_f00d {
-        println!("KVM_SELFTEST_OK regs={}", snap.kvm_regs.len());
-        Ok(())
-    } else {
-        Err(Error::Snapshot(format!("register round-trip mismatch: pc={pc:#x} x5={x5:#x}")))
+    if pc != 0x4001_2340 || x5 != 0xdead_beef_cafe_f00d {
+        return Err(Error::Snapshot(format!("register round-trip mismatch: pc={pc:#x} x5={x5:#x}")));
     }
+    // vGIC save/restore round-trip on the same VM (vcpu 0 INIT'd the vGIC).
+    let gic_regs = gic::selftest(&vm.vgic, NR_IRQS, vm.vcpus)?;
+    println!("KVM_SELFTEST_OK regs={} gic_regs={gic_regs}", snap.kvm_regs.len());
+    Ok(())
 }
 
 impl Drop for KvmVcpu {
