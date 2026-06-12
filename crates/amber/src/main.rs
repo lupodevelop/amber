@@ -24,7 +24,7 @@ fn main() -> ExitCode {
         Some("run") => cmd_run(&args),
         // Internal worker: run one VM in-process (spawned by amberd).
         Some("__vm") => cmd_vm(&args),
-        Some("__lockdown-probe") => cmd_lockdown_probe(),
+        Some("__lockdown-probe") => cmd_lockdown_probe(&args),
         #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
         Some("__kvm-selftest") => match amber_kvm::selftest() {
             Ok(()) => ExitCode::SUCCESS,
@@ -363,17 +363,41 @@ fn cmd_rm(args: &[String]) -> ExitCode {
     }
 }
 
-/// Hidden self-test: apply the VMM lockdown, then verify the denies actually
-/// bite (exec and filesystem writes must fail). Used by the integration suite.
-fn cmd_lockdown_probe() -> ExitCode {
-    if let Err(e) = (amber_core::lockdown::Policy::default()).apply() {
+/// Hidden self-test: apply the VMM lockdown, then verify the denies bite (exec
+/// and outside-the-allowlist writes fail) and, given `__lockdown-probe <dir>`,
+/// that the grants still permit (writes inside `dir` and new sockets succeed —
+/// the snapshot/network paths must survive lockdown). Used by the integration suite.
+fn cmd_lockdown_probe(args: &[String]) -> ExitCode {
+    let allow_dir = args.get(2).cloned();
+    let policy = match &allow_dir {
+        Some(dir) => amber_core::lockdown::Policy {
+            write_paths: vec![dir.into()],
+            net: true,
+        },
+        None => amber_core::lockdown::Policy::default(),
+    };
+    if let Err(e) = policy.apply() {
         eprintln!("lockdown apply failed: {e}");
         return ExitCode::FAILURE;
     }
     let exec_blocked = std::process::Command::new("/usr/bin/true").status().is_err();
-    let write_blocked = std::fs::write("/tmp/amber-lockdown-probe", b"x").is_err();
-    let _ = std::fs::remove_file("/tmp/amber-lockdown-probe"); // in case it got through
-    if exec_blocked && write_blocked {
+    // A normally-writable spot outside any allowed dir: the deny must bite here.
+    let outside = std::env::temp_dir().join("amber-lockdown-outside");
+    let write_blocked = std::fs::write(&outside, b"x").is_err();
+    let _ = std::fs::remove_file(&outside);
+    let mut ok = exec_blocked && write_blocked;
+    if let Some(dir) = &allow_dir {
+        // Grants: a write inside the allowed dir and a new socket must succeed.
+        let inside = std::path::Path::new(dir).join("probe");
+        let write_inside_ok = std::fs::write(&inside, b"x").is_ok();
+        let _ = std::fs::remove_file(&inside);
+        let sock_ok = std::net::UdpSocket::bind("127.0.0.1:0").is_ok();
+        ok &= write_inside_ok && sock_ok;
+        if !(write_inside_ok && sock_ok) {
+            eprintln!("LOCKDOWN_GRANT_LEAK: write_inside={write_inside_ok} sock={sock_ok}");
+        }
+    }
+    if ok {
         println!("LOCKDOWN_OK");
         ExitCode::SUCCESS
     } else {
@@ -703,6 +727,12 @@ fn cmd_vm(args: &[String]) -> ExitCode {
         cfg.snapshot = Some(amber_core::SnapshotReq {
             after: std::time::Duration::from_millis(ms),
             dir: dir.into(),
+            // AMBER_SNAPSHOT_MARKER=<text>: capture the instant the guest prints
+            // it (deterministic), instead of after the fixed delay above.
+            marker: std::env::var("AMBER_SNAPSHOT_MARKER")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(|s| s.into_bytes()),
         });
     }
     // Restore earlycon + verbose boot dmesg for debugging (off by default because
@@ -809,7 +839,11 @@ fn cmd_template(args: &[String]) -> ExitCode {
     // the init auto-configures eth0. (The fork's restore provides a fresh backend.)
     std::env::set_var("AMBER_NET", "smoltcp");
     std::env::set_var("AMBER_SNAPSHOT", dir);
-    std::env::set_var("AMBER_SNAPSHOT_AFTER_MS", "2500");
+    // Snapshot the instant the agent announces readiness — deterministic, so the
+    // template captures a fully-booted guest parked on `read` regardless of how
+    // long the boot took. The delay is only a fallback if the marker never comes.
+    std::env::set_var("AMBER_SNAPSHOT_MARKER", "__AMBER_READY__");
+    std::env::set_var("AMBER_SNAPSHOT_AFTER_MS", "30000");
     let vm_args = vec![
         "amber".into(),
         "__vm".into(),

@@ -68,11 +68,15 @@ pub struct VmConfig {
     pub control_fd: Option<RawFd>,
 }
 
-/// A request to capture a snapshot after the guest has run for a while.
+/// A request to capture a snapshot once the guest is ready. Triggered either by
+/// a console marker (deterministic — fires the instant the guest prints it) or,
+/// if no marker is set, after a wall-clock delay.
 #[derive(Clone)]
 pub struct SnapshotReq {
     pub after: std::time::Duration,
     pub dir: PathBuf,
+    /// Console-output sentinel; when the guest's TX ends with these bytes, snapshot.
+    pub marker: Option<Vec<u8>>,
 }
 
 impl Default for VmConfig {
@@ -372,6 +376,14 @@ impl Vm {
 
         let pl011_intid = layout::GIC_SPI_BASE + layout::PL011_SPI;
 
+        // Arm the console snapshot trigger (if the request carries a marker) so the
+        // loop captures the instant the guest prints it.
+        if let Some(req) = snapshot.as_ref() {
+            if let Some(m) = &req.marker {
+                pl011.arm_marker(m.clone());
+            }
+        }
+
         // Shared device model: secondary vcpus take MMIO exits on their own
         // threads, so every device sits behind a Mutex. MMIO is rare relative to
         // guest execution; contention is not a hot path.
@@ -427,6 +439,30 @@ impl Vm {
                 });
             }
 
+            // Snapshot kicker: where an idle guest blocks in the kernel (KVM's
+            // WFI), nothing returns to the loop to notice the snapshot deadline.
+            // Once it passes, kick the vcpu(s) out of `run` so the loop captures;
+            // repeat to beat the race of a kick landing just before `run` re-enters.
+            // A no-op on backends whose idle path already returns (HVF).
+            if let Some(req) = snapshot {
+                let after = req.after;
+                s.spawn(move || {
+                    // Past the fallback deadline, kick the vcpu out of a blocking
+                    // KVM_RUN so the loop can capture even if a console marker
+                    // never arrives. Polls `running` so teardown joins promptly
+                    // (and a marker that fires earlier ends this at once).
+                    loop {
+                        if !running.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        if started.elapsed() >= after {
+                            hv.kick();
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                });
+            }
+
             // Primary vcpu loop on this thread.
             let mut step = || -> Result<bool> {
                 // Live pause: block the vcpu here while paused (the control reader
@@ -452,7 +488,12 @@ impl Vm {
                 // then stop (restore is a separate path). prepare() guarantees
                 // vcpus == 1 when a snapshot is armed.
                 if let Some(req) = snapshot {
-                    if started.elapsed() >= req.after {
+                    // Fire on the console marker if one is armed (deterministic),
+                    // else on the wall-clock deadline.
+                    let due = (req.marker.is_some() && pl011.lock().unwrap().marked())
+                        || started.elapsed() >= req.after;
+                    if due {
+                        log::info!("snapshot: trigger reached, capturing vcpu state");
                         // Quiesce: every secondary must be out of guest execution
                         // (registers self-captured, parked) before RAM is dumped.
                         let mut cpus = vec![vcpu.capture()?];

@@ -68,6 +68,13 @@ pub struct Pl011 {
     fbrd: u32,
     lcr_h: u32,
     ifls: u32,
+    // Console-output trigger: when `marker` is non-empty, `marked` latches the
+    // first time the guest's TX stream ends with it. The run loop uses this to
+    // snapshot exactly when the guest announces readiness (deterministic, unlike
+    // a wall-clock delay). `tx_tail` is the last `marker.len()` bytes written.
+    marker: Vec<u8>,
+    tx_tail: VecDeque<u8>,
+    marked: bool,
 }
 
 impl Pl011 {
@@ -110,7 +117,23 @@ impl Pl011 {
             fbrd: 0,
             lcr_h: 0,
             ifls: 0,
+            marker: Vec::new(),
+            tx_tail: VecDeque::new(),
+            marked: false,
         }
+    }
+
+    /// Arm a console-output trigger: `marked()` latches once the guest's TX
+    /// stream ends with `marker`. Empty disables it.
+    pub fn arm_marker(&mut self, marker: Vec<u8>) {
+        self.marker = marker;
+        self.tx_tail.clear();
+        self.marked = false;
+    }
+
+    /// Whether the armed marker has appeared in the guest's console output.
+    pub fn marked(&self) -> bool {
+        self.marked
     }
 
     /// Push a received byte from the host into the RX FIFO and raise the raw RX
@@ -179,9 +202,20 @@ impl Pl011 {
         let v32 = value as u32;
         match offset {
             Self::DR => {
-                let byte = [value as u8];
-                let _ = self.out.write_all(&byte);
+                let byte = value as u8;
+                let _ = self.out.write_all(&[byte]);
                 let _ = self.out.flush();
+                if !self.marker.is_empty() && !self.marked {
+                    self.tx_tail.push_back(byte);
+                    while self.tx_tail.len() > self.marker.len() {
+                        self.tx_tail.pop_front();
+                    }
+                    if self.tx_tail.len() == self.marker.len()
+                        && self.tx_tail.iter().eq(self.marker.iter())
+                    {
+                        self.marked = true;
+                    }
+                }
             }
             Self::IMSC => self.imsc = v32,
             Self::CR => self.cr = v32,

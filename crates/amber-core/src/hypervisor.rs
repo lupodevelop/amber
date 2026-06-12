@@ -49,6 +49,13 @@ pub trait Hypervisor: Sized {
     /// threads blocked in guest execution return and can be joined.
     fn request_stop(&self) {}
 
+    /// Force vcpu threads to return from a *blocking* `run` (as Idle) without
+    /// stopping the VM, so the run loop can re-check its deadlines. Needed where
+    /// an idle guest blocks inside the kernel (KVM halts a WFI vcpu in `KVM_RUN`
+    /// until an interrupt); a no-op where the idle path already returns to the
+    /// loop (HVF, whose preemption thread forces periodic exits).
+    fn kick(&self) {}
+
     /// While on, every vcpu returns from `run` (as Idle) at its next forced exit
     /// instead of resuming in place — so the run loop's gates (snapshot quiesce,
     /// pause) are observed even by compute-bound vcpus that never exit on their

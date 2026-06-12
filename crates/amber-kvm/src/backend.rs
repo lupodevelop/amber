@@ -14,13 +14,28 @@ use amber_core::{Error, GicInfo, GicKind, GuestMemory, Result};
 use kvm_bindings::*;
 use kvm_ioctls::{DeviceFd, Kvm, VcpuFd, VmFd};
 use std::os::fd::AsRawFd;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Once};
 
 /// `KVM_RUN` = `_IO(KVMIO, 0x80)`; KVMIO is 0xAE, and `_IO` has no size/dir bits.
 const KVM_RUN: libc::c_ulong = (0xAE << 8) | 0x80;
 
 fn errno<T>(what: &str) -> Result<T> {
     Err(Error::Backend(format!("{what}: {}", std::io::Error::last_os_error())))
+}
+
+/// The "kick" signal: an empty handler so delivery only interrupts a blocking
+/// `KVM_RUN` (returns EINTR) instead of killing the process. SIGUSR1 is unused
+/// elsewhere in amber.
+extern "C" fn kick_handler(_sig: libc::c_int) {}
+static KICK_HANDLER: Once = Once::new();
+fn install_kick_handler() {
+    KICK_HANDLER.call_once(|| unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = kick_handler as usize;
+        libc::sigemptyset(&mut sa.sa_mask);
+        // No SA_RESTART: we want the interrupted ioctl to return EINTR.
+        libc::sigaction(libc::SIGUSR1, &sa, std::ptr::null_mut());
+    });
 }
 fn kvm_err<E: std::fmt::Display>(what: &str) -> impl Fn(E) -> Error + '_ {
     move |e| Error::Backend(format!("{what}: {e}"))
@@ -53,6 +68,9 @@ pub struct KvmVm {
     run_size: usize,
     // The vGIC device fd: kept alive for the VM's lifetime + used for save/restore.
     vgic: DeviceFd,
+    // Kernel thread ids of the running vcpus, for `kick` (tgkill SIGUSR1). Each
+    // vcpu registers its own tid the first time it runs.
+    kick_tids: Arc<Mutex<Vec<libc::pid_t>>>,
 }
 
 fn set_vgic_attr(vgic: &DeviceFd, group: u32, attr: u64, value: u64) -> Result<()> {
@@ -70,6 +88,7 @@ impl Hypervisor for KvmVm {
     type Vcpu = KvmVcpu;
 
     fn create(mem: &GuestMemory, vcpus: usize) -> Result<Self> {
+        install_kick_handler();
         let kvm = Kvm::new().map_err(kvm_err("open /dev/kvm"))?;
         let vm = kvm.create_vm().map_err(kvm_err("KVM_CREATE_VM"))?;
 
@@ -113,7 +132,15 @@ impl Hypervisor for KvmVm {
         };
         let run_size = kvm.get_vcpu_mmap_size().map_err(kvm_err("mmap size"))?;
         log::info!("KVM: vGICv3, dist {GICD_BASE:#x}, redist {GICR_BASE:#x}");
-        Ok(KvmVm { _kvm: kvm, vm: Arc::new(vm), gic, vcpus: vcpus.max(1), run_size, vgic })
+        Ok(KvmVm {
+            _kvm: kvm,
+            vm: Arc::new(vm),
+            gic,
+            vcpus: vcpus.max(1),
+            run_size,
+            vgic,
+            kick_tids: Arc::new(Mutex::new(Vec::new())),
+        })
     }
 
     fn create_vcpu(&self, id: u8) -> Result<KvmVcpu> {
@@ -147,7 +174,13 @@ impl Hypervisor for KvmVm {
         if run == libc::MAP_FAILED {
             return errno("mmap kvm_run");
         }
-        Ok(KvmVcpu { fd, kvm_run: run as *mut kvm_run, mmio_len: 0 })
+        Ok(KvmVcpu {
+            fd,
+            kvm_run: run as *mut kvm_run,
+            mmio_len: 0,
+            kick_tids: self.kick_tids.clone(),
+            tid_registered: false,
+        })
     }
 
     fn gic_info(&self) -> Option<GicInfo> {
@@ -158,6 +191,15 @@ impl Hypervisor for KvmVm {
         // SPI: type(1) in bits[27:24], the GIC INTID (absolute, ≥32) in bits[15:0].
         let irq = (1u32 << 24) | intid;
         self.vm.set_irq_line(irq, level).map_err(kvm_err("KVM_IRQ_LINE"))
+    }
+
+    fn kick(&self) {
+        // Interrupt any vcpu blocked in KVM_RUN (e.g. a halted WFI) so its run
+        // loop returns and re-checks deadlines. tgkill targets the exact thread.
+        let pid = unsafe { libc::getpid() };
+        for &tid in self.kick_tids.lock().unwrap().iter() {
+            unsafe { libc::syscall(libc::SYS_tgkill, pid as i64, tid as i64, libc::SIGUSR1) };
+        }
     }
 
     fn capture_gic(&self) -> Result<Vec<u8>> {
@@ -174,6 +216,10 @@ pub struct KvmVcpu {
     kvm_run: *mut kvm_run,
     /// Length of the MMIO read currently being serviced (for complete_mmio_read).
     mmio_len: usize,
+    /// Shared with `KvmVm`: this vcpu registers its thread id here on first run
+    /// so `kick` can signal it.
+    kick_tids: Arc<Mutex<Vec<libc::pid_t>>>,
+    tid_registered: bool,
 }
 
 // The vcpu and its kvm_run mapping live on, and are driven by, a single thread.
@@ -214,6 +260,13 @@ impl Vcpu for KvmVcpu {
     }
 
     fn run(&mut self) -> Result<VmExit> {
+        // Register this thread's id once, so `kick` can break this vcpu out of a
+        // blocking KVM_RUN (the vcpu is bound to the thread that runs it).
+        if !self.tid_registered {
+            let tid = unsafe { libc::syscall(libc::SYS_gettid) } as libc::pid_t;
+            self.kick_tids.lock().unwrap().push(tid);
+            self.tid_registered = true;
+        }
         let ret = unsafe { libc::ioctl(self.fd.as_raw_fd(), KVM_RUN, 0) };
         if ret < 0 {
             let e = std::io::Error::last_os_error();
