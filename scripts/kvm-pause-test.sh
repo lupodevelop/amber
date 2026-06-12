@@ -58,15 +58,15 @@ mkfifo /ctl /in
 ( AMBER_NET=none AMBER_VCPUS=1 AMBER_CONTROL_FD=3 RUST_LOG=info /amber boot /resin /pause-inner.gz 3<>/ctl < /in > /out 2>&1; echo "amber-rc=$?" >> /out ) &
 exec 4>/in
 i=0; while [ $i -lt 60 ]; do grep -qa PAUSE_READY /out 2>/dev/null && break; sleep 1; i=$((i+1)); done
-printf '\x02' > /ctl
+printf "\x02" > /ctl
 sleep 6
-printf 'hello\n' >&4
+printf "hello\n" >&4
 sleep 8
-echo "DURING_PAUSE_GOT=$(grep -ca 'GOT=' /out)"
-printf '\x03' > /ctl
+echo "DURING_PAUSE_GOT=$(grep -ca "GOT=" /out)"
+printf "\x03" > /ctl
 sleep 8
-echo "AFTER_RESUME_GOT=$(grep -ca 'GOT=' /out)"
-echo "GUEST_OUT:"; grep -aE 'PAUSE_READY|GOT=' /out || true
+echo "AFTER_RESUME_GOT=$(grep -ca "GOT=" /out)"
+echo "GUEST_OUT:"; grep -aE "PAUSE_READY|GOT=" /out || true
 poweroff -f
 INIT
   chmod +x $oo/init
