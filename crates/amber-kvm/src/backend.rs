@@ -31,7 +31,7 @@ static KICK_HANDLER: Once = Once::new();
 fn install_kick_handler() {
     KICK_HANDLER.call_once(|| unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = kick_handler as usize;
+        sa.sa_sigaction = kick_handler as *const () as usize;
         libc::sigemptyset(&mut sa.sa_mask);
         // No SA_RESTART: we want the interrupted ioctl to return EINTR.
         libc::sigaction(libc::SIGUSR1, &sa, std::ptr::null_mut());
@@ -65,12 +65,54 @@ pub struct KvmVm {
     vm: Arc<VmFd>,
     gic: GicInfo,
     vcpus: usize,
-    run_size: usize,
     // The vGIC device fd: kept alive for the VM's lifetime + used for save/restore.
     vgic: DeviceFd,
     // Kernel thread ids of the running vcpus, for `kick` (tgkill SIGUSR1). Each
     // vcpu registers its own tid the first time it runs.
     kick_tids: Arc<Mutex<Vec<libc::pid_t>>>,
+    // All vcpus are created up front (before the vGIC is INIT'd — KVM rejects
+    // KVM_CREATE_VCPU with EBUSY afterward); `create_vcpu(id)` hands out the one
+    // for `id`, which then moves to its run thread.
+    pending: Mutex<Vec<Option<KvmVcpu>>>,
+}
+
+/// Create one vcpu fd: init it for in-kernel PSCI (secondaries start powered
+/// off, woken by PSCI CPU_ON) and mmap its `kvm_run`. No vGIC interaction — the
+/// caller INITs the GIC only after every vcpu exists.
+fn init_vcpu(
+    vm: &VmFd,
+    id: u8,
+    run_size: usize,
+    kick_tids: &Arc<Mutex<Vec<libc::pid_t>>>,
+) -> Result<KvmVcpu> {
+    let fd = vm.create_vcpu(id as u64).map_err(kvm_err("KVM_CREATE_VCPU"))?;
+    let mut kvi = kvm_vcpu_init::default();
+    vm.get_preferred_target(&mut kvi).map_err(kvm_err("preferred target"))?;
+    kvi.features[0] |= 1 << KVM_ARM_VCPU_PSCI_0_2;
+    if id != 0 {
+        kvi.features[0] |= 1 << KVM_ARM_VCPU_POWER_OFF;
+    }
+    fd.vcpu_init(&kvi).map_err(kvm_err("KVM_ARM_VCPU_INIT"))?;
+    let run = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            run_size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            fd.as_raw_fd(),
+            0,
+        )
+    };
+    if run == libc::MAP_FAILED {
+        return errno("mmap kvm_run");
+    }
+    Ok(KvmVcpu {
+        fd,
+        kvm_run: run as *mut kvm_run,
+        mmio_len: 0,
+        kick_tids: kick_tids.clone(),
+        tid_registered: false,
+    })
 }
 
 fn set_vgic_attr(vgic: &DeviceFd, group: u32, attr: u64, value: u64) -> Result<()> {
@@ -123,64 +165,47 @@ impl Hypervisor for KvmVm {
             GICR_BASE,
         )?;
 
+        let n = vcpus.max(1);
         let gic = GicInfo {
             dist_base: GICD_BASE,
             dist_size: GICD_SIZE,
             redist_base: GICR_BASE,
-            redist_size: GICR_PER_CPU * vcpus.max(1) as u64,
+            redist_size: GICR_PER_CPU * n as u64,
             kind: GicKind::V3,
         };
+        let vm = Arc::new(vm);
         let run_size = kvm.get_vcpu_mmap_size().map_err(kvm_err("mmap size"))?;
-        log::info!("KVM: vGICv3, dist {GICD_BASE:#x}, redist {GICR_BASE:#x}");
+        let kick_tids = Arc::new(Mutex::new(Vec::new()));
+
+        // Create every vcpu up front, then INIT the vGIC — KVM_CREATE_VCPU returns
+        // EBUSY once the in-kernel GIC is initialized, and the secondaries are
+        // created lazily on their own run threads, so they must all exist now.
+        let mut pending = Vec::with_capacity(n);
+        for id in 0..n {
+            pending.push(Some(init_vcpu(&vm, id as u8, run_size, &kick_tids)?));
+        }
+        set_vgic_attr(&vgic, KVM_DEV_ARM_VGIC_GRP_CTRL, KVM_DEV_ARM_VGIC_CTRL_INIT as u64, 0)?;
+
+        log::info!("KVM: vGICv3 ({n} vcpu), dist {GICD_BASE:#x}, redist {GICR_BASE:#x}");
         Ok(KvmVm {
             _kvm: kvm,
-            vm: Arc::new(vm),
+            vm,
             gic,
-            vcpus: vcpus.max(1),
-            run_size,
+            vcpus: n,
             vgic,
-            kick_tids: Arc::new(Mutex::new(Vec::new())),
+            kick_tids,
+            pending: Mutex::new(pending),
         })
     }
 
     fn create_vcpu(&self, id: u8) -> Result<KvmVcpu> {
-        let fd = self.vm.create_vcpu(id as u64).map_err(kvm_err("KVM_CREATE_VCPU"))?;
-
-        let mut kvi = kvm_vcpu_init::default();
-        self.vm.get_preferred_target(&mut kvi).map_err(kvm_err("preferred target"))?;
-        // In-kernel PSCI 0.2 (handles SYSTEM_OFF and secondary CPU_ON for us).
-        kvi.features[0] |= 1 << KVM_ARM_VCPU_PSCI_0_2;
-        // Secondaries start powered off; KVM brings them up on PSCI CPU_ON.
-        if id != 0 {
-            kvi.features[0] |= 1 << KVM_ARM_VCPU_POWER_OFF;
-        }
-        fd.vcpu_init(&kvi).map_err(kvm_err("KVM_ARM_VCPU_INIT"))?;
-
-        // The vGIC is INIT'd once vcpu 0 (its redistributor) exists.
-        if id == 0 {
-            set_vgic_attr(&self.vgic, KVM_DEV_ARM_VGIC_GRP_CTRL, KVM_DEV_ARM_VGIC_CTRL_INIT as u64, 0)?;
-        }
-
-        let run = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                self.run_size,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                fd.as_raw_fd(),
-                0,
-            )
-        };
-        if run == libc::MAP_FAILED {
-            return errno("mmap kvm_run");
-        }
-        Ok(KvmVcpu {
-            fd,
-            kvm_run: run as *mut kvm_run,
-            mmio_len: 0,
-            kick_tids: self.kick_tids.clone(),
-            tid_registered: false,
-        })
+        // Hand out the vcpu created in `create`; it moves to its run thread.
+        self.pending
+            .lock()
+            .unwrap()
+            .get_mut(id as usize)
+            .and_then(Option::take)
+            .ok_or_else(|| Error::Backend(format!("vcpu {id} not available")))
     }
 
     fn gic_info(&self) -> Option<GicInfo> {
