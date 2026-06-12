@@ -229,3 +229,45 @@ impl Pl011 {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pl011() -> Pl011 {
+        Pl011::new(Box::new(std::io::sink()))
+    }
+    fn tx(p: &mut Pl011, s: &str) {
+        for b in s.bytes() {
+            p.write(Pl011::DR, 1, b as u64);
+        }
+    }
+
+    #[test]
+    fn marker_latches_when_tx_ends_with_it() {
+        let mut p = pl011();
+        p.arm_marker(b"__AMBER_READY__".to_vec());
+        assert!(!p.marked());
+        tx(&mut p, "boot noise\n__AMBER_READY__");
+        assert!(p.marked(), "should latch as soon as the sentinel passes through");
+    }
+
+    #[test]
+    fn marker_ignores_unrelated_output_and_survives_trailing_bytes() {
+        let mut p = pl011();
+        p.arm_marker(b"MARK".to_vec());
+        tx(&mut p, "near misses: MARZ MAR mark "); // no exact "MARK" substring
+        assert!(!p.marked());
+        tx(&mut p, "MARK"); // exact window now matches
+        assert!(p.marked());
+        tx(&mut p, "\nmore output"); // stays latched
+        assert!(p.marked());
+    }
+
+    #[test]
+    fn no_marker_means_never_marked() {
+        let mut p = pl011();
+        tx(&mut p, "anything at all");
+        assert!(!p.marked());
+    }
+}
