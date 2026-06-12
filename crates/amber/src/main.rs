@@ -517,6 +517,25 @@ fn cmd_resume(args: &[String]) -> ExitCode {
     }
 }
 
+/// Build a snapshot request from the environment, shared by `boot` and `__vm`:
+/// `AMBER_SNAPSHOT=<dir>` arms it, `AMBER_SNAPSHOT_MARKER=<text>` captures the
+/// instant the guest prints it (else after `AMBER_SNAPSHOT_AFTER_MS`, default 2s).
+fn snapshot_from_env() -> Option<amber_core::SnapshotReq> {
+    let dir = std::env::var("AMBER_SNAPSHOT").ok().filter(|s| !s.is_empty())?;
+    let ms: u64 = std::env::var("AMBER_SNAPSHOT_AFTER_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2000);
+    Some(amber_core::SnapshotReq {
+        after: std::time::Duration::from_millis(ms),
+        dir: dir.into(),
+        marker: std::env::var("AMBER_SNAPSHOT_MARKER")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.into_bytes()),
+    })
+}
+
 fn cmd_boot(args: &[String]) -> ExitCode {
     if args.len() < 3 {
         eprintln!("usage: amber boot <kernel-Image> [initramfs]");
@@ -532,7 +551,7 @@ fn cmd_boot(args: &[String]) -> ExitCode {
     let initrd = args.get(3).and_then(|p| std::fs::read(p).ok());
     let disk = args.get(4).map(std::path::PathBuf::from);
 
-    let cfg = VmConfig { kernel, initrd, disk, ..Default::default() };
+    let cfg = VmConfig { kernel, initrd, disk, snapshot: snapshot_from_env(), ..Default::default() };
 
     let vm = match Vm::prepare(&cfg, None) {
         Ok(vm) => vm,
@@ -717,24 +736,9 @@ fn cmd_vm(args: &[String]) -> ExitCode {
     cfg.vsock = std::env::var("AMBER_VSOCK").ok().filter(|s| !s.is_empty()).map(Into::into);
     // Control channel from amberd (balloon targets, etc.), if it passed one.
     cfg.control_fd = std::env::var("AMBER_CONTROL_FD").ok().and_then(|s| s.parse().ok());
-    // Snapshot trigger (M3, de-risk): AMBER_SNAPSHOT=<dir> captures the VM after
-    // AMBER_SNAPSHOT_AFTER_MS (default 2000) and stops.
-    if let Ok(dir) = std::env::var("AMBER_SNAPSHOT") {
-        let ms: u64 = std::env::var("AMBER_SNAPSHOT_AFTER_MS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(2000);
-        cfg.snapshot = Some(amber_core::SnapshotReq {
-            after: std::time::Duration::from_millis(ms),
-            dir: dir.into(),
-            // AMBER_SNAPSHOT_MARKER=<text>: capture the instant the guest prints
-            // it (deterministic), instead of after the fixed delay above.
-            marker: std::env::var("AMBER_SNAPSHOT_MARKER")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .map(|s| s.into_bytes()),
-        });
-    }
+    // Snapshot trigger: AMBER_SNAPSHOT=<dir> captures the VM (on a console marker
+    // or after AMBER_SNAPSHOT_AFTER_MS) and stops. Shared with `boot`.
+    cfg.snapshot = snapshot_from_env();
     // Restore earlycon + verbose boot dmesg for debugging (off by default because
     // the dmesg streams char-per-MMIO-exit and roughly doubles boot time).
     if std::env::var("AMBER_VERBOSE").is_ok() {
