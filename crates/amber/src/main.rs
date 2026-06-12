@@ -563,6 +563,9 @@ fn cmd_boot(args: &[String]) -> ExitCode {
         disk,
         vcpus,
         snapshot: snapshot_from_env(),
+        // AMBER_CONTROL_FD=<fd>: a control channel (pause/resume, balloon) — the
+        // same one amberd passes; exposed here so `boot` is testable standalone.
+        control_fd: std::env::var("AMBER_CONTROL_FD").ok().and_then(|s| s.parse().ok()),
         ..Default::default()
     };
 
