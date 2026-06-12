@@ -15,3 +15,4 @@
 /kernel/resin-subtract.config
 /kernel/resin-effective.config
 /target-linux
+agent/target/

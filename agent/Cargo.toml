@@ -1,0 +1,24 @@
+# The in-guest exec agent: a tiny static aarch64-linux binary baked into a
+# template. It dials the host over AF_VSOCK after restore, runs one command, and
+# streams stdout/stderr/rc back framed. Built only for the musl target by
+# scripts/build-agent.sh (Docker) — kept out of the workspace so the host build
+# (incl. macOS, which has no AF_VSOCK) never touches it.
+[package]
+name = "amber-agent"
+version = "0.0.0"
+edition = "2021"
+
+[[bin]]
+name = "amber-agent"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+
+# Smallest possible static binary: it ships inside every template's initramfs.
+[profile.release]
+opt-level = "z"
+lto = true
+panic = "abort"
+strip = true
+codegen-units = 1
