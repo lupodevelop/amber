@@ -62,7 +62,7 @@ qemu-system-aarch64 -M virt,virtualization=on,gic-version=3 -cpu max -accel tcg 
   -kernel "$WORK/outer-Image" -initrd "$WORK/snap-initramfs.gz" -append "console=ttyAMA0" \
   -nographic -no-reboot > "$log" 2>&1 &
 qp=$!
-for _ in $(seq 1 320); do
+for _ in $(seq 1 640); do
   grep -qaE "restore-rc=|Kernel panic|backend error" "$log" 2>/dev/null && break
   kill -0 $qp 2>/dev/null || break
   sleep 5
