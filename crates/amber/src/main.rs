@@ -106,6 +106,7 @@ usage: amber <command> [args]
     AMBER_DISK=data.img   attach a data disk at /data (:ro for read-only)
     AMBER_VSOCK=/tmp/v.sock  guest<->host vsock over a unix socket (guest CID 3)
     AMBER_GIC=hw          use the in-kernel vGIC (no snapshot timer)
+    AMBER_CPU_TEMPLATE=no-crypto  mask guest CPU features (host=passthrough)
 
 docs: README.md  ·  config: amber.toml
 "
@@ -567,6 +568,7 @@ fn cmd_boot(args: &[String]) -> ExitCode {
         // same one amberd passes; exposed here so `boot` is testable standalone.
         control_fd: std::env::var("AMBER_CONTROL_FD").ok().and_then(|s| s.parse().ok()),
         vsock: std::env::var("AMBER_VSOCK").ok().filter(|s| !s.is_empty()).map(Into::into),
+        cpu_template: std::env::var("AMBER_CPU_TEMPLATE").ok().filter(|s| !s.is_empty()),
         ..Default::default()
     };
 
@@ -751,6 +753,8 @@ fn cmd_vm(args: &[String]) -> ExitCode {
     cfg.data_disks = data_disks;
     // virtio-vsock: AMBER_VSOCK=<host-socket-path> opens a guest↔host channel.
     cfg.vsock = std::env::var("AMBER_VSOCK").ok().filter(|s| !s.is_empty()).map(Into::into);
+    // AMBER_CPU_TEMPLATE=<name> masks guest-visible CPU features (e.g. no-crypto).
+    cfg.cpu_template = std::env::var("AMBER_CPU_TEMPLATE").ok().filter(|s| !s.is_empty());
     // Control channel from amberd (balloon targets, etc.), if it passed one.
     cfg.control_fd = std::env::var("AMBER_CONTROL_FD").ok().and_then(|s| s.parse().ok());
     // Snapshot trigger: AMBER_SNAPSHOT=<dir> captures the VM (on a console marker

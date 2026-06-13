@@ -64,6 +64,13 @@ pub trait Hypervisor: Sized {
 }
 
 pub trait Vcpu {
+    /// Apply a CPU template: read-modify-write each feature register so the guest
+    /// sees the masked features. Called on every vcpu before it first runs. The
+    /// default is a no-op (passthrough) for backends without sysreg access.
+    fn apply_cpu_template(&mut self, _template: &crate::cpu::CpuTemplate) -> Result<()> {
+        Ok(())
+    }
+
     /// arm64 boot protocol: PC at the kernel entry, x0 at the DTB address,
     /// x1..x3 zero, started at EL1 with interrupts masked. The backend sets the
     /// architectural defaults; this call sets the two values amber controls.

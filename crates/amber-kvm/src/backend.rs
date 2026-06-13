@@ -279,7 +279,23 @@ impl KvmVcpu {
     }
 }
 
+/// Wrap a bare ARM sysreg encoding (op0..op2) in KVM's ONE_REG sysreg index.
+fn kvm_sysreg_id(enc: u32) -> u64 {
+    KVM_REG_ARM64 as u64 | KVM_REG_SIZE_U64 as u64 | KVM_REG_ARM64_SYSREG as u64 | enc as u64
+}
+
 impl Vcpu for KvmVcpu {
+    fn apply_cpu_template(&mut self, template: &amber_core::cpu::CpuTemplate) -> Result<()> {
+        // KVM emulates the ID_AA64* reads and accepts a reduced feature set via
+        // SET_ONE_REG, so the masked value becomes the guest's view.
+        for ov in template.overrides {
+            let id = kvm_sysreg_id(ov.reg);
+            let cur = self.get_reg(id)?;
+            self.set_reg(id, (cur & ov.and_mask) | ov.or_value)?;
+        }
+        Ok(())
+    }
+
     fn set_boot_regs(&mut self, entry: u64, dtb: u64) -> Result<()> {
         self.set_reg(PSTATE_REG, 0x3c5)?; // EL1h, DAIF masked
         self.set_reg(PC_REG, entry)?;
@@ -410,7 +426,20 @@ pub fn selftest() -> Result<()> {
     }
     // vGIC save/restore round-trip on the same VM (vcpu 0 INIT'd the vGIC).
     let gic_regs = gic::selftest(&vm.vgic, NR_IRQS, vm.vcpus)?;
-    println!("KVM_SELFTEST_OK regs={} gic_regs={gic_regs}", snap.kvm_regs.len());
+
+    // CPU template: applying no-crypto must clear the crypto fields of ID_AA64ISAR0.
+    let isar0 = kvm_sysreg_id(amber_core::cpu::ID_AA64ISAR0_EL1);
+    let before = v.get_reg(isar0)?;
+    v.apply_cpu_template(amber_core::cpu::by_name("no-crypto").unwrap())?;
+    let after = v.get_reg(isar0)?;
+    let crypto = (0xfffu64 << 4) | (0xfffu64 << 32);
+    if after & crypto != 0 {
+        return Err(Error::Snapshot(format!(
+            "cpu template did not mask crypto: ISAR0 {before:#x} -> {after:#x}"
+        )));
+    }
+
+    println!("KVM_SELFTEST_OK regs={} gic_regs={gic_regs} isar0={before:#x}->{after:#x}", snap.kvm_regs.len());
     Ok(())
 }
 

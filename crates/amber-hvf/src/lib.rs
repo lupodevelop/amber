@@ -446,6 +446,19 @@ fn mach_ticks_to_ns(ticks: u64) -> u64 {
 }
 
 impl Vcpu for HvfVcpu {
+    fn apply_cpu_template(&mut self, template: &amber_core::cpu::CpuTemplate) -> Result<()> {
+        // HVF virtualizes the ID_AA64* registers, so a read-modify-write here
+        // changes what the guest sees. The template's bare ARM encoding is exactly
+        // hv_sys_reg_t's value.
+        for ov in template.overrides {
+            let reg = ov.reg as hv_sys_reg_t;
+            let cur = self.get_sys(reg)?;
+            let new = (cur & ov.and_mask) | ov.or_value;
+            unsafe { check(hv_vcpu_set_sys_reg(self.handle, reg, new), "set_sys (cpu template)")? };
+        }
+        Ok(())
+    }
+
     fn set_boot_regs(&mut self, entry: u64, dtb: u64) -> Result<()> {
         // x0 = DTB, x1..x3 = 0, PC = kernel entry. HVF does NOT start the vcpu at
         // EL1: a fresh vcpu comes up at EL0t with PC=0, so the kernel's first

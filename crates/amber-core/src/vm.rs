@@ -62,6 +62,9 @@ pub struct VmConfig {
     /// virtio-vsock: the host Unix-socket base path for the guest↔host channel,
     /// if enabled. The guest gets CID 3.
     pub vsock: Option<PathBuf>,
+    /// CPU template name (e.g. "no-crypto"); applied to every vcpu before boot to
+    /// mask guest-visible feature registers. None / "host" = passthrough.
+    pub cpu_template: Option<String>,
     /// If set, snapshot the VM to `dir` once it has run for `after`, then stop.
     pub snapshot: Option<SnapshotReq>,
     /// A control-channel fd (from amberd) carrying balloon targets, etc.
@@ -95,6 +98,7 @@ impl Default for VmConfig {
             disk: None,
             data_disks: Vec::new(),
             vsock: None,
+            cpu_template: None,
             snapshot: None,
             control_fd: None,
         }
@@ -115,6 +119,9 @@ pub struct Vm {
     paused: bool,
     snapshot: Option<SnapshotReq>,
     disk_path: Option<PathBuf>,
+    /// CPU template applied to each vcpu before a fresh boot (none on restore —
+    /// the snapshot already carries the masked registers).
+    cpu_template: Option<String>,
     /// When set, `run` restores this captured state instead of booting a kernel.
     restore: Option<crate::snapshot::Loaded>,
     entry: u64,
@@ -184,6 +191,7 @@ impl Vm {
             paused: false,
             snapshot: cfg.snapshot.clone(),
             disk_path: cfg.disk.clone(),
+            cpu_template: cfg.cpu_template.clone(),
             restore: None,
             entry: kernel.entry,
             dtb_addr,
@@ -255,6 +263,7 @@ impl Vm {
             paused: false,
             snapshot: None,
             disk_path: loaded.meta.disk.clone().map(PathBuf::from),
+            cpu_template: None,
             restore: Some(loaded),
             entry: 0,
             dtb_addr: 0,
@@ -297,6 +306,7 @@ impl Vm {
             paused,
             snapshot,
             disk_path,
+            cpu_template,
             restore,
             entry,
             dtb_addr,
@@ -304,6 +314,19 @@ impl Vm {
             cmdline,
             initrd,
         } = self;
+        let cpu_tmpl: Option<&'static crate::cpu::CpuTemplate> = match &cpu_template {
+            Some(name) => {
+                let t = crate::cpu::by_name(name);
+                if t.is_none() {
+                    log::warn!(
+                        "unknown cpu template {name:?}; known: {}",
+                        crate::cpu::names().collect::<Vec<_>>().join(", ")
+                    );
+                }
+                t
+            }
+            None => None,
+        };
 
         let hv = H::create(&mem, vcpus)?;
 
@@ -361,6 +384,12 @@ impl Vm {
                 rng_seed: &rng_seed,
             })?;
             mem.write(dtb_addr, &blob)?;
+            // Apply the CPU template (if any) before the boot cpu reads its feature
+            // registers. A restore skips this — the snapshot already holds them.
+            if let Some(t) = cpu_tmpl {
+                vcpu.apply_cpu_template(t)?;
+                log::info!("cpu template: {}", t.name);
+            }
             vcpu.set_boot_regs(entry, dtb_addr)?;
         }
 
@@ -459,7 +488,7 @@ impl Vm {
             for id in 1..vcpus {
                 let init = restore.as_ref().and_then(|l| l.cpus.get(id - 1));
                 s.spawn(move || {
-                    secondary_loop::<H>(hv, id as u8, init, pl011, pl011_intid, virtio, bus, running, pause, snap_coord)
+                    secondary_loop::<H>(hv, id as u8, init, cpu_tmpl, pl011, pl011_intid, virtio, bus, running, pause, snap_coord)
                 });
             }
 
@@ -680,6 +709,7 @@ fn secondary_loop<H: Hypervisor>(
     hv: &H,
     id: u8,
     init: Option<&crate::snapshot::CpuSnapshot>,
+    cpu_tmpl: Option<&crate::cpu::CpuTemplate>,
     pl011: &Mutex<Pl011>,
     pl011_intid: u32,
     virtio: &Mutex<Vec<VirtioDev>>,
@@ -705,6 +735,13 @@ fn secondary_loop<H: Hypervisor>(
     if let Some(state) = init {
         if let Err(e) = vcpu.restore(state) {
             log::error!("vcpu{id}: restore failed: {e}");
+            stop();
+            return;
+        }
+    } else if let Some(t) = cpu_tmpl {
+        // Fresh boot: mask this secondary's feature registers to match the boot cpu.
+        if let Err(e) = vcpu.apply_cpu_template(t) {
+            log::error!("vcpu{id}: cpu template failed: {e}");
             stop();
             return;
         }

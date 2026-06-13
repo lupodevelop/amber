@@ -7,6 +7,7 @@
 //! budget scheduler) is added in later milestones, all above this seam.
 
 pub mod bus;
+pub mod cpu;
 pub mod dtb;
 pub mod hypervisor;
 pub mod limiter;
