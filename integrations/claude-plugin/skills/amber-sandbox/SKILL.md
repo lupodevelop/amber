@@ -54,12 +54,43 @@ later calls are warm forks (~milliseconds).
   e.g. `AMBER_SANDBOX_IMAGE=python:3-alpine`.
 - `AMBER_SANDBOX_NET=1` — allow the guest outbound network (default: **off**).
   Turn it on only when the task needs it (e.g. installing packages).
+- `AMBER_SANDBOX_MEM=<size>` — guest RAM (default ~512 MiB), e.g. `2GiB` for a
+  heavier toolchain or build.
 - `AMBER_HOME=<path>` — the amber checkout, if not auto-detected.
 
 ```bash
 AMBER_SANDBOX_IMAGE=python:3-alpine "${CLAUDE_PLUGIN_ROOT}/scripts/amber-exec.sh" \
   'python3 -c "print(6*7)"'
 ```
+
+## Toolchains and tests
+
+Two ways to get a compiler / interpreter / build tool in the sandbox:
+
+1. **Use a base image that already has it** (preferred — offline, deterministic,
+   fast, no network needed):
+
+   ```bash
+   AMBER_SANDBOX_IMAGE=python:3-alpine "${CLAUDE_PLUGIN_ROOT}/scripts/amber-exec.sh" 'python3 -c "print(6*7)"'
+   AMBER_SANDBOX_IMAGE=rust:alpine      "${CLAUDE_PLUGIN_ROOT}/scripts/amber-exec.sh" 'cargo --version'
+   AMBER_SANDBOX_IMAGE=node:alpine      "${CLAUDE_PLUGIN_ROOT}/scripts/amber-exec.sh" 'node -e "console.log(6*7)"'
+   ```
+
+2. **Install at runtime** — needs `AMBER_SANDBOX_NET=1`, and you must install and
+   use it **in the same command** (each call is a fresh VM, so installs don't
+   persist):
+
+   ```bash
+   AMBER_SANDBOX_NET=1 "${CLAUDE_PLUGIN_ROOT}/scripts/amber-exec.sh" \
+     'apk add --no-cache gcc musl-dev >/dev/null && echo "int main(){return 0;}" > t.c && gcc t.c -o t && ./t && echo OK'
+   ```
+
+   Networking (including HTTPS — `apk`/`pip`/`npm`/`git`) works; the guest clock is
+   seeded from the host so TLS is valid.
+
+The writable layer is **tmpfs (RAM)**. The default guest RAM is ~472 MB usable —
+fine for light installs and small builds. For a heavier toolchain or build, raise
+it: `AMBER_SANDBOX_MEM=2GiB` (rebuilds the template once).
 
 ## Reading results
 

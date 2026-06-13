@@ -737,6 +737,13 @@ fn cmd_vm(args: &[String]) -> ExitCode {
     if let Some(bytes) = mem_size {
         cfg.mem_size = bytes;
     }
+    // AMBER_MEM=<size> (e.g. 2GiB) overrides guest RAM — useful when a sandbox
+    // needs to install a toolchain or run a heavier build (its writable layer is
+    // tmpfs, i.e. RAM). At template creation it sizes the snapshot, so forks
+    // inherit it.
+    if let Some(b) = std::env::var("AMBER_MEM").ok().as_deref().and_then(manifest::parse_size) {
+        cfg.mem_size = b;
+    }
     // Guest CPUs: AMBER_VCPUS (operator) wins over the template's `vcpus`.
     cfg.vcpus = std::env::var("AMBER_VCPUS")
         .ok()
@@ -993,6 +1000,15 @@ fn build_bootstrap(
     init.push_str("mount -t proc proc /proc\n");
     init.push_str("mount -t sysfs sysfs /sys\n");
     init.push_str("mount -t devtmpfs dev /dev\n");
+    // Seed the clock from the host: the guest has no RTC, so it would otherwise
+    // boot at 1970 and every TLS handshake (apk/pip/npm/git over https) would fail
+    // with "certificate not yet valid". For a template this bakes in the creation
+    // time, which a fork inherits — stale by the template's age but valid for TLS.
+    let epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    init.push_str(&format!("date -s @{epoch} >/dev/null 2>&1\n"));
     if kernel_mods.is_some() {
         for m in guest::MODULES {
             let name = Path::new(m).file_name().unwrap().to_str().unwrap();

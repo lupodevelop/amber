@@ -31,12 +31,16 @@ bin=./amber
 
 image="${AMBER_SANDBOX_IMAGE:-alpine:3}"
 net="none"; [ "${AMBER_SANDBOX_NET:-0}" = "1" ] && net="smoltcp"
+mem="${AMBER_SANDBOX_MEM:-}"   # e.g. 2GiB, for heavier toolchains/builds
 
 "$bin" up >/dev/null 2>&1 || true
-tpl=".amber-cache/sandbox/$(printf '%s' "$image" | tr '/:@' '___')"
+# The template bakes in the image, the net device, and the RAM size, so they're
+# all part of the cache key — changing one builds a new template, not a stale one.
+key="$(printf '%s' "$image" | tr '/:@' '___')_${net}_${mem:-default}"
+tpl=".amber-cache/sandbox/$key"
 if [ ! -f "$tpl/meta.json" ]; then
-  echo "amber: building sandbox template for $image (one-time)…" >&2
-  AMBER_NET="$net" "$bin" template "$image" "$tpl" >&2
+  echo "amber: building sandbox template ($image, net=$net, mem=${mem:-default})…" >&2
+  AMBER_NET="$net" AMBER_MEM="$mem" "$bin" template "$image" "$tpl" >&2
 fi
 
 # Warm fork + run. `amber exec` forwards stdout/stderr as distinct streams and
