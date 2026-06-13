@@ -135,6 +135,10 @@ pub struct VirtioMmio {
     queue_sel: usize,
     queues: Vec<Queue>,
     interrupt_status: u32,
+    /// An rx payload polled from the device but not yet injected because the guest
+    /// had no rx buffer posted. Held (not dropped) so a reliable stream like vsock
+    /// doesn't lose data when the guest's rx queue momentarily drains.
+    pending_rx: Option<Vec<u8>>,
 }
 
 impl VirtioMmio {
@@ -178,6 +182,7 @@ impl VirtioMmio {
             queue_sel: 0,
             queues: vec![Queue::default(); n],
             interrupt_status: 0,
+            pending_rx: None,
         }
     }
 
@@ -289,10 +294,22 @@ impl VirtioMmio {
         let Some(ram) = self.ram else { return false };
         let Some(rxq) = self.dev.rx_queue() else { return false };
         let mut any = false;
+        // First re-try a payload held back last time (the guest had no buffer then).
+        // Holding rather than dropping keeps a reliable stream (vsock) intact when
+        // the guest's rx queue momentarily has no posted buffers.
+        if let Some(data) = self.pending_rx.take() {
+            let Some(q) = self.queues.get_mut(rxq) else { return false };
+            if !inject_one(&ram, q, &data) {
+                self.pending_rx = Some(data);
+                return false;
+            }
+            any = true;
+        }
         while let Some(data) = self.dev.poll_rx() {
             let Some(q) = self.queues.get_mut(rxq) else { break };
             if !inject_one(&ram, q, &data) {
-                break; // no buffer posted: drop and stop (the frame is lost)
+                self.pending_rx = Some(data); // hold it; retry on the next pump
+                break;
             }
             any = true;
         }

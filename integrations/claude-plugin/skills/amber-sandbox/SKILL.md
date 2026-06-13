@@ -74,24 +74,23 @@ never touched; the command runs on an isolated copy.
 ```
 
 It tars `<dir>` in (excluding `.git`, `target`, `node_modules`, `.venv`, `dist`,
-`__pycache__`), unpacks it to `/work`, and runs the command there. Pair it with a
-toolchain image and/or networking:
+`__pycache__`), unpacks it to `/work`, and runs the command there.
 
-```bash
-AMBER_SANDBOX_IMAGE=rust:alpine \
-  "${CLAUDE_PLUGIN_ROOT}/scripts/amber-sandbox-repo.sh" . 'cargo test'
-
-AMBER_SANDBOX_IMAGE=node:alpine AMBER_SANDBOX_NET=1 \
-  "${CLAUDE_PLUGIN_ROOT}/scripts/amber-sandbox-repo.sh" . 'npm ci && npm test'
-```
+> **Limitation (current):** copy-in streams the tar to the guest over the host→
+> guest vsock path, which today only delivers small payloads reliably (a few KB);
+> a larger directory will hang. The fix is in progress. Until then, for a real
+> project prefer a base image that already has both the toolchain **and** the code
+> (or fetch the code inside the guest with networking on), e.g.:
+>
+> ```bash
+> AMBER_SANDBOX_IMAGE=rust:alpine AMBER_SANDBOX_NET=1 \
+>   "${CLAUDE_PLUGIN_ROOT}/scripts/amber-exec.sh" \
+>   'git clone --depth 1 https://… /w && cd /w && cargo test'
+> ```
 
 Output and exit code come back. To get *changes* back out, have the command emit
 a patch you can review and apply on the host (e.g. `… && git -C /work diff`),
 rather than mutating the host directly — that keeps the isolation.
-
-(Under the hood this uses `amber exec`'s stdin: the host streams the tar to the
-guest command's stdin. You can use that directly too: `tar c x | amber-exec.sh
-'tar x; …'`.)
 
 ## Toolchains and tests
 

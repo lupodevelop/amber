@@ -33,9 +33,17 @@ image="${AMBER_SANDBOX_IMAGE:-alpine:3}"
 net="none"; [ "${AMBER_SANDBOX_NET:-0}" = "1" ] && net="smoltcp"
 mem="${AMBER_SANDBOX_MEM:-}"   # e.g. 2GiB, for heavier toolchains/builds
 
-# Keep our stdin (which may be a tarball for the command) away from the daemon and
-# the template build — their console readers would otherwise consume it. Only the
-# final `exec` inherits it.
+# Capture stdin (the command's input, e.g. a tarball to copy files in) to a temp
+# file up front. This drains the pipe so a producer like `tar` can finish, and
+# keeps the daemon/template-build steps below — which would otherwise consume or
+# block on it — out of the way. Only the final `exec` is fed the input.
+indata=""
+if [ ! -t 0 ]; then
+  indata="$(mktemp)"
+  trap 'rm -f "$indata"' EXIT
+  cat > "$indata"
+fi
+
 "$bin" up >/dev/null 2>&1 </dev/null || true
 # The template bakes in the image, the net device, and the RAM size, so they're
 # all part of the cache key — changing one builds a new template, not a stale one.
@@ -47,5 +55,5 @@ if [ ! -f "$tpl/meta.json" ]; then
 fi
 
 # Warm fork + run. `amber exec` forwards stdout/stderr as distinct streams and
-# exits with the command's own code.
-exec "$bin" exec "$tpl" -- "$cmd"
+# exits with the command's own code; the captured input becomes the command's stdin.
+"$bin" exec "$tpl" -- "$cmd" < "${indata:-/dev/null}"
