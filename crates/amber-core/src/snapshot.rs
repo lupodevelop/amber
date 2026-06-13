@@ -52,6 +52,11 @@ pub struct Meta {
     /// restored VM gets a network device.
     #[serde(default)]
     pub net: bool,
+    /// Whether a virtio-vsock device was present — same reason as `net`: the
+    /// restore must recreate it (with a fresh backend) in the same slot so the
+    /// virtio queue order matches.
+    #[serde(default)]
+    pub vsock: bool,
     /// Guest CPUs captured. vcpu 0 lives in `cpu.json`, the rest in `cpu<i>.json`;
     /// a restore recreates all of them already running. Pre-SMP snapshots omit it.
     #[serde(default = "one")]
@@ -112,6 +117,7 @@ pub fn write(
     gic_kind: Option<crate::GicKind>,
     dev: &DevState,
     net: bool,
+    vsock: bool,
 ) -> Result<()> {
     std::fs::create_dir_all(dir).map_err(snap_err)?;
     std::fs::write(dir.join("dev.json"), serde_json::to_vec(dev).map_err(snap_err)?)
@@ -129,6 +135,7 @@ pub fn write(
         disk: disk.map(|p| p.to_string_lossy().into_owned()),
         gic_kind: gic_kind.map(|k| k.as_str().to_string()),
         net,
+        vsock,
         vcpus: cpus.len().max(1),
     };
     std::fs::write(dir.join("meta.json"), serde_json::to_vec(&meta).map_err(snap_err)?)
@@ -198,6 +205,7 @@ mod tests {
             disk: Some("/tmp/base.img".into()),
             gic_kind: Some("v2".into()),
             net: true,
+            vsock: false,
             vcpus: 2,
         };
         let back: Meta = serde_json::from_slice(&serde_json::to_vec(&m).unwrap()).unwrap();

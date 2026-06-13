@@ -199,6 +199,7 @@ impl VsockDevice {
         match op {
             OP_REQUEST => {
                 // Guest dials host port `hp`.
+                log::debug!("vsock: guest dials host port {hp} (guest port {gp})");
                 match self.backend.dial(hp) {
                     Some(stream) => {
                         let _ = stream.set_nonblocking(true);

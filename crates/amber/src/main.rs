@@ -566,6 +566,7 @@ fn cmd_boot(args: &[String]) -> ExitCode {
         // AMBER_CONTROL_FD=<fd>: a control channel (pause/resume, balloon) — the
         // same one amberd passes; exposed here so `boot` is testable standalone.
         control_fd: std::env::var("AMBER_CONTROL_FD").ok().and_then(|s| s.parse().ok()),
+        vsock: std::env::var("AMBER_VSOCK").ok().filter(|s| !s.is_empty()).map(Into::into),
         ..Default::default()
     };
 
@@ -814,7 +815,10 @@ fn cmd_restore(args: &[String]) -> ExitCode {
     // Provide a fresh network backend; restore_from uses it only if the template
     // had a net device (meta.net), keeping the device set aligned with the snapshot.
     let net = amber_net::backend("smoltcp");
-    let mut vm = match Vm::restore_from(Path::new(dir), net) {
+    // Likewise a fresh vsock UDS base if the template had a vsock device — the
+    // agent dials it only after this restore resumes.
+    let vsock = std::env::var("AMBER_VSOCK").ok().filter(|s| !s.is_empty()).map(Into::into);
+    let mut vm = match Vm::restore_from(Path::new(dir), net, vsock) {
         Ok(vm) => vm,
         Err(e) => {
             eprintln!("restore failed: {e}");
@@ -837,31 +841,27 @@ fn cmd_restore(args: &[String]) -> ExitCode {
     }
 }
 
-/// The in-guest agent (M7): announce readiness, read one command line, run it,
-/// report its exit code with a marker the `exec` client parses, then power off.
-/// A template snapshotted while this is blocked on `read` is "ready to exec".
-const EXEC_AGENT: &str = "stty -echo 2>/dev/null; echo __AMBER_READY__; \
-    IFS= read -r __c; sh -c \"$__c\"; __rc=$?; echo \"__AMBER_RC__$__rc\"; \
-    echo 0 >/proc/sys/kernel/printk 2>/dev/null; poweroff -f";
-
-/// `amber template <image> <dir>`: boot `image` running the exec agent and
-/// snapshot it (on the software GIC) once the agent is ready — producing a
-/// ready-to-exec template that `amber exec` forks.
+/// `amber template <image> <dir>`: boot `image` running the vsock exec agent and
+/// snapshot it (on the software GIC) the instant the agent announces readiness —
+/// producing a ready-to-exec template that `amber exec` forks. The agent prints
+/// the marker *before* dialing the host, so the capture is of a guest parked just
+/// short of the dial: vsock state is never snapshotted, and the dial happens on
+/// the restored fork, when the daemon is listening.
 fn cmd_template(args: &[String]) -> ExitCode {
     let (Some(image), Some(dir)) = (args.get(2), args.get(3)) else {
         eprintln!("usage: amber template <image> <dir>");
         return ExitCode::FAILURE;
     };
     // The template must restore on the software GIC (timer survives there), and we
-    // snapshot once the agent has booted and is blocked reading for a command.
+    // snapshot once the agent has booted and announced readiness.
     std::env::set_var("AMBER_GIC", "sw");
-    // Templates carry a network device so forked/exec'd sandboxes have internet;
-    // the init auto-configures eth0. (The fork's restore provides a fresh backend.)
+    // Templates carry net + vsock so forked/exec'd sandboxes have internet and the
+    // exec control channel. The fork's restore provides fresh backends. The base
+    // here is a throwaway: the agent is snapshotted before it dials, so nothing
+    // connects during template creation.
     std::env::set_var("AMBER_NET", "smoltcp");
+    std::env::set_var("AMBER_VSOCK", format!("/tmp/amber-tmpl-vsock-{}", std::process::id()));
     std::env::set_var("AMBER_SNAPSHOT", dir);
-    // Snapshot the instant the agent announces readiness — deterministic, so the
-    // template captures a fully-booted guest parked on `read` regardless of how
-    // long the boot took. The delay is only a fallback if the marker never comes.
     std::env::set_var("AMBER_SNAPSHOT_MARKER", "__AMBER_READY__");
     std::env::set_var("AMBER_SNAPSHOT_AFTER_MS", "30000");
     let vm_args = vec![
@@ -869,9 +869,7 @@ fn cmd_template(args: &[String]) -> ExitCode {
         "__vm".into(),
         image.clone(),
         "--".into(),
-        "sh".into(),
-        "-c".into(),
-        EXEC_AGENT.into(),
+        guest::AGENT_PATH.into(),
     ];
     let r = cmd_vm(&vm_args);
     if matches!(r, ExitCode::SUCCESS) {
@@ -946,6 +944,10 @@ mod guest {
     pub const BUSYBOX: &str = "assets/irx/bin/busybox";
     pub const MUSL: &str = "assets/irx/lib/ld-musl-aarch64.so.1";
     pub const MODULES_ROOT: &str = "assets/irx/lib/modules";
+    /// The in-guest exec agent binary (built by scripts/build-agent.sh).
+    pub const AGENT: &str = "assets/amber-agent";
+    /// Where the agent lands inside the guest; also the argv a template runs.
+    pub const AGENT_PATH: &str = "/sbin/amber-agent";
     // (subpath under <modules_root>/<version>/kernel, load order matters)
     pub const MODULES: &[&str] = &[
         "drivers/virtio/virtio_mmio.ko",
@@ -975,6 +977,10 @@ fn build_bootstrap(
     let musl = std::fs::read(guest::MUSL)?;
     // None => a built-in-everything kernel (resin): no modules to insmod.
     let kernel_mods = first_module_dir();
+    // An exec template runs the vsock agent (argv[0] is its in-guest path); bake
+    // the binary in and stage it into the new root so it runs under the image fs.
+    let with_agent = argv.first().map(String::as_str) == Some(guest::AGENT_PATH);
+    let agent = if with_agent { Some(std::fs::read(guest::AGENT)?) } else { None };
 
     let mut init = String::new();
     init.push_str("#!/bin/busybox sh\n");
@@ -1036,6 +1042,12 @@ fn build_bootstrap(
         sh_quote(&cwd),
         argv.iter().map(|a| sh_quote(a)).collect::<Vec<_>>().join(" ")
     );
+    // Stage the agent into the image's filesystem so it (and the command it runs)
+    // execute under the image root after chroot.
+    if with_agent {
+        init.push_str("mkdir -p /newroot/sbin\n");
+        init.push_str("cp /sbin/amber-agent /newroot/sbin/amber-agent\n");
+    }
     init.push_str(&format!("chroot /newroot /bin/sh -c {}\n", sh_quote(&inner)));
     // Unmount data disks cleanly before poweroff: flushes writes and leaves the
     // ext4 journal clean, so the image mounts read-only elsewhere without replay.
@@ -1055,6 +1067,10 @@ fn build_bootstrap(
     cpio.file("bin/busybox", &busybox, 0o755);
     cpio.file("lib/ld-musl-aarch64.so.1", &musl, 0o755);
     cpio.symlink("lib/libc.musl-aarch64.so.1", "ld-musl-aarch64.so.1");
+    if let Some(agent) = &agent {
+        cpio.dir("sbin", 0o755);
+        cpio.file("sbin/amber-agent", agent, 0o755);
+    }
     if let Some(kernel_mods) = &kernel_mods {
         cpio.dir("mod", 0o755);
         for m in guest::MODULES {

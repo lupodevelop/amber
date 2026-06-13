@@ -25,24 +25,39 @@ const HOST_CID: libc::c_uint = 2; // VMADDR_CID_HOST
 const EXEC_PORT: libc::c_uint = 1;
 const READY: &[u8] = b"__AMBER_READY__\n";
 
-/// Dial the host's exec port over AF_VSOCK. The connection is what restore turns
-/// "live", so this only succeeds once the host (daemon) is listening for the fork.
+/// Dial the host's exec port over AF_VSOCK. Retries: the virtio-vsock device is
+/// probed asynchronously, so an early connect can see ENODEV; and on a restored
+/// fork the host listener may attach a beat after the guest resumes. Give it a
+/// few seconds before giving up.
 fn dial_host() -> File {
-    let fd = unsafe { libc::socket(AF_VSOCK, libc::SOCK_STREAM, 0) };
-    assert!(fd >= 0, "vsock socket");
-    let mut addr: libc::sockaddr_vm = unsafe { std::mem::zeroed() };
-    addr.svm_family = AF_VSOCK as libc::sa_family_t;
-    addr.svm_port = EXEC_PORT;
-    addr.svm_cid = HOST_CID;
-    let rc = unsafe {
-        libc::connect(
-            fd,
-            &addr as *const _ as *const libc::sockaddr,
-            std::mem::size_of::<libc::sockaddr_vm>() as libc::socklen_t,
-        )
-    };
-    assert_eq!(rc, 0, "vsock connect");
-    unsafe { File::from_raw_fd(fd) }
+    let mut last = String::new();
+    for _ in 0..100 {
+        let fd = unsafe { libc::socket(AF_VSOCK, libc::SOCK_STREAM, 0) };
+        if fd < 0 {
+            last = std::io::Error::last_os_error().to_string();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            continue;
+        }
+        let mut addr: libc::sockaddr_vm = unsafe { std::mem::zeroed() };
+        addr.svm_family = AF_VSOCK as libc::sa_family_t;
+        addr.svm_port = EXEC_PORT;
+        addr.svm_cid = HOST_CID;
+        let rc = unsafe {
+            libc::connect(
+                fd,
+                &addr as *const _ as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_vm>() as libc::socklen_t,
+            )
+        };
+        if rc == 0 {
+            return unsafe { File::from_raw_fd(fd) };
+        }
+        last = std::io::Error::last_os_error().to_string();
+        unsafe { libc::close(fd) };
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    eprintln!("amber-agent: vsock connect (cid={HOST_CID} port={EXEC_PORT}) failed: {last}");
+    std::process::exit(1);
 }
 
 fn write_frame(sock: &Mutex<File>, tag: u8, payload: &[u8]) {

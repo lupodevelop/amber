@@ -196,7 +196,11 @@ impl Vm {
     /// Build a VM from a snapshot directory: load its RAM, re-open its disk and
     /// devices, and stash the captured GIC + vcpu state for `run` to apply
     /// instead of booting.
-    pub fn restore_from(dir: &std::path::Path, net: Option<Box<dyn crate::net::NetBackend>>) -> Result<Self> {
+    pub fn restore_from(
+        dir: &std::path::Path,
+        net: Option<Box<dyn crate::net::NetBackend>>,
+        vsock: Option<PathBuf>,
+    ) -> Result<Self> {
         let loaded = crate::snapshot::read(dir)?;
         // Copy-on-write map of the snapshot's RAM: no up-front copy, and every fork
         // of this template shares the untouched pages. This is the fork fast path.
@@ -217,6 +221,25 @@ impl Vm {
             if let Some(backend) = net {
                 let i = virtio.len();
                 virtio.push(VirtioDev::new(i, Box::new(crate::net::NetDevice::new(backend))));
+            }
+        }
+        // vsock sits after net and before balloon, matching prepare()'s order so
+        // the restored virtio queues line up. A fresh UDS backend; the guest's
+        // driver state is in restored RAM, and the agent dials only post-restore.
+        if loaded.meta.vsock {
+            if let Some(path) = vsock {
+                match crate::vsock::UdsBackend::new(path.clone()) {
+                    Some(b) => {
+                        let i = virtio.len();
+                        virtio.push(VirtioDev::new(
+                            i,
+                            Box::new(crate::vsock::VsockDevice::new(3, Box::new(b))),
+                        ));
+                    }
+                    None => log::warn!("vsock: cannot bind {} on restore", path.display()),
+                }
+            } else {
+                log::warn!("snapshot has a vsock device but no AMBER_VSOCK given; device set will mismatch");
             }
         }
         let balloon = push_balloon(&mut virtio);
@@ -344,11 +367,12 @@ impl Vm {
         // Lockdown: everything the VM needs is open (RAM, disk fd, control fd,
         // console, bound listeners); drop the ability to acquire more before any
         // guest instruction runs. The snapshot dir stays writable for capture;
-        // new sockets only if a network device exists (the netstack dials at
-        // runtime). Platform mechanism behind lockdown::Policy (macOS: seatbelt).
+        // new sockets only if a network device (the netstack dials at runtime) or
+        // a vsock device (its UDS backend dials per guest connection) exists.
+        // Platform mechanism behind lockdown::Policy (macOS: seatbelt).
         let policy = crate::lockdown::Policy {
             write_paths: snapshot.iter().map(|r| r.dir.clone()).collect(),
-            net: virtio.iter().any(|d| d.mmio.device_id() == 1),
+            net: virtio.iter().any(|d| matches!(d.mmio.device_id(), 1 | 19)),
         };
         if let Err(e) = policy.apply() {
             return Err(crate::Error::Backend(format!("vmm lockdown: {e}")));
@@ -524,8 +548,11 @@ impl Vm {
                             virtio: v.iter().map(|d| d.mmio.capture()).collect(),
                         };
                         let has_net = v.iter().any(|d| d.mmio.device_id() == 1);
+                        let has_vsock = v.iter().any(|d| d.mmio.device_id() == 19);
                         drop(v);
-                        crate::snapshot::write(&req.dir, mem, &cpus, &gic, disk_path, gic_kind, &dev, has_net)?;
+                        crate::snapshot::write(
+                            &req.dir, mem, &cpus, &gic, disk_path, gic_kind, &dev, has_net, has_vsock,
+                        )?;
                         log::info!("snapshot captured to {} ({} vcpus)", req.dir.display(), cpus.len());
                         return Ok(false);
                     }
