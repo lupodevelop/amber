@@ -16,8 +16,10 @@ proc = subprocess.Popen(
 )
 child.close()  # the agent holds the other end now
 
-cmd = b'echo out-line; echo err-line 1>&2; exit 7'
-host.sendall(struct.pack('<I', len(cmd)) + cmd)
+# command reads stdin (cat), then writes stdout + stderr + a known exit code.
+cmd = b'cat; echo " end"; echo err-line 1>&2; exit 7'
+blob = b'in-blob'
+host.sendall(struct.pack('<I', len(cmd)) + cmd + struct.pack('<I', len(blob)) + blob)
 
 host.settimeout(10)
 buf = b''
@@ -44,6 +46,6 @@ while rc is None:
 
 proc.wait(timeout=5)
 print("STDOUT", repr(out), "STDERR", repr(err), "RC", rc)
-ok = out == b'out-line\n' and err == b'err-line\n' and rc == 7
+ok = out == b'in-blob end\n' and err == b'err-line\n' and rc == 7
 print("AGENT_PROTOCOL_OK" if ok else "AGENT_PROTOCOL_FAIL")
 sys.exit(0 if ok else 1)

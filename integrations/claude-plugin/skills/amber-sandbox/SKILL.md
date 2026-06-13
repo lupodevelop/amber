@@ -63,6 +63,36 @@ AMBER_SANDBOX_IMAGE=python:3-alpine "${CLAUDE_PLUGIN_ROOT}/scripts/amber-exec.sh
   'python3 -c "print(6*7)"'
 ```
 
+## Testing a repo / directory you're working on
+
+To run something against a project — build it, run its tests, try a risky script
+on it — copy the directory **into** the sandbox and run there. The host copy is
+never touched; the command runs on an isolated copy.
+
+```bash
+"${CLAUDE_PLUGIN_ROOT}/scripts/amber-sandbox-repo.sh" <dir> '<command in the copy>'
+```
+
+It tars `<dir>` in (excluding `.git`, `target`, `node_modules`, `.venv`, `dist`,
+`__pycache__`), unpacks it to `/work`, and runs the command there. Pair it with a
+toolchain image and/or networking:
+
+```bash
+AMBER_SANDBOX_IMAGE=rust:alpine \
+  "${CLAUDE_PLUGIN_ROOT}/scripts/amber-sandbox-repo.sh" . 'cargo test'
+
+AMBER_SANDBOX_IMAGE=node:alpine AMBER_SANDBOX_NET=1 \
+  "${CLAUDE_PLUGIN_ROOT}/scripts/amber-sandbox-repo.sh" . 'npm ci && npm test'
+```
+
+Output and exit code come back. To get *changes* back out, have the command emit
+a patch you can review and apply on the host (e.g. `… && git -C /work diff`),
+rather than mutating the host directly — that keeps the isolation.
+
+(Under the hood this uses `amber exec`'s stdin: the host streams the tar to the
+guest command's stdin. You can use that directly too: `tar c x | amber-exec.sh
+'tar x; …'`.)
+
 ## Toolchains and tests
 
 Two ways to get a compiler / interpreter / build tool in the sandbox:

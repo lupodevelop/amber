@@ -14,6 +14,8 @@ the host filesystem or processes, and the network is off by default.
 - **`/amber-sandbox:run <command>`** — run a command in the sandbox on demand.
 - **`scripts/amber-exec.sh`** — the helper both use; usable standalone. It
   downloads a prebuilt amber on first use (`scripts/amber-fetch.sh`).
+- **`scripts/amber-sandbox-repo.sh <dir> '<cmd>'`** — copy a directory into the
+  sandbox and run a command (build/test) against the copy; the host is untouched.
 
 ## Install
 

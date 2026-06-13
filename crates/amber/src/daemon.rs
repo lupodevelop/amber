@@ -389,6 +389,12 @@ fn handle_exec(
     template: String,
     cmd: String,
 ) -> io::Result<()> {
+    // The client follows its request with one TAG_STDIN frame carrying the
+    // command's stdin (e.g. a tarball to copy files in); empty if none.
+    let input = match read_frame(&mut stream) {
+        Ok(Some((TAG_STDIN, b))) => b,
+        _ => Vec::new(),
+    };
     // A private vsock base for this exec; the agent dials `<base>_1`, where we
     // listen. spawn_paused passes the base to the worker as AMBER_VSOCK.
     let n = counter.fetch_add(1, Ordering::Relaxed);
@@ -413,7 +419,7 @@ fn handle_exec(
     let result = match accept_timeout(&listener, Duration::from_secs(15)) {
         Some(mut conn) => {
             log::debug!("exec: agent connected");
-            exec_relay(&mut conn, &mut stream, &cmd)
+            exec_relay(&mut conn, &mut stream, &cmd, &input)
         }
         None => {
             log::warn!("exec: agent did not connect within timeout");
@@ -457,12 +463,20 @@ fn accept_timeout(listener: &UnixListener, timeout: Duration) -> Option<UnixStre
 /// Send the command to the agent, relay its framed output to the client, and
 /// return the exit code. Agent frames: `[tag u8][len u32-le][payload]` with tag
 /// 1 = stdout, 2 = stderr, 3 = exit (payload = rc i32-le).
-fn exec_relay(conn: &mut UnixStream, client: &mut UnixStream, cmd: &str) -> io::Result<i32> {
+fn exec_relay(
+    conn: &mut UnixStream,
+    client: &mut UnixStream,
+    cmd: &str,
+    input: &[u8],
+) -> io::Result<i32> {
+    // Send the command then the stdin blob: each is [u32-le len][bytes].
     let bytes = cmd.as_bytes();
     conn.write_all(&(bytes.len() as u32).to_le_bytes())?;
     conn.write_all(bytes)?;
+    conn.write_all(&(input.len() as u32).to_le_bytes())?;
+    conn.write_all(input)?;
     conn.flush()?;
-    log::debug!("exec_relay: sent cmd ({} bytes), reading frames", bytes.len());
+    log::debug!("exec_relay: sent cmd ({} bytes) + input ({} bytes)", bytes.len(), input.len());
 
     loop {
         let mut hdr = [0u8; 5];
@@ -976,6 +990,17 @@ pub fn exec(template: &str, cmd: &str) -> io::Result<i32> {
         &mut s,
         &Request::Exec { template: template.to_string(), cmd: cmd.to_string() },
     )?;
+    // Follow with our stdin as one blob (the command's stdin in the guest, e.g. a
+    // tarball to copy files in). Empty when stdin is a terminal — reading it would
+    // block, and an interactive shell isn't what `exec` is for.
+    let input = if unsafe { libc::isatty(0) } == 1 {
+        Vec::new()
+    } else {
+        let mut b = Vec::new();
+        let _ = io::Read::read_to_end(&mut io::stdin(), &mut b);
+        b
+    };
+    write_frame(&mut s, TAG_STDIN, &input)?;
 
     let mut stdout = io::stdout();
     let mut stderr = io::stderr();

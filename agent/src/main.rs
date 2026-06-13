@@ -109,17 +109,23 @@ fn main() {
     };
     let sock = Arc::new(Mutex::new(conn));
 
-    // Read the command: a u32-le length then that many bytes.
-    let cmd = {
+    // Read the command, then an stdin blob: each is [u32-le len][bytes]. The blob
+    // (e.g. a tar of the caller's repo) is fed to the command's stdin, so the host
+    // can copy files in: `tar c repo | amber exec … -- 'tar x; run tests'`.
+    let (cmd, input) = {
         let mut g = sock.lock().unwrap();
-        let len = u32::from_le_bytes(read_n(&mut *g, 4).try_into().unwrap_or([0; 4])) as usize;
-        read_n(&mut *g, len)
+        let clen = u32::from_le_bytes(read_n(&mut *g, 4).try_into().unwrap_or([0; 4])) as usize;
+        let cmd = read_n(&mut *g, clen);
+        let ilen = u32::from_le_bytes(read_n(&mut *g, 4).try_into().unwrap_or([0; 4])) as usize;
+        let input = read_n(&mut *g, ilen);
+        (cmd, input)
     };
 
+    let stdin_mode = if input.is_empty() { Stdio::null() } else { Stdio::piped() };
     let mut child = match Command::new("sh")
         .arg("-c")
         .arg(std::ffi::OsStr::from_bytes(&cmd))
-        .stdin(Stdio::null())
+        .stdin(stdin_mode)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -131,6 +137,14 @@ fn main() {
         }
     };
 
+    // Feed the input blob to the command's stdin on its own thread (it may exceed
+    // the pipe buffer, and the command consumes it while running), then close it.
+    let h_in = child.stdin.take().map(|mut sin| {
+        std::thread::spawn(move || {
+            let _ = sin.write_all(&input);
+        })
+    });
+
     let out = child.stdout.take().unwrap();
     let err = child.stderr.take().unwrap();
     let so = sock.clone();
@@ -139,6 +153,9 @@ fn main() {
     let h_err = std::thread::spawn(move || pump(err, se, 2));
     let _ = h_out.join();
     let _ = h_err.join();
+    if let Some(h) = h_in {
+        let _ = h.join();
+    }
 
     let rc = child.wait().ok().and_then(|s| s.code()).unwrap_or(-1);
     write_frame(&sock, 3, &(rc as i32).to_le_bytes());
