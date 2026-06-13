@@ -1,0 +1,11 @@
+{
+  "name": "amber",
+  "owner": { "name": "amber" },
+  "plugins": [
+    {
+      "name": "amber-sandbox",
+      "source": "./claude-plugin",
+      "description": "Run untrusted or destructive commands and code inside an isolated amber arm64 microVM instead of on the host."
+    }
+  ]
+}

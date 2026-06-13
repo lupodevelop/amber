@@ -16,3 +16,5 @@
 /kernel/resin-effective.config
 /target-linux
 agent/target/
+/dist
+.amber-cache/

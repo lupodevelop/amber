@@ -1,0 +1,74 @@
+name: release
+
+# Produce ready-to-run amber bundles — the binary plus the resin guest kernel,
+# the in-guest agent, and the busybox/musl userland — for macOS and Linux arm64.
+# The guest artifacts are host-independent, so they're built once on Linux arm64
+# (Docker, native) and bundled with each host binary. Tagging `v*` also publishes
+# them to a GitHub Release; `workflow_dispatch` just uploads workflow artifacts.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  assets:
+    name: guest assets (resin kernel + agent + userland)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: resin kernel -> assets/Image
+        run: make kernel
+      - name: in-guest agent -> assets/amber-agent
+        run: ./scripts/build-agent.sh
+      - name: userland -> assets/irx
+        run: ./scripts/fetch-assets.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: assets
+          path: assets/
+          retention-days: 1
+
+  bundle-linux:
+    name: linux arm64 bundle
+    needs: assets
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo build --release -p amber
+      - uses: actions/download-artifact@v4
+        with: { name: assets, path: assets/ }
+      - run: ./scripts/package-release.sh linux arm64
+      - uses: actions/upload-artifact@v4
+        with: { name: amber-linux-arm64, path: dist/amber-linux-arm64.tar.gz }
+
+  bundle-macos:
+    name: macos arm64 bundle
+    needs: assets
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo build --release -p amber
+      - name: codesign (ad-hoc, with the HVF entitlement)
+        run: codesign --entitlements amber.entitlements -s - target/release/amber
+      - uses: actions/download-artifact@v4
+        with: { name: assets, path: assets/ }
+      - run: ./scripts/package-release.sh macos arm64
+      - uses: actions/upload-artifact@v4
+        with: { name: amber-macos-arm64, path: dist/amber-macos-arm64.tar.gz }
+
+  release:
+    name: publish release
+    needs: [bundle-linux, bundle-macos]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { pattern: amber-*, merge-multiple: true, path: dist/ }
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/amber-*.tar.gz
+          generate_release_notes: true

@@ -1,0 +1,10 @@
+{
+  "name": "amber-sandbox",
+  "description": "Run untrusted or destructive shell commands and code inside an isolated amber arm64 microVM instead of on the host.",
+  "version": "0.1.0",
+  "author": { "name": "amber" },
+  "repository": "https://github.com/lupodevelop/amber",
+  "keywords": ["sandbox", "microvm", "amber", "isolation", "untrusted-code"],
+  "skills": "./skills/",
+  "commands": ["./commands/"]
+}

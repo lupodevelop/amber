@@ -399,6 +399,11 @@ impl Vm {
         // new sockets only if a network device (the netstack dials at runtime) or
         // a vsock device (its UDS backend dials per guest connection) exists.
         // Platform mechanism behind lockdown::Policy (macOS: seatbelt).
+        // Create the snapshot dir up front so lockdown can canonicalize it (and so
+        // the later capture write lands) even when its parent doesn't exist yet.
+        if let Some(req) = &snapshot {
+            let _ = std::fs::create_dir_all(&req.dir);
+        }
         let policy = crate::lockdown::Policy {
             write_paths: snapshot.iter().map(|r| r.dir.clone()).collect(),
             net: virtio.iter().any(|d| matches!(d.mmio.device_id(), 1 | 19)),
