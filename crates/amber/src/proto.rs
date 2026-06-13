@@ -13,6 +13,8 @@ pub const TAG_REQUEST: u8 = 1;
 pub const TAG_REPLY: u8 = 2;
 pub const TAG_STDOUT: u8 = 3;
 pub const TAG_STDIN: u8 = 4;
+/// Guest stderr, kept distinct from stdout (the vsock exec path carries both).
+pub const TAG_STDERR: u8 = 5;
 
 /// Reject frames larger than this. Control frames are small and stdout chunks are
 /// 8 KiB; the cap stops a malformed length from forcing a huge allocation.
@@ -54,6 +56,10 @@ pub enum Request {
     /// `interactive` streams the resumed guest's console I/O to the client (like
     /// `RunOneShot`); otherwise the fork is detached and only its id is returned.
     Fork { template: String, interactive: bool },
+    /// Run one command in a fork of a template over the vsock exec channel: the
+    /// in-guest agent runs it under `sh -c`, and its stdout/stderr/exit-code come
+    /// back as distinct frames (no in-band marker). Non-interactive, one-shot.
+    Exec { template: String, cmd: String },
     /// Kill a VM by id.
     Kill { id: String },
     /// Stop the daemon.

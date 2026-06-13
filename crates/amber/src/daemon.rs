@@ -8,7 +8,7 @@
 
 use crate::proto::{
     self, read_frame, write_frame, write_reply, Reply, Request, VmInfo, TAG_REPLY, TAG_REQUEST,
-    TAG_STDIN, TAG_STDOUT,
+    TAG_STDERR, TAG_STDIN, TAG_STDOUT,
 };
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
@@ -210,7 +210,13 @@ fn attach_control(cmd: &mut Command) -> io::Result<(UnixStream, UnixStream)> {
 /// the costly work (CoW map + GIC + register restore), signals ready on the
 /// control channel, and blocks for a go byte. Returns once it is warmed and
 /// registered. The caller decides whether to pool the id or release it now.
-fn spawn_paused(reg: &Registry, counter: &AtomicU64, pool: &Pool, template: &str) -> io::Result<String> {
+fn spawn_paused(
+    reg: &Registry,
+    counter: &AtomicU64,
+    pool: &Pool,
+    template: &str,
+    vsock: Option<&str>,
+) -> io::Result<String> {
     let (id, kill) = reserve(reg, counter, template)
         .map_err(|_| io::Error::other("RAM budget exceeded"))?;
 
@@ -226,6 +232,11 @@ fn spawn_paused(reg: &Registry, counter: &AtomicU64, pool: &Pool, template: &str
     // there), so the worker runs in swgic mode regardless of the daemon's env.
     cmd.arg("restore").arg(template);
     cmd.env("AMBER_PAUSED", "1").env("AMBER_GIC", "sw");
+    // The exec path gives the worker a vsock base so the in-guest agent can dial
+    // amberd's listener once this fork resumes.
+    if let Some(v) = vsock {
+        cmd.env("AMBER_VSOCK", v);
+    }
     cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(err);
     let (mut ctl_host, ctl_child) = match attach_control(&mut cmd) {
         Ok(p) => p,
@@ -325,7 +336,7 @@ fn handle_fork(
     let pooled = pool.lock().unwrap().get_mut(&template).and_then(|v| v.pop());
     let id = match pooled {
         Some(id) => id,
-        None => match spawn_paused(&reg, &counter, &pool, &template) {
+        None => match spawn_paused(&reg, &counter, &pool, &template, None) {
             Ok(id) => id,
             Err(e) => {
                 write_reply(&mut stream, &Reply::Error { message: e.to_string() })?;
@@ -363,6 +374,118 @@ fn handle_fork(
             }
         }
         write_reply(&mut stream, &Reply::Started { id })
+    }
+}
+
+/// Run one command in a fork of `template` over the vsock exec channel. Stage a
+/// dedicated worker with a private vsock base, listen for the in-guest agent's
+/// dial, release the fork, then relay the agent's stdout/stderr/exit frames to the
+/// client. One-shot and non-interactive; the worker is torn down at the end.
+fn handle_exec(
+    mut stream: UnixStream,
+    reg: Registry,
+    counter: Arc<AtomicU64>,
+    pool: Pool,
+    template: String,
+    cmd: String,
+) -> io::Result<()> {
+    // A private vsock base for this exec; the agent dials `<base>_1`, where we
+    // listen. spawn_paused passes the base to the worker as AMBER_VSOCK.
+    let n = counter.fetch_add(1, Ordering::Relaxed);
+    let base = std::env::temp_dir().join(format!("amber-exec-{}-{n}.sock", std::process::id()));
+    let base_str = base.to_string_lossy().into_owned();
+    let listen_path = format!("{base_str}_1");
+    let _ = std::fs::remove_file(&listen_path);
+    let listener = UnixListener::bind(&listen_path)?;
+    listener.set_nonblocking(true)?;
+
+    let id = match spawn_paused(&reg, &counter, &pool, &template, Some(&base_str)) {
+        Ok(id) => id,
+        Err(e) => {
+            let _ = std::fs::remove_file(&listen_path);
+            return write_reply(&mut stream, &Reply::Error { message: e.to_string() });
+        }
+    };
+    // Resume the fork; its agent now dials our listener.
+    let released = release(&reg, &id);
+    log::debug!("exec: worker {id} released={released}, waiting for agent on {listen_path}");
+
+    let result = match accept_timeout(&listener, Duration::from_secs(15)) {
+        Some(mut conn) => {
+            log::debug!("exec: agent connected");
+            exec_relay(&mut conn, &mut stream, &cmd)
+        }
+        None => {
+            log::warn!("exec: agent did not connect within timeout");
+            Err(io::Error::other("exec agent did not connect"))
+        }
+    };
+
+    // Tear the worker down and clean up the sockets.
+    if let Some(flag) = reg.lock().unwrap().get(&id).map(|e| e.kill.clone()) {
+        flag.store(true, Ordering::Relaxed);
+    }
+    let _ = std::fs::remove_file(&listen_path);
+    let _ = std::fs::remove_file(&base);
+
+    match result {
+        Ok(code) => write_reply(&mut stream, &Reply::Exit { code }),
+        Err(e) => write_reply(&mut stream, &Reply::Error { message: e.to_string() }),
+    }
+}
+
+/// Accept one connection within `timeout`, polling the nonblocking listener.
+fn accept_timeout(listener: &UnixListener, timeout: Duration) -> Option<UnixStream> {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        match listener.accept() {
+            Ok((s, _)) => {
+                // The connection inherits the listener's nonblocking flag; the
+                // relay does blocking reads, so clear it.
+                let _ = s.set_nonblocking(false);
+                return Some(s);
+            }
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+/// Send the command to the agent, relay its framed output to the client, and
+/// return the exit code. Agent frames: `[tag u8][len u32-le][payload]` with tag
+/// 1 = stdout, 2 = stderr, 3 = exit (payload = rc i32-le).
+fn exec_relay(conn: &mut UnixStream, client: &mut UnixStream, cmd: &str) -> io::Result<i32> {
+    let bytes = cmd.as_bytes();
+    conn.write_all(&(bytes.len() as u32).to_le_bytes())?;
+    conn.write_all(bytes)?;
+    conn.flush()?;
+    log::debug!("exec_relay: sent cmd ({} bytes), reading frames", bytes.len());
+
+    loop {
+        let mut hdr = [0u8; 5];
+        if let Err(e) = conn.read_exact(&mut hdr) {
+            log::warn!("exec_relay: header read ended: {e}");
+            return Ok(-1); // agent closed without an exit frame
+        }
+        let len = u32::from_le_bytes(hdr[1..5].try_into().unwrap()) as usize;
+        log::debug!("exec_relay: frame tag={} len={len}", hdr[0]);
+        if len > proto::MAX_FRAME {
+            return Err(io::Error::other("agent frame too large"));
+        }
+        let mut payload = vec![0u8; len];
+        conn.read_exact(&mut payload)?;
+        match hdr[0] {
+            1 => write_frame(client, TAG_STDOUT, &payload)?,
+            2 => write_frame(client, TAG_STDERR, &payload)?,
+            3 => {
+                let rc = payload.get(..4).and_then(|s| s.try_into().ok()).unwrap_or([0; 4]);
+                return Ok(i32::from_le_bytes(rc));
+            }
+            _ => {}
+        }
     }
 }
 
@@ -436,7 +559,7 @@ fn refill_pool(reg: Registry, counter: Arc<AtomicU64>, pool: Pool, template: Str
     let target = pool_target();
     thread::spawn(move || {
         while pool.lock().unwrap().get(&template).map_or(0, |v| v.len()) < target {
-            match spawn_paused(&reg, &counter, &pool, &template) {
+            match spawn_paused(&reg, &counter, &pool, &template, None) {
                 Ok(rid) => pool.lock().unwrap().entry(template.clone()).or_default().push(rid),
                 Err(_) => break,
             }
@@ -574,6 +697,9 @@ fn handle(
         }
         Request::Fork { template, interactive } => {
             return handle_fork(stream, reg, counter, pool, template, interactive);
+        }
+        Request::Exec { template, cmd } => {
+            return handle_exec(stream, reg, counter, pool, template, cmd);
         }
         Request::Kill { id } => {
             // Signal the owner thread; it kills and reaps the child it owns.
@@ -840,57 +966,40 @@ pub fn fork_interactive(template: &str) -> io::Result<i32> {
     stream_client(&Request::Fork { template: template.to_string(), interactive: true })
 }
 
-/// Marker the in-guest agent prints after the command, carrying its exit status.
-const RC_MARKER: &[u8] = b"__AMBER_RC__";
-
-/// Run a fresh command in a fork of a ready-to-exec template (M7): fork the
-/// template, hand the agent the command line, stream its output, and return the
-/// exit code the agent reports. The agent line is filtered out of the output.
+/// Run a fresh command in a fork of a ready-to-exec template: send `Exec`, then
+/// stream the in-guest agent's stdout and stderr (kept distinct) to ours and
+/// return the structured exit code. No in-band marker — the code arrives in the
+/// terminal `Exit` reply.
 pub fn exec(template: &str, cmd: &str) -> io::Result<i32> {
-    let mut s = connect().ok_or_else(|| io::Error::other("no amberd"))?;
-    proto::write_request(&mut s, &Request::Fork { template: template.to_string(), interactive: true })?;
-    // Hand the agent the command (it does `read` then `sh -c`).
-    write_frame(&mut s, TAG_STDIN, format!("{cmd}\n").as_bytes())?;
+    let mut s = connect().ok_or_else(|| io::Error::other("no amberd (run 'amber up')"))?;
+    proto::write_request(
+        &mut s,
+        &Request::Exec { template: template.to_string(), cmd: cmd.to_string() },
+    )?;
 
-    let mut rc = 0i32;
-    let mut buf: Vec<u8> = Vec::new();
     let mut stdout = io::stdout();
+    let mut stderr = io::stderr();
     loop {
         match read_frame(&mut s)? {
             Some((TAG_STDOUT, bytes)) => {
-                buf.extend_from_slice(&bytes);
-                // Process complete lines, swallowing the exit-code marker line.
-                while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
-                    let line: Vec<u8> = buf.drain(..=nl).collect();
-                    if let Some(code) = line.strip_prefix(RC_MARKER) {
-                        // The marker is the agent's last line: the command is done
-                        // and all its output is already flushed. Return now and let
-                        // the dropped connection reap the fork — no wait for the
-                        // guest to finish powering off (that is the slow part).
-                        rc = String::from_utf8_lossy(code).trim().parse().unwrap_or(0);
-                        return Ok(rc);
-                    }
-                    stdout.write_all(&line)?;
-                    stdout.flush()?;
-                }
+                stdout.write_all(&bytes)?;
+                stdout.flush()?;
+            }
+            Some((TAG_STDERR, bytes)) => {
+                stderr.write_all(&bytes)?;
+                stderr.flush()?;
             }
             Some((TAG_REPLY, payload)) => {
                 return match serde_json::from_slice::<Reply>(&payload)? {
-                    Reply::Exit { .. } => {
-                        if !buf.is_empty() {
-                            stdout.write_all(&buf)?;
-                            stdout.flush()?;
-                        }
-                        Ok(rc)
-                    }
+                    Reply::Exit { code } => Ok(code),
                     Reply::Error { message } => Err(io::Error::other(message)),
                     Reply::BudgetExceeded { budget, used, requested } => {
                         Err(io::Error::other(budget_msg(budget, used, requested)))
                     }
-                    _ => Ok(rc),
+                    _ => Ok(0),
                 };
             }
-            _ => return Ok(rc),
+            _ => return Ok(0),
         }
     }
 }
