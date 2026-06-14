@@ -5,7 +5,15 @@
 BIN := target/release/amber
 ENTITLEMENTS := amber.entitlements
 
-.PHONY: build sign release test test-int lint kernel clean
+.PHONY: build sign release test test-int lint fuzz kernel clean
+
+# Fuzz the guest→host parsers (untrusted-input attack surface). Needs nightly +
+# cargo-fuzz; the rustup shims must win over any homebrew rust in PATH.
+# Usage: make fuzz TARGET=vsock_packet SECS=60   (targets: vsock_packet, virtio_chain)
+TARGET ?= vsock_packet
+SECS ?= 60
+fuzz:
+	cd fuzz && PATH="$$HOME/.cargo/bin:$$PATH" cargo +nightly fuzz run $(TARGET) -- -max_total_time=$(SECS)
 
 # Default: build the release binary and codesign it (software GIC + net on).
 build:

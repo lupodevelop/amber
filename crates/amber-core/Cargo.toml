@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Exposes thin harness wrappers over the guest→host parsers (vsock packets,
+# virtio descriptor chains) so the fuzz crate can drive them. Off by default.
+fuzzing = []
+
 [dependencies]
 libc.workspace = true
 vm-fdt.workspace = true

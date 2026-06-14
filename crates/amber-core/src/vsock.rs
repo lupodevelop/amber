@@ -359,6 +359,27 @@ impl VsockDevice {
     }
 }
 
+/// Drive the guest→host vsock packet parser with arbitrary bytes (fuzz entry).
+/// The guest controls this byte string in production, so it must never panic,
+/// over-read, or loop on any input. The backend refuses all dials so no real
+/// sockets are touched.
+#[cfg(feature = "fuzzing")]
+pub fn fuzz_on_guest_packet(data: &[u8]) {
+    struct NullBackend;
+    impl VsockBackend for NullBackend {
+        fn dial(&mut self, _: u32) -> Option<UnixStream> {
+            None
+        }
+        fn accept(&mut self) -> Option<(u32, UnixStream)> {
+            None
+        }
+    }
+    let mut dev = VsockDevice::new(3, Box::new(NullBackend));
+    dev.on_guest_packet(data);
+    // Drive the downstream state the parsed packet may have mutated.
+    let _ = dev.poll_rx(4096);
+}
+
 impl VirtioDevice for VsockDevice {
     fn device_id(&self) -> u32 {
         Self::DEVICE_ID

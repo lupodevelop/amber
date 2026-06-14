@@ -18,3 +18,8 @@
 agent/target/
 /dist
 .amber-cache/
+# cargo-fuzz build output and run artifacts (the targets + Cargo.toml are tracked).
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+/fuzz/coverage

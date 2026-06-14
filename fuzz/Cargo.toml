@@ -1,0 +1,29 @@
+[package]
+name = "amber-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+amber-core = { path = "../crates/amber-core", features = ["fuzzing"] }
+
+# Detach from the parent workspace so libfuzzer-sys/ASAN stay out of the main build.
+[workspace]
+
+[[bin]]
+name = "vsock_packet"
+path = "fuzz_targets/vsock_packet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "virtio_chain"
+path = "fuzz_targets/virtio_chain.rs"
+test = false
+doc = false
+bench = false

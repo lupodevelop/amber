@@ -463,6 +463,38 @@ fn inject_one(ram: &GuestRam, q: &mut Queue, data: &[u8]) -> bool {
     true
 }
 
+/// Drive the virtqueue descriptor walkers with a guest-controlled ring (fuzz
+/// entry). The guest owns the descriptor table, avail/used rings, and the queue
+/// indices; the walkers must stay bounded and in-RAM for any of them. `data`'s
+/// first 8 bytes pick the ring geometry, the rest fills guest RAM.
+#[cfg(feature = "fuzzing")]
+pub fn fuzz_descriptor_chain(data: &[u8]) {
+    use crate::memory::GuestMemory;
+    if data.len() < 8 {
+        return;
+    }
+    let base = 0x4000_0000u64;
+    // One mmap'd region per thread, reused across iterations.
+    thread_local! {
+        static MEM: GuestMemory = GuestMemory::new(0x4000_0000, 1 << 20).unwrap();
+    }
+    let head = u16::from_le_bytes([data[0], data[1]]);
+    let qsz = u16::from_le_bytes([data[2], data[3]]).clamp(1, QUEUE_MAX as u16);
+    // Place the rings at fuzz-chosen offsets within the region.
+    let off = |b: [u8; 2]| base + (u16::from_le_bytes(b) as u64 & 0xfff0);
+    let desc = off([data[4], data[5]]);
+    let used = off([data[6], data[7]]);
+    MEM.with(|mem| {
+        let ram = mem.ram();
+        let _ = ram.write(base, &data[8..]);
+        let bufs = collect_chain(&ram, desc, head, qsz);
+        let mut q = Queue { num: qsz as u32, ready: 1, desc, avail: desc, used, last_avail: head };
+        let _ = next_rx_capacity(&ram, &q);
+        let _ = inject_one(&ram, &mut q, &data[8..]);
+        std::hint::black_box(bufs);
+    });
+}
+
 /// virtio-blk. The squashfs root opens read-only (the guest layers a tmpfs
 /// overlay for its writes); a data disk opens read-write, so IN, OUT and FLUSH
 /// are all implemented and writes persist to the backing host file.
