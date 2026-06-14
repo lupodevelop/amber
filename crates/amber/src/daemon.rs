@@ -69,7 +69,8 @@ fn ram_budget() -> Option<u64> {
         .map(|b| b as u64)
 }
 
-/// Total host RAM in bytes (via `sysctl hw.memsize`; 0 if unavailable).
+/// Total host RAM in bytes (0 if unavailable).
+#[cfg(target_os = "macos")]
 fn machine_ram() -> u64 {
     Command::new("sysctl")
         .args(["-n", "hw.memsize"])
@@ -80,7 +81,19 @@ fn machine_ram() -> u64 {
         .unwrap_or(0)
 }
 
-/// Real resident memory of a process, in bytes (via `ps`; 0 if unavailable).
+#[cfg(target_os = "linux")]
+fn machine_ram() -> u64 {
+    let pages = unsafe { libc::sysconf(libc::_SC_PHYS_PAGES) };
+    let psize = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if pages > 0 && psize > 0 {
+        pages as u64 * psize as u64
+    } else {
+        0
+    }
+}
+
+/// Real resident memory of a process, in bytes (0 if unavailable).
+#[cfg(target_os = "macos")]
 fn rss_bytes(pid: u32) -> u64 {
     if pid == 0 {
         return 0;
@@ -93,6 +106,26 @@ fn rss_bytes(pid: u32) -> u64 {
         .and_then(|s| s.trim().parse::<u64>().ok())
         .map(|kb| kb * 1024)
         .unwrap_or(0)
+}
+
+// On Linux, read `/proc/<pid>/statm` directly instead of forking `ps` per VM —
+// listing a 1000-VM fleet otherwise spawns 1000 processes per `amber budget`/`ps`.
+#[cfg(target_os = "linux")]
+fn rss_bytes(pid: u32) -> u64 {
+    if pid == 0 {
+        return 0;
+    }
+    // statm fields are in pages; the second is the resident set size.
+    let resident_pages: u64 = std::fs::read_to_string(format!("/proc/{pid}/statm"))
+        .ok()
+        .and_then(|s| s.split_whitespace().nth(1).and_then(|f| f.parse().ok()))
+        .unwrap_or(0);
+    let psize = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if psize > 0 {
+        resident_pages * psize as u64
+    } else {
+        0
+    }
 }
 
 /// Atomically admit and reserve a slot for a new VM, or refuse to protect the
