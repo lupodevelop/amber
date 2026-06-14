@@ -1072,6 +1072,38 @@ mod tests {
         assert!(!inject_one(&r, &mut q, &[1, 2, 3])); // avail idx == last_avail
     }
 
+    #[test]
+    fn next_rx_capacity_sums_writable_chain() {
+        let m = ram();
+        let r = m.ram();
+        put_desc(&r, 0, DATA, 100, VIRTQ_DESC_F_WRITE | VIRTQ_DESC_F_NEXT, 1);
+        put_desc(&r, 1, DATA + 100, 56, VIRTQ_DESC_F_WRITE, 0);
+        avail_set(&r, 0, 0, 1);
+        let q = Queue { num: 8, ready: 1, desc: DESC, avail: AVAIL, used: USED, last_avail: 0 };
+        assert_eq!(next_rx_capacity(&r, &q), Some(156)); // 100 + 56 writable
+    }
+
+    #[test]
+    fn next_rx_capacity_none_when_unposted_or_unready() {
+        let m = ram();
+        let r = m.ram();
+        let posted = Queue { num: 8, ready: 1, desc: DESC, avail: AVAIL, used: USED, last_avail: 0 };
+        assert_eq!(next_rx_capacity(&r, &posted), None); // avail idx == last_avail
+        let unready = Queue { num: 8, ready: 0, desc: DESC, avail: AVAIL, used: USED, last_avail: 0 };
+        assert_eq!(next_rx_capacity(&r, &unready), None);
+    }
+
+    #[test]
+    fn next_rx_capacity_ignores_out_of_ram_descriptor() {
+        // A descriptor pointing outside guest RAM contributes zero, never panics.
+        let m = ram();
+        let r = m.ram();
+        put_desc(&r, 0, BASE + (RAMSZ as u64) + 0x1000, 4096, VIRTQ_DESC_F_WRITE, 0);
+        avail_set(&r, 0, 0, 1);
+        let q = Queue { num: 8, ready: 1, desc: DESC, avail: AVAIL, used: USED, last_avail: 0 };
+        assert_eq!(next_rx_capacity(&r, &q), Some(0));
+    }
+
     // ---- virtio-blk (read-only) ----
 
     fn blk_chain(data_len: u32) -> Vec<Buf> {

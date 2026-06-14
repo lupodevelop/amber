@@ -593,4 +593,75 @@ mod tests {
         writer.join().unwrap();
         assert_eq!(data, total, "every byte must arrive, split across capped packets");
     }
+
+    // ---- malformed guest input (the guest→host attack surface) ----
+    // These pin the invariants the fuzzer explores: no panic, no state corruption,
+    // junk packets are dropped. `on_guest_packet` parses fully guest-controlled bytes.
+
+    fn null_dev() -> VsockDevice {
+        VsockDevice::new(3, Box::new(TestBackend { dialed: None, incoming: VecDeque::new() }))
+    }
+
+    #[test]
+    fn short_packets_are_ignored_not_panicked() {
+        let mut dev = null_dev();
+        for n in 0..HDR_LEN {
+            dev.on_guest_packet(&vec![0xff; n]); // shorter than a header
+        }
+        assert!(dev.conns.is_empty());
+        assert!(dev.rx.is_empty());
+    }
+
+    #[test]
+    fn unknown_opcode_is_dropped() {
+        let mut dev = null_dev();
+        dev.on_guest_packet(&guest_pkt(40000, 1024, 0xbeef, 0, b"junk"));
+        dev.on_guest_packet(&guest_pkt(40000, 1024, 0, 0, b""));
+        assert!(dev.conns.is_empty());
+        assert!(dev.rx.is_empty());
+    }
+
+    #[test]
+    fn data_for_unknown_connection_is_dropped() {
+        let mut dev = null_dev();
+        // RW / SHUTDOWN / CREDIT for a connection that was never opened.
+        dev.on_guest_packet(&guest_pkt(40000, 1024, OP_RW, 0, b"payload"));
+        dev.on_guest_packet(&guest_pkt(40000, 1024, OP_SHUTDOWN, 0, b""));
+        dev.on_guest_packet(&guest_pkt(40000, 1024, OP_CREDIT_UPDATE, 999, b""));
+        assert!(dev.conns.is_empty(), "no phantom connection from stray data");
+    }
+
+    #[test]
+    fn oversized_len_field_does_not_over_read() {
+        // Header claims a 4 GiB payload but carries 4 bytes: the parser must clamp
+        // to what's present, never index past the packet.
+        let mut p = guest_pkt(40000, 1024, OP_RW, 0, b"abcd");
+        p[24..28].copy_from_slice(&u32::MAX.to_le_bytes()); // len = 0xffff_ffff
+        let mut dev = null_dev();
+        dev.on_guest_packet(&p); // must not panic / OOB
+        assert!(dev.conns.is_empty());
+    }
+
+    #[test]
+    fn packet_for_other_cid_is_ignored() {
+        // dst_cid must be the host (2); anything else is not ours.
+        let mut p = guest_pkt(40000, 1024, OP_REQUEST, 0, b"");
+        p[8..16].copy_from_slice(&999u64.to_le_bytes()); // dst_cid = 999, not host
+        let mut dev =
+            VsockDevice::new(3, Box::new(TestBackend { dialed: None, incoming: VecDeque::new() }));
+        dev.on_guest_packet(&p);
+        assert!(dev.conns.is_empty());
+        assert!(dev.rx.is_empty(), "no RST/RESPONSE for a packet not addressed to us");
+    }
+
+    #[test]
+    fn refused_request_then_stray_data_stays_clean() {
+        // A dial we refuse (RST), followed by data on the never-established conn.
+        let mut dev = null_dev();
+        dev.on_guest_packet(&guest_pkt(40000, 9999, OP_REQUEST, 0, b"")); // -> RST
+        assert_eq!(hdr(&dev.rx.pop_front().unwrap()).2, OP_RST);
+        dev.on_guest_packet(&guest_pkt(40000, 9999, OP_RW, 0, b"after-rst"));
+        assert!(dev.conns.is_empty());
+        assert!(dev.rx.is_empty());
+    }
 }
