@@ -90,8 +90,38 @@ echo "worker fds:           $sum_fds           (avg $(( up>0 ? sum_fds/up : 0 ))
 echo "daemon (serve) rss/thr/fds: $dline"
 echo "======================================================"
 
-echo "==> teardown"
+seq_total=0; for x in "${lat[@]}"; do seq_total=$((seq_total + x)); done
+
+echo "==> teardown (sequential phase)"
 for id in "${ids[@]}"; do "$BIN" rm "$id" >/dev/null 2>&1 || true; done
 sleep 1
+
+# --- concurrent burst: stresses the daemon's single registry lock + admission ---
+# If the lock serializes spawns, the burst wall-clock approaches the sequential
+# sum; if it parallelizes, it's far lower. This is the signal for whether a sharded
+# / RwLock registry (and concurrent admission) is worth doing.
+echo "==> burst: spawning $up VMs concurrently"
+tmpd="$(mktemp -d)"
+bt0=$(now_ms)
+for i in $(seq 1 "$up"); do
+  ( AMBER_MEM="${MEM:-}" "$BIN" run -d "$IMG" -- sh -c "$HOLD" >"$tmpd/$i" 2>/dev/null ) &
+done
+wait
+bt1=$(now_ms)
+bids=(); for i in $(seq 1 "$up"); do id="$(cat "$tmpd/$i" 2>/dev/null)"; [ -n "$id" ] && bids+=("$id"); done
+burst_up=${#bids[@]}
+burst_ms=$((bt1 - bt0))
+echo
+echo "================ concurrency (registry lock) ================"
+echo "burst up:             $burst_up / $up"
+echo "burst wall-clock:     ${burst_ms} ms   (sequential sum was ${seq_total} ms)"
+if [ "$burst_up" -gt 0 ] && [ "$seq_total" -gt 0 ]; then
+  echo "speedup vs serial:    $(awk -v s="$seq_total" -v b="$burst_ms" 'BEGIN{ r=(b>0)?(s/b):0; printf "%.1fx", r }')  (near 1x = lock serializes; >>1x = parallel)"
+fi
+echo "============================================================="
+
+echo "==> teardown (burst phase)"
+for id in "${bids[@]}"; do "$BIN" rm "$id" >/dev/null 2>&1 || true; done
+rm -rf "$tmpd"; sleep 1
 leaked=$(worker_pids | wc -l | tr -d ' ')
 echo "worker procs after teardown: $leaked $([ "$leaked" -eq 0 ] && echo '(clean)' || echo '(LEAK)')"
