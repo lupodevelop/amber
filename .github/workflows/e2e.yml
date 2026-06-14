@@ -1,0 +1,75 @@
+name: e2e
+
+# Heavy end-to-end lane: the KVM backend (boot, snapshot/restore, SMP teardown,
+# pause/resume) exercised hardware-free under QEMU TCG — three levels of emulation,
+# so it takes tens of minutes. Too slow for the per-push `ci` gate, so it runs on a
+# nightly schedule and on demand. Pure TCG: no nested virt, so a stock arm64 runner
+# works. The HVF e2e (scripts/integration-test.sh) is NOT here — GitHub's macOS
+# runners don't expose Hypervisor.framework — and stays a local check.
+
+on:
+  schedule:
+    - cron: "0 4 * * *" # nightly, 04:00 UTC
+  workflow_dispatch: {}
+
+jobs:
+  kvm-e2e:
+    name: KVM backend under QEMU TCG
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    env:
+      # One shared work dir so the outer KVM-host kernel is built once and reused
+      # by all four scripts in this job.
+      WORK: ${{ github.workspace }}/.kvm-work
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install qemu (system arm64)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-system-arm
+          qemu-system-aarch64 --version | head -1
+
+      # The kernel source tarball (kernel/.cache) and the built outer KVM-host
+      # kernel (WORK/outer-Image) are deterministic and slow — cache them.
+      - name: cache kernel source + outer kernel
+        uses: actions/cache@v4
+        with:
+          path: |
+            kernel/.cache
+            .kvm-work/outer-Image
+          key: kvm-e2e-kernel-${{ hashFiles('scripts/build-kernel.sh', 'kernel/**') }}
+
+      - name: build resin kernel -> assets/Image
+        run: make kernel
+
+      - name: fetch userland -> assets/irx
+        run: ./scripts/fetch-assets.sh
+
+      - name: kvm boot (resin under amber-kvm)
+        run: ./scripts/kvm-test.sh
+
+      - name: kvm snapshot/restore
+        run: ./scripts/kvm-snapshot-test.sh
+
+      - name: kvm SMP teardown
+        run: ./scripts/kvm-smp-test.sh
+
+      - name: kvm pause/resume
+        run: ./scripts/kvm-pause-test.sh
+
+  fuzz-smoke:
+    name: fuzz smoke (guest->host parsers)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: install nightly + cargo-fuzz
+        run: |
+          rustup toolchain install nightly --profile minimal
+          rustup component add --toolchain nightly rust-src
+          cargo install cargo-fuzz --locked
+      - name: fuzz vsock packet parser (2 min)
+        run: cd fuzz && cargo +nightly fuzz run vsock_packet -- -max_total_time=120
+      - name: fuzz virtio descriptor chains (2 min)
+        run: cd fuzz && cargo +nightly fuzz run virtio_chain -- -max_total_time=120
