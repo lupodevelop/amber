@@ -153,7 +153,9 @@ impl VirtioDevice for NetDevice {
         // tx consumes the buffer with no bytes written back; rx is pumped elsewhere.
         0
     }
-    fn poll_rx(&mut self) -> Option<Vec<u8>> {
+    fn poll_rx(&mut self, _max_frame: usize) -> Option<Vec<u8>> {
+        // Ethernet frames are whole and fit any posted rx buffer, so `max_frame`
+        // (the guest's buffer capacity) is not a constraint here.
         // A deferred frame goes first (ordering); otherwise pull from the backend.
         let frame = match self.pending_rx.take() {
             Some(f) => f,
@@ -267,7 +269,7 @@ mod tests {
         let be = RecBackend::default();
         be.inq.lock().unwrap().push(vec![1, 2, 3, 4]);
         let mut dev = NetDevice::new(Box::new(be));
-        let out = dev.poll_rx().unwrap();
+        let out = dev.poll_rx(65536).unwrap();
         assert_eq!(out.len(), VIRTIO_NET_HDR_LEN + 4);
         assert_eq!(out[10], 1); // num_buffers = 1
         assert_eq!(&out[VIRTIO_NET_HDR_LEN..], &[1, 2, 3, 4]);
@@ -299,10 +301,10 @@ mod tests {
         let mut bucket = crate::limiter::TokenBucket::new(1024); // 1 KiB/s
         assert!(bucket.try_take(1024)); // drain: 64 B need ~62 ms to refill
         dev.rx_limit = Some(bucket);
-        assert!(dev.poll_rx().is_none()); // deferred...
+        assert!(dev.poll_rx(65536).is_none()); // deferred...
         assert!(dev.wants_poll()); // ...and the loop is told to keep polling
         std::thread::sleep(std::time::Duration::from_millis(150));
-        let out = dev.poll_rx().expect("delivered after refill");
+        let out = dev.poll_rx(65536).expect("delivered after refill");
         assert_eq!(&out[VIRTIO_NET_HDR_LEN..], &[7u8; 64]); // same frame, in order
     }
 

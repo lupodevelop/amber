@@ -31,7 +31,10 @@ const OP_CREDIT_REQUEST: u16 = 7;
 /// Our advertised receive window per connection. The guest may have this many
 /// bytes in flight to us before it must wait for a credit update.
 const BUF_ALLOC: u32 = 256 * 1024;
-/// Largest RW payload we put in one rx packet (fits a guest rx buffer).
+/// A nominal RW payload cap used by tests. At run time the payload is instead
+/// sized to the guest's actual posted rx buffer (see `poll_rx`/`pump`), which on
+/// Linux is under a page once skb overhead is accounted for.
+#[cfg(test)]
 const MAX_RW: usize = 4096 - HDR_LEN;
 
 /// The host side of vsock: how a guest port maps to a Unix socket, and how host
@@ -144,6 +147,7 @@ impl VsockDevice {
     const DEVICE_ID: u32 = 19;
     const RX: usize = 0;
     const TX: usize = 1;
+    const EVENT: usize = 2;
 
     pub fn new(guest_cid: u64, backend: Box<dyn VsockBackend>) -> Self {
         Self { backend, guest_cid, conns: Vec::new(), rx: VecDeque::new() }
@@ -247,8 +251,9 @@ impl VsockDevice {
     }
 
     /// Host-side work: accept new host→guest connections, move bytes both ways
-    /// under credit, and reap dead connections. Fills `self.rx`.
-    fn pump(&mut self) {
+    /// under credit, and reap dead connections. Fills `self.rx`. `max_payload` caps
+    /// each RW packet's payload so a packet fits the guest's posted rx buffer.
+    fn pump(&mut self, max_payload: usize) {
         // New host→guest connections: tell the guest with a REQUEST.
         while let Some((guest_port, stream)) = self.backend.accept() {
             let _ = stream.set_nonblocking(true);
@@ -304,11 +309,12 @@ impl VsockDevice {
                 self.send(gp, hp, OP_CREDIT_UPDATE, fwd, &[]);
             }
 
-            // Host→guest bytes, bounded by the guest's window.
+            // Host→guest bytes, bounded by the guest's credit window and the rx
+            // buffer it posted (max_payload).
             if self.conns[idx].up {
                 loop {
                     let window = self.conns[idx].guest_window() as usize;
-                    let take = window.min(MAX_RW);
+                    let take = window.min(max_payload);
                     if take == 0 {
                         break;
                     }
@@ -371,6 +377,9 @@ impl VirtioDevice for VsockDevice {
     fn rx_queue(&self) -> Option<usize> {
         Some(Self::RX)
     }
+    fn event_queue(&self) -> Option<usize> {
+        Some(Self::EVENT)
+    }
     fn wants_poll(&self) -> bool {
         // Always: the run loop must keep pumping so an inbound host connection
         // (accepted on the listener thread) reaches the guest within a poll tick,
@@ -393,10 +402,13 @@ impl VirtioDevice for VsockDevice {
         0
     }
 
-    /// Next packet for the guest rx queue: pump the host side, then dequeue.
-    fn poll_rx(&mut self) -> Option<Vec<u8>> {
+    /// Next packet for the guest rx queue: pump the host side, then dequeue. The
+    /// guest's posted rx buffer is `max_frame` bytes, so a data packet's payload is
+    /// capped to that minus the header — an oversized packet would be truncated by
+    /// the virtio layer and dropped by the guest.
+    fn poll_rx(&mut self, max_frame: usize) -> Option<Vec<u8>> {
         if self.rx.is_empty() {
-            self.pump();
+            self.pump(max_frame.saturating_sub(HDR_LEN));
         }
         self.rx.pop_front()
     }
@@ -457,14 +469,14 @@ mod tests {
 
         // Guest sends data; it must reach the host stream.
         dev.on_guest_packet(&guest_pkt(40000, 1024, OP_RW, 0, b"ping"));
-        dev.pump();
+        dev.pump(MAX_RW);
         let mut got = [0u8; 4];
         b.read_exact(&mut got).unwrap();
         assert_eq!(&got, b"ping");
 
         // Host replies; it must come back as an RW packet to the guest.
         b.write_all(b"pong").unwrap();
-        dev.pump();
+        dev.pump(MAX_RW);
         let rw = dev.rx.iter().find(|p| hdr(p).2 == OP_RW).expect("an RW back");
         assert_eq!(&rw[HDR_LEN..], b"pong");
     }
@@ -485,14 +497,14 @@ mod tests {
         inc.push_back((5000u32, a)); // host peer wants guest port 5000
         let mut dev = VsockDevice::new(3, Box::new(TestBackend { dialed: None, incoming: inc }));
 
-        dev.pump(); // emits a REQUEST to the guest
+        dev.pump(MAX_RW); // emits a REQUEST to the guest
         let (gp, hp, op, _) = hdr(&dev.rx.pop_front().unwrap());
         assert_eq!((gp, op), (5000, OP_REQUEST));
 
         // Guest accepts; now host data flows to the guest.
         dev.on_guest_packet(&guest_pkt(gp, hp, OP_RESPONSE, 0, b""));
         b.write_all(b"hello").unwrap();
-        dev.pump();
+        dev.pump(MAX_RW);
         let rw = dev.rx.iter().find(|p| hdr(p).2 == OP_RW).expect("RW to guest");
         assert_eq!(&rw[HDR_LEN..], b"hello");
     }
@@ -510,15 +522,54 @@ mod tests {
         dev.rx.clear();
 
         b.write_all(b"abcdef").unwrap();
-        dev.pump();
+        dev.pump(MAX_RW);
         // Only 3 bytes may go (window=3); no more until the guest raises fwd_cnt.
         let sent: usize = dev.rx.iter().filter(|p| hdr(p).2 == OP_RW).map(|p| p.len() - HDR_LEN).sum();
         assert_eq!(sent, 3, "host→guest is capped at the guest's credit");
 
         // Guest consumed them (fwd_cnt=3): the window reopens.
         dev.on_guest_packet(&guest_pkt(40000, 1024, OP_CREDIT_UPDATE, 3, b""));
-        dev.pump();
+        dev.pump(MAX_RW);
         let sent: usize = dev.rx.iter().filter(|p| hdr(p).2 == OP_RW).map(|p| p.len() - HDR_LEN).sum();
         assert_eq!(sent, 6, "the rest flows after credit");
+    }
+
+    #[test]
+    fn rw_packets_fit_the_posted_rx_buffer() {
+        // poll_rx must size each data packet to the guest's posted rx buffer: a
+        // packet larger than the buffer is truncated by the virtio layer and the
+        // guest drops it as malformed (real guests post sub-page, ~3776-byte, bufs).
+        let (a, mut b) = UnixStream::pair().unwrap();
+        let _ = a.set_nonblocking(true);
+        let mut dev =
+            VsockDevice::new(3, Box::new(TestBackend { dialed: Some(a), incoming: VecDeque::new() }));
+        dev.on_guest_packet(&guest_pkt(40000, 1024, OP_REQUEST, 0, b"")); // 256 KiB window
+        dev.rx.clear();
+
+        // Write on a thread so it can block on the socket buffer while we drain it.
+        let total = 20_000usize;
+        let writer = std::thread::spawn(move || {
+            b.write_all(&vec![0xab; total]).unwrap();
+        });
+
+        // The guest posts buffers of 1000 bytes; no packet may exceed that.
+        let frame = 1000usize;
+        let mut data = 0usize;
+        // Poll until we've drained the whole blob (poll_rx pumps the socket each
+        // time rx empties); a brief spin lets the writer make progress.
+        for _ in 0..100_000 {
+            match dev.poll_rx(frame) {
+                Some(p) => {
+                    assert!(p.len() <= frame, "packet {} exceeds posted buffer {frame}", p.len());
+                    if hdr(&p).2 == OP_RW {
+                        data += p.len() - HDR_LEN;
+                    }
+                }
+                None if data >= total => break,
+                None => std::thread::yield_now(),
+            }
+        }
+        writer.join().unwrap();
+        assert_eq!(data, total, "every byte must arrive, split across capped packets");
     }
 }

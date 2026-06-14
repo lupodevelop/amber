@@ -103,9 +103,18 @@ pub trait VirtioDevice: Send {
     fn rx_queue(&self) -> Option<usize> {
         None
     }
+    /// A device-driven queue whose buffers the guest posts for the device to fill
+    /// only when an event occurs (virtio-vsock's event queue). Like `rx_queue`, a
+    /// notify on it must NOT consume the posted buffers — doing so signals a bogus
+    /// event, the guest reposts, and the two livelock. Returns the queue index, if any.
+    fn event_queue(&self) -> Option<usize> {
+        None
+    }
     /// Next payload to deliver on `rx_queue` (already including any device header),
-    /// or None. Polled by the run loop; must be non-blocking.
-    fn poll_rx(&mut self) -> Option<Vec<u8>> {
+    /// or None. Polled by the run loop; must be non-blocking. `max_frame` is the
+    /// writable capacity of the buffer the guest has posted: a stream device (vsock)
+    /// must not return a frame larger than this, or it would be truncated and dropped.
+    fn poll_rx(&mut self, _max_frame: usize) -> Option<Vec<u8>> {
         None
     }
     /// True while the device has asynchronous work pending and wants the run loop
@@ -305,7 +314,12 @@ impl VirtioMmio {
             }
             any = true;
         }
-        while let Some(data) = self.dev.poll_rx() {
+        // Size each frame to the buffer the guest has actually posted: a frame
+        // larger than the next rx buffer would be truncated by `inject_one` and
+        // dropped by the guest as malformed. virtio-vsock guests post buffers
+        // smaller than a page (skb overhead), so this is well under 4 KiB.
+        while let Some(cap) = self.queues.get(rxq).and_then(|q| next_rx_capacity(&ram, q)) {
+            let Some(data) = self.dev.poll_rx(cap) else { break };
             let Some(q) = self.queues.get_mut(rxq) else { break };
             if !inject_one(&ram, q, &data) {
                 self.pending_rx = Some(data); // hold it; retry on the next pump
@@ -321,9 +335,11 @@ impl VirtioMmio {
 
     fn process(&mut self, qidx: usize) {
         let Some(ram) = self.ram else { return };
-        // The receive queue is filled asynchronously by `pump_rx`, not on notify;
-        // a notify there just posts buffers, so do not consume them here.
-        if self.dev.rx_queue() == Some(qidx) {
+        // The receive and event queues are device-driven: a notify there just posts
+        // buffers for the device to fill later (rx) or on an event (event queue).
+        // Consuming them here would deliver empty buffers — for the event queue that
+        // signals a bogus event and livelocks with the guest reposting. Skip both.
+        if self.dev.rx_queue() == Some(qidx) || self.dev.event_queue() == Some(qidx) {
             return;
         }
         let Some(mut q) = self.queues.get(qidx).copied() else { return };
@@ -394,6 +410,28 @@ fn push_used(ram: &GuestRam, used: u64, id: u32, len: u32, qsz: u16) {
     ram.write_u32(elem, id);
     ram.write_u32(elem.wrapping_add(4), len);
     ram.write_u16(used.wrapping_add(2), idx.wrapping_add(1));
+}
+
+/// Total writable bytes in the next posted buffer of a receive queue, or None if
+/// the guest hasn't posted one. Used to size a frame so it fits — an oversized
+/// frame would be silently truncated by `inject_one` and dropped by the guest.
+fn next_rx_capacity(ram: &GuestRam, q: &Queue) -> Option<usize> {
+    if q.ready == 0 || q.num == 0 {
+        return None;
+    }
+    let qsz = q.num as u16;
+    let avail_idx = ram.read_u16(q.avail.wrapping_add(2));
+    if q.last_avail == avail_idx {
+        return None;
+    }
+    let slot = q.last_avail % qsz;
+    let head = ram.read_u16(q.avail.wrapping_add(4 + 2 * slot as u64));
+    let cap: usize = collect_chain(ram, q.desc, head, qsz)
+        .iter()
+        .filter(|b| b.writable)
+        .map(|b| b.len as usize)
+        .sum();
+    Some(cap)
 }
 
 /// Write one host->guest payload into the next posted buffer of a receive queue

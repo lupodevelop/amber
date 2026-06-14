@@ -74,19 +74,8 @@ never touched; the command runs on an isolated copy.
 ```
 
 It tars `<dir>` in (excluding `.git`, `target`, `node_modules`, `.venv`, `dist`,
-`__pycache__`), unpacks it to `/work`, and runs the command there.
-
-> **Limitation (current):** copy-in streams the tar to the guest over the host→
-> guest vsock path, which today only delivers small payloads reliably (a few KB);
-> a larger directory will hang. The fix is in progress. Until then, for a real
-> project prefer a base image that already has both the toolchain **and** the code
-> (or fetch the code inside the guest with networking on), e.g.:
->
-> ```bash
-> AMBER_SANDBOX_IMAGE=rust:alpine AMBER_SANDBOX_NET=1 \
->   "${CLAUDE_PLUGIN_ROOT}/scripts/amber-exec.sh" \
->   'git clone --depth 1 https://… /w && cd /w && cargo test'
-> ```
+`__pycache__`), unpacks it to `/work`, and runs the command there. The tar streams
+to the guest over the host→guest vsock channel, so a whole project copies in fine.
 
 Output and exit code come back. To get *changes* back out, have the command emit
 a patch you can review and apply on the host (e.g. `… && git -C /work diff`),
