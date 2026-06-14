@@ -624,7 +624,40 @@ fn pool_target() -> usize {
 
 // ---- daemon ----
 
+/// Raise the open-file soft limit toward the hard cap. The daemon holds a control
+/// socket (and transiently pipes) per live VM, so the default 1024 soft limit caps
+/// the fleet around a few hundred VMs — well below where RAM binds. Best-effort:
+/// failure just leaves the inherited limit.
+fn raise_fd_limit() {
+    // When the hard cap is "unlimited", pick a high concrete target instead — the
+    // kernel rejects an infinite soft limit (and macOS caps it at maxfilesperproc).
+    #[cfg(target_os = "macos")]
+    const UNCAPPED_TARGET: libc::rlim_t = 24_576;
+    #[cfg(target_os = "linux")]
+    const UNCAPPED_TARGET: libc::rlim_t = 1 << 20;
+
+    unsafe {
+        let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) != 0 {
+            return;
+        }
+        let target = if lim.rlim_max == libc::RLIM_INFINITY {
+            UNCAPPED_TARGET
+        } else {
+            lim.rlim_max
+        };
+        if target <= lim.rlim_cur {
+            return;
+        }
+        let newlim = libc::rlimit { rlim_cur: target, rlim_max: lim.rlim_max };
+        if libc::setrlimit(libc::RLIMIT_NOFILE, &newlim) == 0 {
+            log::info!("amberd: RLIMIT_NOFILE soft limit raised to {target}");
+        }
+    }
+}
+
 pub fn serve() -> io::Result<()> {
+    raise_fd_limit();
     let sock = proto::socket_path();
     // Restrict the socket to the owner: a 0700 parent dir and a 0600 socket.
     if let Some(parent) = sock.parent() {
