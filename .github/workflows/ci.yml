@@ -20,3 +20,23 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: unit tests
         run: cargo test --workspace
+
+  # The Linux sandbox (seccomp + Landlock) is the host-protection barrier and is
+  # untestable on macOS, so it gets its own arm64-Linux job. Cheap: build + run the
+  # in-process probe that applies the real policy and checks exec/writes are denied
+  # and a granted dir/socket is allowed. Needs a Landlock-capable kernel (Ubuntu's).
+  lockdown-linux:
+    name: linux lockdown (seccomp + landlock)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: kernel + LSM diagnostic
+        run: |
+          uname -r
+          cat /sys/kernel/security/lsm 2>/dev/null || echo "no /sys/kernel/security/lsm"
+      - name: build amber
+        run: cargo build -p amber
+      - name: deny exec + writes (default policy)
+        run: ./target/debug/amber __lockdown-probe | grep -q LOCKDOWN_OK
+      - name: grant the allowed dir + network
+        run: ./target/debug/amber __lockdown-probe "$(mktemp -d)" | grep -q LOCKDOWN_OK
