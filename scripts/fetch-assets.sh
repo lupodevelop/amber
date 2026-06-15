@@ -48,7 +48,10 @@ echo "==> Alpine ${ALPINE_VER} ${ARCH} userland -> ${OUT}/"
 # busybox + musl loader, from the minirootfs tarball.
 echo "  - busybox + musl (minirootfs)"
 curl -fSL --retry 3 "${CDN}/alpine-minirootfs-${ALPINE_VER}-${ARCH}.tar.gz" -o "$tmp/root.tgz"
-tar -xzf "$tmp/root.tgz" -C "$tmp" bin/busybox lib/ld-musl-aarch64.so.1
+# Extract the whole rootfs (~4 MB), not named members: the tarball stores paths
+# with a leading `./`, which GNU tar (Linux/CI) will not match against `bin/busybox`
+# the way BSD tar (macOS) does. The copies below resolve the paths on either tar.
+tar -xzf "$tmp/root.tgz" -C "$tmp"
 cp "$tmp/bin/busybox" "$OUT/irx/bin/busybox"
 cp "$tmp/lib/ld-musl-aarch64.so.1" "$OUT/irx/lib/ld-musl-aarch64.so.1"
 ln -sf ld-musl-aarch64.so.1 "$OUT/irx/lib/libc.musl-aarch64.so.1"

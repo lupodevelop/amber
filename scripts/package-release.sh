@@ -27,6 +27,9 @@ cp "$ROOT/assets/Image" "$dir/assets/Image"
 cp "$ROOT/assets/amber-agent" "$dir/assets/amber-agent"
 cp -R "$ROOT/assets/irx/." "$dir/assets/irx/"
 [ -f "$ROOT/amber.entitlements" ] && cp "$ROOT/amber.entitlements" "$dir/amber.entitlements"
+# License + third-party attributions (busybox/musl/kernel) travel with the bundle.
+cp "$ROOT/LICENSE" "$dir/LICENSE"
+cp "$ROOT/NOTICE" "$dir/NOTICE"
 printf '%s\n' "amber prebuilt bundle ($os/$arch). Run ./amber from this directory." > "$dir/README"
 
 mkdir -p "$ROOT/dist"

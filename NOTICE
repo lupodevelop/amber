@@ -1,0 +1,28 @@
+amber
+Copyright the amber authors.
+Licensed under the Apache License, Version 2.0. See LICENSE.
+
+This product, and the prebuilt release bundles, include third-party components:
+
+1. Linux kernel ("resin")
+   The guest kernel (assets/Image) is the Linux kernel, built from unmodified
+   upstream source with the configuration in kernel/resin_defconfig.
+   License: GPL-2.0-only.
+   Source: https://cdn.kernel.org/pub/linux/kernel/ (version pinned in
+   scripts/build-kernel.sh), plus kernel/resin_defconfig in this repository.
+
+2. BusyBox
+   The in-guest userland binary (assets/irx/bin/busybox), obtained from the
+   Alpine Linux minirootfs.
+   License: GPL-2.0-only.
+   Source: https://busybox.net/ and https://gitlab.alpinelinux.org/alpine/aports.
+
+3. musl libc
+   The dynamic loader (assets/irx/lib/ld-musl-aarch64.so.1), obtained from the
+   Alpine Linux minirootfs.
+   License: MIT.
+   Source: https://musl.libc.org/ and https://gitlab.alpinelinux.org/alpine/aports.
+
+The GPL-2.0 components above are redistributed under the terms of that license;
+their corresponding source is available at the locations listed. They are
+separate works conveyed alongside amber, not derived from it.
