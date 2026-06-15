@@ -1,8 +1,8 @@
-//! The backend-agnostic VM: load the kernel and DTB, wire the bus, create the
+//! The backend-agnostic VM: load the kernel and DTB, wire the devices, create the
 //! vcpu, and run the exit loop. This is the file that proves the seam works:
 //! it names no hypervisor, only the `Hypervisor`/`Vcpu` traits.
 
-use crate::bus::{MmioBus, Pl011};
+use crate::bus::Pl011;
 use crate::hypervisor::{Hypervisor, MmioAccess, Vcpu, VmExit};
 use crate::virtio::{BalloonDevice, BalloonHandle, BlkDevice, RngDevice, VirtioDevice, VirtioMmio};
 use crate::{dtb, layout, loader, GuestMemory, Result};
@@ -108,7 +108,6 @@ impl Default for VmConfig {
 pub struct Vm {
     mem: GuestMemory,
     vcpus: usize,
-    bus: MmioBus,
     pl011: Pl011,
     virtio: Vec<VirtioDev>,
     balloon: Option<(BalloonHandle, u32)>,
@@ -183,7 +182,6 @@ impl Vm {
         Ok(Self {
             mem,
             vcpus: cfg.vcpus.clamp(1, 8),
-            bus: MmioBus::default(),
             pl011: Pl011::new(Box::new(std::io::stdout())),
             virtio,
             balloon: Some(balloon),
@@ -255,7 +253,6 @@ impl Vm {
         Ok(Self {
             mem,
             vcpus: loaded.meta.vcpus.clamp(1, 8),
-            bus: MmioBus::default(),
             pl011: Pl011::new(Box::new(std::io::stdout())),
             virtio,
             balloon: Some(balloon),
@@ -298,7 +295,6 @@ impl Vm {
         let Vm {
             mem,
             vcpus,
-            bus,
             mut pl011,
             mut virtio,
             balloon,
@@ -447,12 +443,10 @@ impl Vm {
         // guest execution; contention is not a hot path.
         let pl011 = Mutex::new(pl011);
         let virtio = Mutex::new(virtio);
-        let bus = Mutex::new(bus);
         let running = AtomicBool::new(true);
         let hv = &hv;
         let pl011 = &pl011;
         let virtio = &virtio;
-        let bus = &bus;
         let running = &running;
         let mem = &mem;
         let snapshot = snapshot.as_ref();
@@ -493,7 +487,7 @@ impl Vm {
             for id in 1..vcpus {
                 let init = restore.as_ref().and_then(|l| l.cpus.get(id - 1));
                 s.spawn(move || {
-                    secondary_loop::<H>(hv, id as u8, init, cpu_tmpl, pl011, pl011_intid, virtio, bus, running, pause, snap_coord)
+                    secondary_loop::<H>(hv, id as u8, init, cpu_tmpl, pl011, pl011_intid, virtio, running, pause, snap_coord)
                 });
             }
 
@@ -593,7 +587,7 @@ impl Vm {
                 }
                 match vcpu.run()? {
                     VmExit::Mmio { access } => {
-                        dispatch_mmio::<H>(hv, &mut vcpu, &access, pl011, pl011_intid, virtio, bus)?;
+                        dispatch_mmio::<H>(hv, &mut vcpu, &access, pl011, pl011_intid, virtio)?;
                         Ok(true)
                     }
                     // On a fresh boot the in-kernel vGIC handles WFI internally and
@@ -667,7 +661,6 @@ fn dispatch_mmio<H: Hypervisor>(
     pl011: &Mutex<Pl011>,
     pl011_intid: u32,
     virtio: &Mutex<Vec<VirtioDev>>,
-    bus: &Mutex<MmioBus>,
 ) -> Result<()> {
     let pl011_lo = layout::PL011_BASE;
     let pl011_hi = layout::PL011_BASE + layout::PL011_SIZE;
@@ -694,12 +687,10 @@ fn dispatch_mmio<H: Hypervisor>(
         }
         hv.set_irq(d.intid, d.mmio.irq_level())?;
     } else {
+        // Unbacked MMIO: no device at this address. Reads return 0, writes drop.
         match access.write {
-            Some(value) => bus.lock().unwrap().write(ipa, access.size, value),
-            None => {
-                let v = bus.lock().unwrap().read(ipa, access.size);
-                vcpu.complete_mmio_read(v)?;
-            }
+            Some(value) => log::trace!("mmio write {value:#x} to unbacked {ipa:#x}"),
+            None => vcpu.complete_mmio_read(0)?,
         }
     }
     vcpu.advance_mmio()
@@ -718,7 +709,6 @@ fn secondary_loop<H: Hypervisor>(
     pl011: &Mutex<Pl011>,
     pl011_intid: u32,
     virtio: &Mutex<Vec<VirtioDev>>,
-    bus: &Mutex<MmioBus>,
     running: &AtomicBool,
     pause: &(Mutex<bool>, std::sync::Condvar),
     snap: &SnapCoord,
@@ -786,7 +776,7 @@ fn secondary_loop<H: Hypervisor>(
         match vcpu.run() {
             Ok(VmExit::Mmio { access }) => {
                 if let Err(e) =
-                    dispatch_mmio::<H>(hv, &mut vcpu, &access, pl011, pl011_intid, virtio, bus)
+                    dispatch_mmio::<H>(hv, &mut vcpu, &access, pl011, pl011_intid, virtio)
                 {
                     log::error!("vcpu{id}: mmio: {e}");
                     stop();

@@ -1,58 +1,11 @@
-//! The MMIO bus and the PL011 UART. The PL011 is now a full-enough PrimeCell for
-//! Linux's `amba-pl011` driver to bind and bring up `ttyAMA0`: it answers the
-//! PrimeCell/peripheral ID reads the AMBA bus matches on, models the control and
-//! interrupt registers, and has a receive FIFO fed by the host. That is what
-//! turns earlycon-only output into a real interactive console.
-//!
-//! `MmioBus`/`MmioDevice` stay for future non-interrupting devices; the PL011 is
-//! owned directly by the VM because the run loop introspects its interrupt line.
+//! The PL011 UART. It is a full-enough PrimeCell for Linux's `amba-pl011` driver
+//! to bind and bring up `ttyAMA0`: it answers the PrimeCell/peripheral ID reads the
+//! AMBA bus matches on, models the control and interrupt registers, and has a
+//! receive FIFO fed by the host. That is what turns earlycon-only output into a
+//! real interactive console. The VM owns it directly because the run loop
+//! introspects its interrupt line.
 
 use std::collections::VecDeque;
-
-pub trait MmioDevice: Send {
-    fn read(&mut self, offset: u64, size: u8) -> u64;
-    fn write(&mut self, offset: u64, size: u8, value: u64);
-}
-
-struct Region {
-    base: u64,
-    size: u64,
-    dev: Box<dyn MmioDevice>,
-}
-
-#[derive(Default)]
-pub struct MmioBus {
-    regions: Vec<Region>,
-}
-
-impl MmioBus {
-    pub fn register(&mut self, base: u64, size: u64, dev: Box<dyn MmioDevice>) {
-        self.regions.push(Region { base, size, dev });
-    }
-
-    pub fn read(&mut self, ipa: u64, size: u8) -> u64 {
-        match self.find(ipa) {
-            Some(r) => r.dev.read(ipa - r.base, size),
-            None => {
-                log::trace!("mmio read to unbacked {ipa:#x}");
-                0
-            }
-        }
-    }
-
-    pub fn write(&mut self, ipa: u64, size: u8, value: u64) {
-        match self.find(ipa) {
-            Some(r) => r.dev.write(ipa - r.base, size, value),
-            None => log::trace!("mmio write {value:#x} to unbacked {ipa:#x}"),
-        }
-    }
-
-    fn find(&mut self, ipa: u64) -> Option<&mut Region> {
-        self.regions
-            .iter_mut()
-            .find(|r| ipa >= r.base && ipa < r.base + r.size)
-    }
-}
 
 /// A PL011 PrimeCell UART, enough for an interactive console: TX to a host sink,
 /// an RX FIFO fed by `push_rx`, the control/mask/status registers the driver

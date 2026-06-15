@@ -34,6 +34,11 @@ jobs:
         run: |
           uname -r
           cat /sys/kernel/security/lsm 2>/dev/null || echo "no /sys/kernel/security/lsm"
+      # The macOS gate can't lint Linux-only code (the KVM backend, the /proc and
+      # seccomp/Landlock paths), so clippy them here.
+      - run: rustup component add clippy
+      - name: clippy linux-only code (warnings are errors)
+        run: cargo clippy -p amber -p amber-kvm --all-targets -- -D warnings
       - name: build amber
         run: cargo build -p amber
       - name: deny exec + writes (default policy)

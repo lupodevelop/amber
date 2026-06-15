@@ -52,7 +52,7 @@ const NR_IRQS: u32 = 256;
 /// arm64 core register id (see `KVM_REG_ARM_CORE`): byte offset into `kvm_regs`,
 /// encoded in u32 units.
 const fn core_reg(byte_off: usize) -> u64 {
-    KVM_REG_ARM64 as u64 | KVM_REG_SIZE_U64 as u64 | KVM_REG_ARM_CORE as u64 | (byte_off as u64 / 4)
+    KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM_CORE as u64 | (byte_off as u64 / 4)
 }
 fn x_reg(i: u8) -> u64 {
     core_reg(i as usize * 8) // regs.regs[i] is the first field of user_pt_regs
@@ -116,11 +116,10 @@ fn init_vcpu(
 }
 
 fn set_vgic_attr(vgic: &DeviceFd, group: u32, attr: u64, value: u64) -> Result<()> {
-    let v = value;
     let kda = kvm_device_attr {
         group,
         attr,
-        addr: &v as *const u64 as u64,
+        addr: &value as *const u64 as u64,
         flags: 0,
     };
     vgic.set_device_attr(&kda).map_err(kvm_err("vgic attr"))
@@ -281,7 +280,7 @@ impl KvmVcpu {
 
 /// Wrap a bare ARM sysreg encoding (op0..op2) in KVM's ONE_REG sysreg index.
 fn kvm_sysreg_id(enc: u32) -> u64 {
-    KVM_REG_ARM64 as u64 | KVM_REG_SIZE_U64 as u64 | KVM_REG_ARM64_SYSREG as u64 | enc as u64
+    KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM64_SYSREG as u64 | enc as u64
 }
 
 impl Vcpu for KvmVcpu {

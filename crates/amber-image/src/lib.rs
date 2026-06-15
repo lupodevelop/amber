@@ -14,8 +14,7 @@ mod registry;
 use std::path::{Path, PathBuf};
 
 pub use cpio::Cpio;
-pub use pack::pack_squashfs;
-pub use registry::Reference;
+use registry::Reference;
 
 #[derive(Debug)]
 pub enum Error {
@@ -69,38 +68,6 @@ impl ImageConfig {
         v.extend(self.cmd.iter().cloned());
         v
     }
-}
-
-/// A pulled-and-flattened image: the rootfs tree on disk plus its run config.
-pub struct Image {
-    pub rootfs: PathBuf,
-    pub config: ImageConfig,
-}
-
-/// Pull `reference`, caching blobs under `cache_dir`, and flatten its layers into
-/// `rootfs` (created fresh). Returns the rootfs path and the image's run config.
-pub fn pull_and_flatten(reference: &str, cache_dir: &Path, rootfs: &Path) -> Result<Image> {
-    let reference = Reference::parse(reference)?;
-    log::info!("pulling {}", reference);
-
-    let mut client = registry::Client::new(&reference)?;
-    let manifest = client.fetch_manifest()?;
-    let config = client.fetch_config(&manifest.config_digest)?;
-
-    std::fs::create_dir_all(cache_dir)?;
-    let mut layer_paths = Vec::new();
-    for (i, layer) in manifest.layers.iter().enumerate() {
-        log::info!("layer {}/{} {}", i + 1, manifest.layers.len(), layer.digest);
-        layer_paths.push(client.fetch_blob(&layer.digest, cache_dir)?);
-    }
-
-    flatten::flatten(&layer_paths, rootfs)?;
-    log::info!("flattened {} layers into {}", layer_paths.len(), rootfs.display());
-
-    Ok(Image {
-        rootfs: rootfs.to_path_buf(),
-        config,
-    })
 }
 
 /// A ready-to-boot image: a packed read-only base plus its run config.

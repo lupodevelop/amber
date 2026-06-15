@@ -1,11 +1,6 @@
 //! `amber.toml`: the declarative fleet manifest. Templates name an image and its
-//! resources so `amber run <template>` works by name. This is the M2 manifest
-//! slice — the daemon, warm pools, and budget enforcement come later; fields for
-//! them are parsed (forward-compatible) but not yet acted on.
-
-// Several fields are parsed for forward compatibility and consumed in later
-// milestones (pool, budget, timeout); don't warn on them being unread yet.
-#![allow(dead_code)]
+//! resources so `amber run <template>` works by name; the fleet section sets the
+//! RAM budget and warm-pool size the daemon enforces.
 
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -42,14 +37,8 @@ pub struct Template {
     pub disks: Vec<String>,
     #[serde(default)]
     pub env: HashMap<String, String>,
-
-    // Forward-compatible: parsed now, acted on in later milestones.
+    /// Guest vCPUs (default 1).
     pub vcpus: Option<u32>,
-    pub net: Option<String>,
-    pub warm_pool: Option<u32>,
-    pub snapshot: Option<String>,
-    pub reuse: Option<bool>,
-    pub timeout: Option<String>,
 }
 
 impl Manifest {
