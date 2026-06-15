@@ -22,7 +22,7 @@ jobs:
       # by all four scripts in this job.
       WORK: ${{ github.workspace }}/.kvm-work
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: install qemu (system arm64)
         run: |
@@ -63,7 +63,7 @@ jobs:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: install nightly + cargo-fuzz
         run: |
           rustup toolchain install nightly --profile minimal

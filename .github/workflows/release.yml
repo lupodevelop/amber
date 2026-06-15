@@ -19,7 +19,7 @@ jobs:
     name: guest assets (resin kernel + agent + userland)
     runs-on: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: resin kernel -> assets/Image
         run: make kernel
       - name: in-guest agent -> assets/amber-agent
@@ -37,7 +37,7 @@ jobs:
     needs: assets
     runs-on: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: cargo build --release -p amber
       - uses: actions/download-artifact@v4
         with: { name: assets, path: assets/ }
@@ -50,7 +50,7 @@ jobs:
     needs: assets
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: cargo build --release -p amber
       - name: codesign (ad-hoc, with the HVF entitlement)
         run: codesign --entitlements amber.entitlements -s - target/release/amber
