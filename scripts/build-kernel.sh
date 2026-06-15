@@ -28,6 +28,9 @@ command -v docker >/dev/null || { echo "docker not found"; exit 1; }
 # download and go straight to compile.
 CACHE="$ROOT/kernel/.cache"
 mkdir -p "$CACHE"
+# The output dir (assets/) is gitignored, so it may not exist in a fresh checkout
+# (e.g. CI). Create it on the host before the container copies the built Image in.
+mkdir -p "$ROOT/$(dirname "$OUT")"
 
 echo "==> building resin $KVER (arm64, -j$JOBS) -> $OUT"
 docker run --rm -v "$ROOT:/work" -v "$CACHE:/cache" -w /work debian:bookworm bash -euc '
