@@ -48,7 +48,8 @@ jobs:
   bundle-macos:
     name: macos arm64 bundle
     needs: assets
-    runs-on: macos-14
+    # macOS 15+: the HVF backend links hv_gic_* (in-kernel GIC), added in macOS 15.
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v5
       - run: cargo build --release -p amber
