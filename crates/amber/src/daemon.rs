@@ -816,7 +816,7 @@ fn handle(
 }
 
 fn logs_dir() -> std::path::PathBuf {
-    std::path::PathBuf::from("amber-cache/logs")
+    crate::cache_dir().join("logs")
 }
 
 /// Start a VM that keeps running after the client leaves; its stdout/stderr go to
@@ -1050,6 +1050,17 @@ pub fn fork_interactive(template: &str) -> io::Result<i32> {
 /// stream the in-guest agent's stdout and stderr (kept distinct) to ours and
 /// return the structured exit code. No in-band marker — the code arrives in the
 /// terminal `Exit` reply.
+/// True if stdin has input ready (or is at EOF) to read without blocking. A regular
+/// file, `/dev/null`, and a pipe that already carries data all return immediately;
+/// an open-but-idle inherited stdin times out and returns false, so `exec` doesn't
+/// hang waiting for input nobody is going to send. Producers (`tar | amber exec`)
+/// signal readable within the grace window.
+fn stdin_has_input() -> bool {
+    let mut pfd = libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 };
+    let rc = unsafe { libc::poll(&mut pfd, 1, 200) };
+    rc > 0 && (pfd.revents & (libc::POLLIN | libc::POLLHUP)) != 0
+}
+
 pub fn exec(template: &str, cmd: &str) -> io::Result<i32> {
     let mut s = connect().ok_or_else(|| io::Error::other("no amberd (run 'amber up')"))?;
     proto::write_request(
@@ -1057,9 +1068,12 @@ pub fn exec(template: &str, cmd: &str) -> io::Result<i32> {
         &Request::Exec { template: template.to_string(), cmd: cmd.to_string() },
     )?;
     // Follow with our stdin as one blob (the command's stdin in the guest, e.g. a
-    // tarball to copy files in). Empty when stdin is a terminal — reading it would
-    // block, and an interactive shell isn't what `exec` is for.
-    let input = if unsafe { libc::isatty(0) } == 1 {
+    // tarball to copy files in). We read it only when there's actually input to
+    // send: a terminal, or an inherited-but-idle stdin (the common case when a
+    // program spawns `amber exec` without piping anything) must NOT make us block
+    // on a read that never reaches EOF. A regular file, `/dev/null`, or a producing
+    // pipe (`tar | amber exec`) all signal readable at once, so they still stream.
+    let input = if unsafe { libc::isatty(0) } == 1 || !stdin_has_input() {
         Vec::new()
     } else {
         let mut b = Vec::new();

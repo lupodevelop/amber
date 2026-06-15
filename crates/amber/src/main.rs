@@ -235,8 +235,8 @@ fn cmd_up() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     let exe = std::env::current_exe().expect("current_exe");
-    let _ = std::fs::create_dir_all("amber-cache");
-    let log = match std::fs::File::create("amber-cache/amberd.log") {
+    let _ = std::fs::create_dir_all(cache_dir());
+    let log = match std::fs::File::create(cache_dir().join("amberd.log")) {
         Ok(f) => f,
         Err(e) => {
             eprintln!("cannot open amberd log: {e}");
@@ -269,7 +269,7 @@ fn cmd_up() -> ExitCode {
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    eprintln!("amberd did not come up; see amber-cache/amberd.log");
+    eprintln!("amberd did not come up; see {}", cache_dir().join("amberd.log").display());
     ExitCode::FAILURE
 }
 
@@ -601,7 +601,7 @@ fn cmd_pull(args: &[String]) -> ExitCode {
     };
     // refresh = true: always re-resolve against the registry and update the
     // reference -> id mapping, so a moved tag is picked up.
-    match amber_image::build(image, Path::new("amber-cache"), true) {
+    match amber_image::build(image, &cache_dir(), true) {
         Ok(built) => {
             let sz = std::fs::metadata(&built.base).map(|m| m.len()).unwrap_or(0);
             println!("base: {} ({} KiB)", built.base.display(), sz / 1024);
@@ -663,7 +663,7 @@ fn cmd_vm(args: &[String]) -> ExitCode {
     let t0 = std::time::Instant::now();
     // Resolve, pull, flatten, and pack — cached by image content id, so repeated
     // runs of the same image skip straight to boot.
-    let mut built = match amber_image::build(&oci_ref, Path::new("amber-cache"), false) {
+    let mut built = match amber_image::build(&oci_ref, &cache_dir(), false) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("build failed: {e}");
@@ -720,10 +720,10 @@ fn cmd_vm(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let kernel = match std::fs::read(guest::KERNEL) {
+    let kernel = match std::fs::read(asset(guest::KERNEL)) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("cannot read kernel {}: {e}", guest::KERNEL);
+            eprintln!("cannot read kernel {}: {e}", asset(guest::KERNEL).display());
             return ExitCode::FAILURE;
         }
     };
@@ -975,6 +975,47 @@ mod guest {
     ];
 }
 
+/// Resolve a bundled asset (e.g. `assets/Image`) to a path. The directory holding
+/// `assets/` is found in order: `AMBER_HOME`, then the amber binary's own directory
+/// (an install puts `assets/` beside it, and `current_exe` resolves the PATH
+/// symlink), then the current directory (a source checkout or a bundle run in
+/// place). Falls back to the relative path so error messages stay sensible.
+fn asset(rel: &str) -> std::path::PathBuf {
+    let has_assets = |base: &std::path::Path| base.join(guest::KERNEL).exists();
+    if let Some(home) = std::env::var_os("AMBER_HOME") {
+        let base = std::path::PathBuf::from(home);
+        if has_assets(&base) {
+            return base.join(rel);
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        // Resolve a PATH symlink (e.g. ~/.local/bin/amber) to the real binary so
+        // `assets/` beside it (in the install dir) is found.
+        let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+        if let Some(dir) = exe.parent() {
+            if has_assets(dir) {
+                return dir.join(rel);
+            }
+        }
+    }
+    std::path::PathBuf::from(rel)
+}
+
+/// The per-user cache directory for pulled images, packed bases, and daemon logs.
+/// `AMBER_CACHE` overrides it; otherwise `$XDG_CACHE_HOME/amber` or `~/.cache/amber`.
+/// Using a fixed location (not the current directory) lets an installed `amber`,
+/// and the daemon it spawns, agree on one cache no matter where each was started.
+pub fn cache_dir() -> std::path::PathBuf {
+    if let Some(c) = std::env::var_os("AMBER_CACHE") {
+        return std::path::PathBuf::from(c);
+    }
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    base.join("amber")
+}
+
 /// Build the gzipped cpio that bootstraps the image: load the virtio/fs modules,
 /// mount the squashfs base read-only under a tmpfs overlay, mount any data disks
 /// at /data, and exec the command inside it. Env and working dir come from the
@@ -984,14 +1025,14 @@ fn build_bootstrap(
     argv: &[String],
     data_disks: usize,
 ) -> std::io::Result<Vec<u8>> {
-    let busybox = std::fs::read(guest::BUSYBOX)?;
-    let musl = std::fs::read(guest::MUSL)?;
+    let busybox = std::fs::read(asset(guest::BUSYBOX))?;
+    let musl = std::fs::read(asset(guest::MUSL))?;
     // None => a built-in-everything kernel (resin): no modules to insmod.
     let kernel_mods = first_module_dir();
     // An exec template runs the vsock agent (argv[0] is its in-guest path); bake
     // the binary in and stage it into the new root so it runs under the image fs.
     let with_agent = argv.first().map(String::as_str) == Some(guest::AGENT_PATH);
-    let agent = if with_agent { Some(std::fs::read(guest::AGENT)?) } else { None };
+    let agent = if with_agent { Some(std::fs::read(asset(guest::AGENT))?) } else { None };
 
     let mut init = String::new();
     init.push_str("#!/bin/busybox sh\n");
@@ -1112,7 +1153,7 @@ fn first_module_dir() -> Option<std::path::PathBuf> {
     // The modules root holds a versioned dir (e.g. `6.12.81-0-virt`) and may also
     // hold a sibling `firmware` dir, so pick the entry that actually has a `kernel`
     // module tree rather than the first one read_dir happens to return.
-    for e in std::fs::read_dir(guest::MODULES_ROOT).ok()?.flatten() {
+    for e in std::fs::read_dir(asset(guest::MODULES_ROOT)).ok()?.flatten() {
         let kernel = e.path().join("kernel");
         if kernel.is_dir() {
             return Some(kernel);

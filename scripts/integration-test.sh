@@ -39,6 +39,14 @@ echo "$val" | grep -qw 42 && ok "exec runs a command (42)" || bad "exec runs a c
 "$BIN" exec "$TMP/tpl" -- 'exit 7' >/dev/null 2>&1
 rc=$?
 [ "$rc" -eq 7 ] && ok "exec propagates exit code 7" || bad "exec exit code (got $rc)"
+# Copy-in: a tar piped to exec must reach the command's stdin.
+ci="$(printf 'hello-copyin' | "$BIN" exec "$TMP/tpl" -- 'cat' 2>/dev/null)"
+[ "$ci" = "hello-copyin" ] && ok "exec forwards piped stdin" || bad "exec stdin (got '$ci')"
+# Footgun: an inherited but idle stdin must NOT hang exec (poll grace, then empty).
+rm -f "$TMP/fifo"; mkfifo "$TMP/fifo"; exec 7<>"$TMP/fifo"
+fg="$("$BIN" exec "$TMP/tpl" -- 'echo no-hang' <&7 2>/dev/null)"
+exec 7>&-; rm -f "$TMP/fifo"
+[ "$fg" = "no-hang" ] && ok "exec does not hang on idle stdin" || bad "exec idle-stdin (got '$fg')"
 "$BIN" down >/dev/null 2>&1
 
 echo "== snapshot / restore =="

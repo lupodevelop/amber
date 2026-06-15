@@ -5,7 +5,7 @@ members = ["crates/amber-core", "crates/amber-hvf", "crates/amber-kvm", "crates/
 [workspace.package]
 edition = "2021"
 license = "Apache-2.0"
-repository = "https://github.com/USER/amber"
+repository = "https://github.com/lupodevelop/amber"
 
 # arm64 only. The HVF backend links only on macOS; the KVM backend (amber-kvm)
 # only on Linux. Each is a per-target dependency of the `amber` binary.
