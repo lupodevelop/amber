@@ -302,4 +302,4 @@ cannot spawn, drop files, or phone home.
 
 ## License
 
-Undecided (Apache-2.0 intended, to stay inside the `rust-vmm` ecosystem).
+Apache-2.0. See [LICENSE](LICENSE).
