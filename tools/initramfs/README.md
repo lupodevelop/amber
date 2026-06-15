@@ -32,5 +32,5 @@ amber boot Image initramfs-amber.gz
 
 The host terminal goes into raw mode; keystrokes reach the guest console and the
 guest's tty echoes them. Piped stdin works too, but feed input after the boot
-reaches the prompt — bytes delivered before the shell opens the console are
+reaches the prompt: bytes delivered before the shell opens the console are
 consumed by the kernel, not the shell.

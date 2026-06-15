@@ -10,7 +10,7 @@ allowed-tools: Bash(*)
 
 # amber sandbox: requirements & troubleshooting
 
-You normally **don't need to do anything** — the first sandbox run downloads a
+You normally **don't need to do anything**: the first sandbox run downloads a
 prebuilt amber bundle (binary + resin kernel + in-guest agent + userland) for
 this platform into `~/.cache/amber/` and uses it. This skill is for when that
 isn't possible or fails.
@@ -22,7 +22,7 @@ isn't possible or fails.
 - **macOS (Apple Silicon):** uses Hypervisor.framework. The prebuilt binary is
   ad-hoc codesigned with the HVF entitlement; the fetch step clears the download
   quarantine so it can run. Nothing else to configure.
-- **Linux (arm64):** needs `/dev/kvm` — your user must be in the `kvm` group
+- **Linux (arm64):** needs `/dev/kvm`; your user must be in the `kvm` group
   (`sudo usermod -aG kvm "$USER"` then re-login).
 - **Docker** is needed only to build a template's OCI image userland the first
   time per image (e.g. `alpine:3`); it pulls and converts the image.
@@ -34,8 +34,8 @@ isn't possible or fails.
 "${CLAUDE_PLUGIN_ROOT}/scripts/amber-fetch.sh"
 ```
 
-- `AMBER_REPO=owner/repo` — pull from a fork's releases.
-- `AMBER_RELEASE=v0.1.0` — pin a specific release (default: latest).
+- `AMBER_REPO=owner/repo`: pull from a fork's releases.
+- `AMBER_RELEASE=v0.1.0`: pin a specific release (default: latest).
 
 ## Use a source checkout instead (development)
 
@@ -53,7 +53,7 @@ make kernel               # resin kernel -> assets/Image (Docker, one-time)
 ```
 
 The prebuilt bundles are produced by the repo's `release` GitHub Actions workflow
-(`.github/workflows/release.yml`) — the same steps, run on tag.
+(`.github/workflows/release.yml`): the same steps, run on tag.
 
 ## Troubleshooting
 

@@ -11,5 +11,5 @@ sandbox helper, and report its stdout, stderr, and exit code:
 "${CLAUDE_PLUGIN_ROOT}/scripts/amber-exec.sh" '$ARGUMENTS'
 ```
 
-If the helper reports amber isn't set up, run the `amber-setup` skill first, then
+If the helper reports amber isn't set up, consult the `amber-install` skill, then
 retry. Show the user the command's output and its exit code.

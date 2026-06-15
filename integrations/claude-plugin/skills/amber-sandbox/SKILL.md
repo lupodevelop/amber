@@ -13,13 +13,13 @@ allowed-tools: Bash(*)
 
 amber boots a real arm64 Linux microVM (HVF on macOS, KVM on Linux) in tens of
 milliseconds. A command run inside it cannot touch the host's filesystem,
-processes, or — by default — the network. Use this instead of running risky code
+processes, or, by default, the network. Use this instead of running risky code
 directly on the host.
 
 ## When to reach for it
 
 - The user asks you to run code or a command you don't fully trust.
-- A destructive / irreversible operation you'd rather try in a throwaway box
+- A destructive or irreversible operation you'd rather try in a throwaway box
   first (`rm -rf`, migrations, `dd`, package installs, `curl | sh`).
 - Code that should be isolated from the host (untrusted scripts, CTF binaries,
   scraped snippets).
@@ -29,13 +29,13 @@ directly on the host.
 
 Call the helper with a single shell command string. It prints the command's
 **stdout** to stdout, its **stderr** to stderr, and exits with the command's own
-**exit code** — clean, separate streams, no marker parsing.
+**exit code**. Clean, separate streams, no marker parsing.
 
 ```bash
 "${CLAUDE_PLUGIN_ROOT}/scripts/amber-exec.sh" 'echo hello; uname -m; exit 0'
 ```
 
-Multi-line scripts work — pass the whole thing as one argument:
+Multi-line scripts work; pass the whole thing as one argument:
 
 ```bash
 "${CLAUDE_PLUGIN_ROOT}/scripts/amber-exec.sh" '
@@ -46,28 +46,28 @@ echo "{\"x\":1}" | jq .x
 ```
 
 The first call for a given image builds a template (a few seconds, one time);
-later calls are warm forks (~milliseconds).
+later calls are warm forks (milliseconds).
 
 ## Knobs (environment variables)
 
-- `AMBER_SANDBOX_IMAGE=<oci-image>` — the guest userland (default `alpine:3`).
+- `AMBER_SANDBOX_IMAGE=<oci-image>`: the guest userland (default `alpine:3`),
   e.g. `AMBER_SANDBOX_IMAGE=python:3-alpine`.
-- `AMBER_SANDBOX_NET=1` — allow the guest outbound network (default: **off**).
-  Turn it on only when the task needs it (e.g. installing packages).
-- `AMBER_SANDBOX_MEM=<size>` — guest RAM (default ~512 MiB), e.g. `2GiB` for a
+- `AMBER_SANDBOX_NET=1`: allow the guest outbound network (default off). Turn it
+  on only when the task needs it (for example installing packages).
+- `AMBER_SANDBOX_MEM=<size>`: guest RAM (default about 512 MiB), e.g. `2GiB` for a
   heavier toolchain or build.
-- `AMBER_HOME=<path>` — the amber checkout, if not auto-detected.
+- `AMBER_HOME=<path>`: the amber checkout, if not auto-detected.
 
 ```bash
 AMBER_SANDBOX_IMAGE=python:3-alpine "${CLAUDE_PLUGIN_ROOT}/scripts/amber-exec.sh" \
   'python3 -c "print(6*7)"'
 ```
 
-## Testing a repo / directory you're working on
+## Testing a repo or directory you're working on
 
-To run something against a project — build it, run its tests, try a risky script
-on it — copy the directory **into** the sandbox and run there. The host copy is
-never touched; the command runs on an isolated copy.
+To run something against a project (build it, run its tests, try a risky script on
+it), copy the directory **into** the sandbox and run there. The host copy is never
+touched; the command runs on an isolated copy.
 
 ```bash
 "${CLAUDE_PLUGIN_ROOT}/scripts/amber-sandbox-repo.sh" <dir> '<command in the copy>'
@@ -77,15 +77,15 @@ It tars `<dir>` in (excluding `.git`, `target`, `node_modules`, `.venv`, `dist`,
 `__pycache__`), unpacks it to `/work`, and runs the command there. The tar streams
 to the guest over the host→guest vsock channel, so a whole project copies in fine.
 
-Output and exit code come back. To get *changes* back out, have the command emit
-a patch you can review and apply on the host (e.g. `… && git -C /work diff`),
-rather than mutating the host directly — that keeps the isolation.
+Output and exit code come back. To get *changes* back out, have the command emit a
+patch you can review and apply on the host (for example `… && git -C /work diff`),
+rather than mutating the host directly, which keeps the isolation.
 
 ## Toolchains and tests
 
-Two ways to get a compiler / interpreter / build tool in the sandbox:
+Two ways to get a compiler, interpreter, or build tool in the sandbox:
 
-1. **Use a base image that already has it** (preferred — offline, deterministic,
+1. **Use a base image that already has it** (preferred: offline, deterministic,
    fast, no network needed):
 
    ```bash
@@ -94,7 +94,7 @@ Two ways to get a compiler / interpreter / build tool in the sandbox:
    AMBER_SANDBOX_IMAGE=node:alpine      "${CLAUDE_PLUGIN_ROOT}/scripts/amber-exec.sh" 'node -e "console.log(6*7)"'
    ```
 
-2. **Install at runtime** — needs `AMBER_SANDBOX_NET=1`, and you must install and
+2. **Install at runtime**: needs `AMBER_SANDBOX_NET=1`, and you must install and
    use it **in the same command** (each call is a fresh VM, so installs don't
    persist):
 
@@ -103,12 +103,12 @@ Two ways to get a compiler / interpreter / build tool in the sandbox:
      'apk add --no-cache gcc musl-dev >/dev/null && echo "int main(){return 0;}" > t.c && gcc t.c -o t && ./t && echo OK'
    ```
 
-   Networking (including HTTPS — `apk`/`pip`/`npm`/`git`) works; the guest clock is
-   seeded from the host so TLS is valid.
+   Networking works, including HTTPS for `apk`/`pip`/`npm`/`git`; the guest clock
+   is seeded from the host so TLS is valid.
 
-The writable layer is **tmpfs (RAM)**. The default guest RAM is ~472 MB usable —
-fine for light installs and small builds. For a heavier toolchain or build, raise
-it: `AMBER_SANDBOX_MEM=2GiB` (rebuilds the template once).
+The writable layer is **tmpfs (RAM)**. The default guest RAM is about 472 MB
+usable, fine for light installs and small builds. For a heavier toolchain or build,
+raise it: `AMBER_SANDBOX_MEM=2GiB` (rebuilds the template once).
 
 ## Reading results
 
@@ -119,14 +119,14 @@ it: `AMBER_SANDBOX_MEM=2GiB` (rebuilds the template once).
 
 ## Setup
 
-Nothing, usually: the **first run downloads a prebuilt amber** (binary + resin
-kernel + agent + userland) for this platform into `~/.cache/amber/` and uses it.
-You just need an **arm64 host** — Apple Silicon (macOS, HVF) or arm64 Linux with
-`/dev/kvm`. If a run fails on a host requirement, a download problem, or you want
-to build from source, see the **`amber-install`** skill.
+Nothing, usually: the **first run downloads a prebuilt amber** (binary, resin
+kernel, agent, userland) for this platform into `~/.cache/amber/` and uses it. You
+need an **arm64 host**: Apple Silicon (macOS, HVF) or arm64 Linux with `/dev/kvm`.
+If a run fails on a host requirement, a download problem, or you want to build from
+source, see the **`amber-install`** skill.
 
 ## What this does NOT do
 
-- It is not a persistent container — no state between runs by default.
+- It is not a persistent container: no state between runs by default.
 - The network is off unless you opt in; don't assume internet inside the VM.
 - It runs arm64 Linux; x86-only binaries won't run.
