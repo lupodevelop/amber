@@ -2,14 +2,17 @@ name: e2e
 
 # Heavy end-to-end lane: the KVM backend (boot, snapshot/restore, SMP teardown,
 # pause/resume) exercised hardware-free under QEMU TCG — three levels of emulation,
-# so it takes tens of minutes. Too slow for the per-push `ci` gate, so it runs on a
-# nightly schedule and on demand. Pure TCG: no nested virt, so a stock arm64 runner
-# works. The HVF e2e (scripts/integration-test.sh) is NOT here — GitHub's macOS
-# runners don't expose Hypervisor.framework — and stays a local check.
+# so it takes tens of minutes. Too slow for the per-push `ci` gate. Pure TCG: no
+# nested virt, so a stock arm64 runner works. The HVF e2e (scripts/integration-test.sh)
+# is NOT here — GitHub's macOS runners don't expose Hypervisor.framework — and stays
+# a local check.
+#
+# Manual-only (workflow_dispatch): this is a diagnostic lane, not a merge gate.
+# Three levels of emulation make it slow and occasionally flaky (post-boot timing),
+# so a nightly schedule just painted the Actions tab red without gating anything.
+# Run it on demand: Actions -> e2e -> Run workflow.
 
 on:
-  schedule:
-    - cron: "0 4 * * *" # nightly, 04:00 UTC
   workflow_dispatch: {}
 
 jobs:
