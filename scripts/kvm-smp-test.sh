@@ -59,7 +59,7 @@ for _ in $(seq 1 400); do
   kill -0 $qp 2>/dev/null || break
   sleep 5
 done
-sleep 4; kill $qp 2>/dev/null; pkill -f qemu-system-aarch64 2>/dev/null || true
+sleep 4; kill $qp 2>/dev/null || true; pkill -f qemu-system-aarch64 2>/dev/null || true
 
 echo "--- markers ---"
 grep -aE "==SMP==|KVM_SMP_OK|amber-boot-rc=|panic|backend error" "$log" || true
@@ -67,5 +67,5 @@ grep -aE "==SMP==|KVM_SMP_OK|amber-boot-rc=|panic|backend error" "$log" || true
 if grep -qa "KVM_SMP_OK nproc=2" "$log" && grep -qa "amber-boot-rc=0" "$log"; then
   echo ">>> PASS: 2-vcpu resin booted under KVM and tore down cleanly"
 else
-  echo ">>> FAIL (full log: $log)"; exit 1
+  echo ">>> FAIL — boot log (last 100 lines):"; tail -100 "$log"; exit 1
 fi

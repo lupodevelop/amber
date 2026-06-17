@@ -83,7 +83,7 @@ for _ in $(seq 1 400); do
   kill -0 $qp 2>/dev/null || break
   sleep 5
 done
-sleep 4; kill $qp 2>/dev/null; pkill -f qemu-system-aarch64 2>/dev/null || true
+sleep 4; kill $qp 2>/dev/null || true; pkill -f qemu-system-aarch64 2>/dev/null || true
 
 echo "--- markers ---"
 grep -aE "==PAUSE==|DURING_PAUSE_GOT=|AFTER_RESUME_GOT=|GOT=|PAUSE_READY|panic|backend error" "$log" || true
@@ -91,5 +91,5 @@ grep -aE "==PAUSE==|DURING_PAUSE_GOT=|AFTER_RESUME_GOT=|GOT=|PAUSE_READY|panic|b
 if grep -qa "DURING_PAUSE_GOT=0" "$log" && grep -qa "AFTER_RESUME_GOT=1" "$log"; then
   echo ">>> PASS: vcpu froze under PAUSE and processed the queued input only after RESUME"
 else
-  echo ">>> FAIL (full log: $log)"; exit 1
+  echo ">>> FAIL — boot log (last 100 lines):"; tail -100 "$log"; exit 1
 fi

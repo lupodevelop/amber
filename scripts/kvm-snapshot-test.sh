@@ -67,7 +67,7 @@ for _ in $(seq 1 640); do
   kill -0 $qp 2>/dev/null || break
   sleep 5
 done
-sleep 4; kill $qp 2>/dev/null; pkill -f qemu-system-aarch64 2>/dev/null || true
+sleep 4; kill $qp 2>/dev/null || true; pkill -f qemu-system-aarch64 2>/dev/null || true
 
 echo "--- markers ---"
 grep -aE "==BOOT==|==RESTORE==|KVM_E2E_PRE|KVM_E2E_TICK|KVM_E2E_POST|snap-rc=|restore-rc=" "$log" || true
@@ -77,5 +77,5 @@ post_count=$(grep -ac "KVM_E2E_POST" "$log" || true)
 if grep -qa "==RESTORE==" "$log" && [ "$post_count" -ge 1 ]; then
   echo ">>> PASS: resin resumed from a KVM snapshot and ran to completion"
 else
-  echo ">>> FAIL (full log: $log)"; exit 1
+  echo ">>> FAIL — boot log (last 100 lines):"; tail -100 "$log"; exit 1
 fi
