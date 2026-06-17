@@ -478,7 +478,9 @@ impl GicV2 {
         }
         if range(off, gicd::ITARGETSR, 64) {
             let idx = (off - gicd::ITARGETSR) as usize;
-            let cpu_mask = (1u16 << self.cpus.len()) as u8 - 1;
+            // Compute the mask in u16 then truncate: with 8 cpus, 1u16<<8 == 256,
+            // so `(… as u8) - 1` would overflow (panic in debug, wrap in release).
+            let cpu_mask = ((1u16 << self.cpus.len()) - 1) as u8;
             for k in 0..size as usize {
                 let i = idx + k;
                 // Private targets are read-only; SPI targets clamp to real CPUs.
@@ -874,5 +876,13 @@ mod tests {
         assert!(g.cpus[0].enabled[27], "private INTID migrated to cpu0's bank");
         assert!(g.enabled[33] && g.level[33], "SPI migrated to the shared block");
         assert!(g.irq_pending(0), "the SPI is deliverable after migration");
+    }
+
+    #[test]
+    fn itargetsr_write_with_max_cpus_does_not_overflow() {
+        // Regression: the 8-cpu mask was `(1u16<<8) as u8 - 1`, which panics in
+        // debug. One ITARGETSR write at MAX_CPUS must not panic.
+        let mut g = GicV2::with_cpus(MAX_CPUS);
+        g.dist_write(0, gicd::ITARGETSR, 4, 0xffff_ffff);
     }
 }

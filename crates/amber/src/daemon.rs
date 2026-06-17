@@ -794,9 +794,13 @@ fn handle(
         }
         Request::Shutdown => {
             write_reply(&mut stream, &Reply::Ok)?;
-            // Kill every VM before exiting so detached ones aren't orphaned.
+            // Kill every VM before exiting so detached ones aren't orphaned. Skip
+            // pid 0 (reserved but not yet spawned): kill(0, …) would signal amberd's
+            // whole process group, including amberd itself.
             for e in reg.lock().unwrap().values() {
-                unsafe { libc::kill(e.info.pid as i32, libc::SIGKILL) };
+                if e.info.pid != 0 {
+                    unsafe { libc::kill(e.info.pid as i32, libc::SIGKILL) };
+                }
             }
             let _ = std::fs::remove_file(sock);
             log::info!("amberd shutting down");
