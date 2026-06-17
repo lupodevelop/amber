@@ -76,7 +76,7 @@ for _ in $(seq 1 72); do
   kill -0 $qp 2>/dev/null || break
   sleep 5
 done
-sleep 4; kill $qp 2>/dev/null; pkill -f qemu-system-aarch64 2>/dev/null || true
+sleep 4; kill $qp 2>/dev/null || true; pkill -f qemu-system-aarch64 2>/dev/null || true
 
 echo "--- relevant output ---"
 grep -aE "booting on KVM|KVM:|KVM_INNER_OK|backend error|unhandled KVM|panic|amber-boot-rc" "$log" || true
