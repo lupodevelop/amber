@@ -83,5 +83,5 @@ grep -aE "booting on KVM|KVM:|KVM_INNER_OK|backend error|unhandled KVM|panic|amb
 if grep -qa "KVM_INNER_OK" "$log"; then
   echo ">>> PASS: resin booted under amber-kvm"
 else
-  echo ">>> FAIL (full log: $log)"; exit 1
+  echo ">>> FAIL — boot log (last 100 lines):"; tail -100 "$log"; exit 1
 fi
