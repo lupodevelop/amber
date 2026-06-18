@@ -289,3 +289,50 @@ fn challenge_field(challenge: &str, key: &str) -> Option<String> {
     let end = rest.find('"')?;
     Some(rest[..end].to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn docker_official_image_gets_library_prefix_and_latest() {
+        let r = Reference::parse("alpine").unwrap();
+        assert_eq!(r.registry, DEFAULT_REGISTRY);
+        assert_eq!(r.repository, "library/alpine");
+        assert_eq!(r.reference, "latest");
+    }
+
+    #[test]
+    fn explicit_tag_is_parsed() {
+        let r = Reference::parse("alpine:3.20").unwrap();
+        assert_eq!(r.repository, "library/alpine");
+        assert_eq!(r.reference, "3.20");
+    }
+
+    #[test]
+    fn registry_host_is_split_off() {
+        let r = Reference::parse("ghcr.io/user/img:tag").unwrap();
+        assert_eq!(r.registry, "ghcr.io");
+        assert_eq!(r.repository, "user/img");
+        assert_eq!(r.reference, "tag");
+    }
+
+    #[test]
+    fn localhost_with_port_is_a_registry_not_a_tag() {
+        let r = Reference::parse("localhost:5000/img").unwrap();
+        assert_eq!(r.registry, "localhost:5000");
+        assert_eq!(r.repository, "img");
+        assert_eq!(r.reference, "latest");
+    }
+
+    #[test]
+    fn digest_reference_is_parsed() {
+        let r = Reference::parse("repo@sha256:abc").unwrap();
+        assert_eq!(r.reference, "sha256:abc");
+    }
+
+    #[test]
+    fn empty_reference_errors() {
+        assert!(Reference::parse("").is_err());
+    }
+}

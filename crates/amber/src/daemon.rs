@@ -1268,3 +1268,55 @@ pub fn shutdown() -> io::Result<()> {
         Ok(_) | Err(_) => Ok(()), // the daemon exits as it replies; a dropped conn is fine
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fake_entry(id: &str) -> VmEntry {
+        VmEntry {
+            info: VmInfo {
+                id: id.to_string(),
+                reference: "test".to_string(),
+                pid: 0,
+                started: 0,
+                ram_bytes: 0,
+                rss_bytes: 0,
+                paused: false,
+            },
+            kill: Arc::new(AtomicBool::new(false)),
+            control: None,
+            stdout: None,
+            stdin: None,
+        }
+    }
+
+    #[test]
+    fn evict_one_pooled_removes_entry_and_signals_kill() {
+        let reg: Registry = Arc::new(Mutex::new(HashMap::new()));
+        let pool: Pool = Arc::new(Mutex::new(HashMap::new()));
+        let e = fake_entry("vm1");
+        let kill = e.kill.clone();
+        reg.lock().unwrap().insert("vm1".to_string(), e);
+        pool.lock().unwrap().insert("tmpl".to_string(), vec!["vm1".to_string()]);
+
+        assert!(evict_one_pooled(&reg, &pool));
+        assert!(!reg.lock().unwrap().contains_key("vm1"));
+        assert!(kill.load(Ordering::Relaxed), "supervisor must be told to reap");
+    }
+
+    #[test]
+    fn evict_one_pooled_is_false_when_pool_empty() {
+        let reg: Registry = Arc::new(Mutex::new(HashMap::new()));
+        let pool: Pool = Arc::new(Mutex::new(HashMap::new()));
+        assert!(!evict_one_pooled(&reg, &pool));
+    }
+
+    #[test]
+    fn release_is_false_without_a_control_channel() {
+        let reg: Registry = Arc::new(Mutex::new(HashMap::new()));
+        reg.lock().unwrap().insert("vm1".to_string(), fake_entry("vm1"));
+        assert!(!release(&reg, "vm1")); // control is None
+        assert!(!release(&reg, "missing"));
+    }
+}

@@ -147,3 +147,44 @@ pub fn write_reply(w: &mut impl Write, reply: &Reply) -> io::Result<()> {
     let json = serde_json::to_vec(reply)?;
     write_frame(w, TAG_REPLY, &json)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn read_frame_round_trips() {
+        let mut buf = Vec::new();
+        write_frame(&mut buf, TAG_STDOUT, b"hello").unwrap();
+        let (tag, payload) = read_frame(&mut Cursor::new(buf)).unwrap().unwrap();
+        assert_eq!(tag, TAG_STDOUT);
+        assert_eq!(payload, b"hello");
+    }
+
+    #[test]
+    fn read_frame_clean_eof_is_none() {
+        assert!(read_frame(&mut Cursor::new(Vec::new())).unwrap().is_none());
+    }
+
+    #[test]
+    fn read_frame_truncated_header_errors() {
+        // A tag byte with no length following is a torn frame, not a clean EOF.
+        assert!(read_frame(&mut Cursor::new(vec![TAG_REQUEST])).is_err());
+    }
+
+    #[test]
+    fn read_frame_oversized_len_is_rejected() {
+        let mut buf = vec![TAG_REQUEST];
+        buf.extend_from_slice(&((MAX_FRAME as u32) + 1).to_le_bytes());
+        assert!(read_frame(&mut Cursor::new(buf)).is_err());
+    }
+
+    #[test]
+    fn read_frame_partial_payload_errors() {
+        let mut buf = vec![TAG_REQUEST];
+        buf.extend_from_slice(&10u32.to_le_bytes());
+        buf.extend_from_slice(b"abc"); // only 3 of the promised 10 bytes
+        assert!(read_frame(&mut Cursor::new(buf)).is_err());
+    }
+}

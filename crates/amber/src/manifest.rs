@@ -86,3 +86,39 @@ pub fn parse_size(s: &str) -> Option<usize> {
     let bytes = (num * mult) as usize;
     (bytes > 0).then_some(bytes)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::parse_size;
+
+    #[test]
+    fn parse_size_iec_units() {
+        assert_eq!(parse_size("512"), Some(512));
+        assert_eq!(parse_size("512b"), Some(512));
+        assert_eq!(parse_size("1k"), Some(1024));
+        assert_eq!(parse_size("1KiB"), Some(1024));
+        assert_eq!(parse_size("1m"), Some(1024 * 1024));
+        assert_eq!(parse_size("1g"), Some(1024 * 1024 * 1024));
+    }
+
+    #[test]
+    fn parse_size_si_units() {
+        assert_eq!(parse_size("1kb"), Some(1000));
+        assert_eq!(parse_size("1mb"), Some(1_000_000));
+    }
+
+    #[test]
+    fn parse_size_decimals_and_whitespace() {
+        assert_eq!(parse_size("2.5m"), Some(2_621_440));
+        assert_eq!(parse_size("  10 MiB "), Some(10 * 1024 * 1024));
+    }
+
+    #[test]
+    fn parse_size_rejects_garbage() {
+        assert_eq!(parse_size("0"), None); // zero is not a useful size
+        assert_eq!(parse_size("-5m"), None); // negative
+        assert_eq!(parse_size("abc"), None); // no leading number
+        assert_eq!(parse_size("5x"), None); // unknown unit
+        assert_eq!(parse_size("1e400"), None); // 'e400' is not a known unit
+    }
+}
