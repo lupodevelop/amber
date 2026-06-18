@@ -7,8 +7,12 @@
 
 use crate::{Error, ImageConfig, Result};
 use sha2::{Digest, Sha256};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+
+/// Per-layer size ceiling. Streaming a blob is bounded by this so a hostile or
+/// corrupt registry can't OOM the host with an unbounded download.
+const MAX_BLOB: u64 = 4 << 30; // 4 GiB
 
 const DEFAULT_REGISTRY: &str = "registry-1.docker.io";
 
@@ -172,6 +176,13 @@ impl Client {
     pub fn fetch_config(&mut self, digest: &str) -> Result<ImageConfig> {
         let url = format!("{}/blobs/{}", self.base, digest);
         let body = self.get(&url, "application/octet-stream")?.into_string()?;
+        // Verify the config blob against its digest: the manifest references it by
+        // sha256, so a mirror/MITM must not be able to swap entrypoint/cmd/env.
+        let want = digest.strip_prefix("sha256:").unwrap_or(digest);
+        let got = hex::encode(Sha256::digest(body.as_bytes()));
+        if got != want {
+            return Err(Error::Digest { want: want.to_string(), got });
+        }
         let v: serde_json::Value =
             serde_json::from_str(&body).map_err(|e| Error::Json(e.to_string()))?;
         let c = &v["config"];
@@ -192,21 +203,39 @@ impl Client {
             return Ok(path);
         }
         let url = format!("{}/blobs/{}", self.base, digest);
-        let resp = self.get(&url, "application/octet-stream")?;
-        let mut reader = resp.into_reader();
-        let mut data = Vec::new();
-        reader.read_to_end(&mut data)?;
+        let mut reader = self.get(&url, "application/octet-stream")?.into_reader();
+        // Stream to a temp file while hashing, with a hard size cap, instead of
+        // buffering the whole (possibly hostile) blob in memory. The temp name
+        // means a cache hit is always a complete, verified file.
+        let tmp = cache_dir.join(format!("{hex}.partial"));
+        let mut out = std::fs::File::create(&tmp)?;
+        let mut hasher = Sha256::new();
+        let mut buf = [0u8; 64 * 1024];
+        let mut total: u64 = 0;
+        loop {
+            let n = reader.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            total += n as u64;
+            if total > MAX_BLOB {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(Error::Registry(format!("blob {hex} exceeds {MAX_BLOB} bytes")));
+            }
+            hasher.update(&buf[..n]);
+            out.write_all(&buf[..n])?;
+        }
+        out.flush()?;
+        drop(out);
 
-        let got = hex::encode(Sha256::digest(&data));
+        let got = hex::encode(hasher.finalize());
         if got != hex {
+            let _ = std::fs::remove_file(&tmp);
             return Err(Error::Digest {
                 want: hex.to_string(),
                 got,
             });
         }
-        // Write via a temp name so a cache hit is always a complete file.
-        let tmp = cache_dir.join(format!("{hex}.partial"));
-        std::fs::write(&tmp, &data)?;
         std::fs::rename(&tmp, &path)?;
         Ok(path)
     }

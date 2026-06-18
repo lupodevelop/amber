@@ -23,6 +23,8 @@ pub fn flatten(layers: &[PathBuf], dest: &Path) -> Result<()> {
         fs::remove_dir_all(dest)?;
     }
     fs::create_dir_all(dest)?;
+    // Canonical root for the symlink-containment check below.
+    let root = dest.canonicalize()?;
 
     for layer in layers {
         let file = fs::File::open(layer)?;
@@ -39,22 +41,48 @@ pub fn flatten(layers: &[PathBuf], dest: &Path) -> Result<()> {
             if let Some(name) = rel.file_name().and_then(|n| n.to_str()) {
                 if name == WH_OPAQUE {
                     let dir = dest.join(rel.parent().unwrap_or(Path::new("")));
-                    clear_dir(&dir)?;
+                    if within_root(&root, &dir.join("_")) {
+                        clear_dir(&dir)?;
+                    }
                     continue;
                 }
                 if let Some(target) = name.strip_prefix(WH_PREFIX) {
                     let victim = dest
                         .join(rel.parent().unwrap_or(Path::new("")))
                         .join(target);
-                    remove_any(&victim)?;
+                    if within_root(&root, &victim) {
+                        remove_any(&victim)?;
+                    }
                     continue;
                 }
             }
 
-            extract(&mut entry, &dest.join(&rel))?;
+            let out = dest.join(&rel);
+            // A previous layer may have made a parent component a symlink that
+            // escapes the tree; refuse to write through it (tar-symlink traversal).
+            if !within_root(&root, &out) {
+                log::debug!("skip {} (parent escapes rootfs)", out.display());
+                continue;
+            }
+            extract(&mut entry, &out)?;
         }
     }
     Ok(())
+}
+
+/// True if writing `out` stays inside the rootfs: the deepest existing ancestor of
+/// `out`'s parent, with symlinks resolved, must lie under `root` (already canonical).
+/// Blocks the tar-symlink traversal where a layer makes a parent a symlink escaping
+/// the tree and a later entry writes through it onto the host.
+fn within_root(root: &Path, out: &Path) -> bool {
+    let mut p = out.parent();
+    while let Some(dir) = p {
+        match dir.canonicalize() {
+            Ok(c) => return c.starts_with(root),
+            Err(_) => p = dir.parent(),
+        }
+    }
+    false
 }
 
 fn extract<R: io::Read>(entry: &mut tar::Entry<R>, out: &Path) -> Result<()> {
@@ -153,4 +181,70 @@ fn clear_dir(dir: &Path) -> Result<()> {
         remove_any(&entry?.path())?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flate2::{write::GzEncoder, Compression};
+    use tar::{Builder, EntryType, Header};
+
+    fn tmp(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("amber-flatten-{}-{}", std::process::id(), name))
+    }
+
+    fn write_layer(path: &Path, build: impl FnOnce(&mut Builder<GzEncoder<Vec<u8>>>)) {
+        let mut b = Builder::new(GzEncoder::new(Vec::new(), Compression::fast()));
+        build(&mut b);
+        let gz = b.into_inner().unwrap().finish().unwrap();
+        fs::write(path, gz).unwrap();
+    }
+
+    fn reg(b: &mut Builder<GzEncoder<Vec<u8>>>, path: &str, data: &[u8]) {
+        let mut h = Header::new_gnu();
+        h.set_entry_type(EntryType::Regular);
+        h.set_mode(0o644);
+        h.set_size(data.len() as u64);
+        b.append_data(&mut h, path, data).unwrap();
+    }
+
+    #[test]
+    fn symlink_parent_traversal_is_blocked() {
+        let outside = tmp("outside-1");
+        let dest = tmp("dest-1");
+        let layer = tmp("layer-1.tar.gz");
+        let _ = fs::remove_dir_all(&outside);
+        let _ = fs::remove_dir_all(&dest);
+        fs::create_dir_all(&outside).unwrap();
+
+        // Layer: make `esc` a symlink to a dir OUTSIDE the rootfs, then write
+        // `esc/pwned` through it. The write must NOT land in `outside`.
+        write_layer(&layer, |b| {
+            let mut h = Header::new_gnu();
+            h.set_entry_type(EntryType::Symlink);
+            h.set_mode(0o777);
+            h.set_size(0);
+            b.append_link(&mut h, "esc", &outside).unwrap();
+            reg(b, "esc/pwned", b"PWNED");
+        });
+
+        flatten(&[layer], &dest).unwrap();
+
+        assert!(!outside.join("pwned").exists(), "traversal wrote outside the rootfs");
+        let _ = fs::remove_dir_all(&outside);
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn normal_files_still_extract() {
+        let dest = tmp("dest-2");
+        let layer = tmp("layer-2.tar.gz");
+        let _ = fs::remove_dir_all(&dest);
+        write_layer(&layer, |b| reg(b, "etc/hello", b"hi"));
+
+        flatten(&[layer], &dest).unwrap();
+
+        assert_eq!(fs::read(dest.join("etc/hello")).unwrap(), b"hi");
+        let _ = fs::remove_dir_all(&dest);
+    }
 }

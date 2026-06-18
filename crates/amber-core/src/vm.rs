@@ -110,7 +110,7 @@ pub struct Vm {
     vcpus: usize,
     pl011: Pl011,
     virtio: Vec<VirtioDev>,
-    balloon: Option<(BalloonHandle, u32)>,
+    balloon: (BalloonHandle, u32),
     control_fd: Option<RawFd>,
     /// Warm-pool gate: when set, `run` finishes the restore, signals readiness on
     /// the control fd, and blocks for a one-byte "go" before resuming the guest —
@@ -184,7 +184,7 @@ impl Vm {
             vcpus: cfg.vcpus.clamp(1, 8),
             pl011: Pl011::new(Box::new(std::io::stdout())),
             virtio,
-            balloon: Some(balloon),
+            balloon,
             control_fd: cfg.control_fd,
             paused: false,
             snapshot: cfg.snapshot.clone(),
@@ -255,7 +255,7 @@ impl Vm {
             vcpus: loaded.meta.vcpus.clamp(1, 8),
             pl011: Pl011::new(Box::new(std::io::stdout())),
             virtio,
-            balloon: Some(balloon),
+            balloon,
             control_fd: None,
             paused: false,
             snapshot: None,
@@ -440,7 +440,11 @@ impl Vm {
 
         // Shared device model: secondary vcpus take MMIO exits on their own
         // threads, so every device sits behind a Mutex. MMIO is rare relative to
-        // guest execution; contention is not a hot path.
+        // guest execution; contention is not a hot path. The `.lock().unwrap()`s
+        // below intentionally propagate poison: a panic in a device handler (all
+        // of which are bounds-checked and fuzzed) means this one disposable VM is
+        // unrecoverable, so tearing it down is the right outcome, not limping on
+        // with a half-updated virtqueue.
         let pl011 = Mutex::new(pl011);
         let virtio = Mutex::new(virtio);
         let running = AtomicBool::new(true);
@@ -453,7 +457,7 @@ impl Vm {
         let disk_path = disk_path.as_deref();
         let started = std::time::Instant::now();
 
-        let balloon = balloon.as_ref();
+        let balloon = &balloon;
         // The vcpu loop runs on this thread; reader threads unpark it to cut idle
         // latency when it is parked waiting for the timer (software-GIC mode).
         let vcpu_thread = std::thread::current();
@@ -537,8 +541,7 @@ impl Vm {
 
                 // Snapshot point: the guest is stopped between runs, so its RAM
                 // and registers are consistent. Capture once the deadline passes,
-                // then stop (restore is a separate path). prepare() guarantees
-                // vcpus == 1 when a snapshot is armed.
+                // then stop (restore is a separate path).
                 if let Some(req) = snapshot {
                     // Fire on the console marker if one is armed (deterministic),
                     // else on the wall-clock deadline.
@@ -878,7 +881,7 @@ fn read_exact_fd(fd: RawFd, buf: &mut [u8]) -> bool {
 fn control_reader<H: Hypervisor>(
     hv: &H,
     fd: RawFd,
-    balloon: Option<&(BalloonHandle, u32)>,
+    balloon: &(BalloonHandle, u32),
     running: &AtomicBool,
     pause: &(Mutex<bool>, std::sync::Condvar),
 ) {
@@ -898,12 +901,11 @@ fn control_reader<H: Hypervisor>(
                 if !read_exact_fd(fd, &mut buf) {
                     break;
                 }
-                if let Some((handle, intid)) = balloon {
-                    let mib = u64::from_le_bytes(buf);
-                    handle.target_pages.store(mib * 256, Ordering::Relaxed); // 1 MiB = 256 * 4 KiB
-                    handle.config_dirty.store(true, Ordering::Relaxed);
-                    let _ = hv.set_irq(*intid, true);
-                }
+                let (handle, intid) = balloon;
+                let mib = u64::from_le_bytes(buf);
+                handle.target_pages.store(mib * 256, Ordering::Relaxed); // 1 MiB = 256 * 4 KiB
+                handle.config_dirty.store(true, Ordering::Relaxed);
+                let _ = hv.set_irq(*intid, true);
             }
             crate::control::PAUSE => {
                 *pause.0.lock().unwrap() = true;

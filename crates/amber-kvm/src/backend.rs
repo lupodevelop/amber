@@ -109,6 +109,7 @@ fn init_vcpu(
     Ok(KvmVcpu {
         fd,
         kvm_run: run as *mut kvm_run,
+        run_size,
         mmio_len: 0,
         kick_tids: kick_tids.clone(),
         tid_registered: false,
@@ -253,6 +254,8 @@ impl KvmVm {
 pub struct KvmVcpu {
     fd: VcpuFd,
     kvm_run: *mut kvm_run,
+    /// Size of the kvm_run mapping (from get_vcpu_mmap_size), to munmap exactly.
+    run_size: usize,
     /// Length of the MMIO read currently being serviced (for complete_mmio_read).
     mmio_len: usize,
     /// Shared with `KvmVm`: this vcpu registers its thread id here on first run
@@ -444,8 +447,9 @@ pub fn selftest() -> Result<()> {
 
 impl Drop for KvmVcpu {
     fn drop(&mut self) {
-        // The kvm_run mapping size is fixed by KVM; munmap with a page-rounded
-        // guess is fine since the kernel tracks the real length.
-        unsafe { libc::munmap(self.kvm_run as *mut libc::c_void, 0x1000) };
+        // Unmap the exact size we mapped (get_vcpu_mmap_size); it can exceed one
+        // page (it includes the coalesced-MMIO ring), so a hardcoded 0x1000 would
+        // leak the tail of every vcpu's mapping.
+        unsafe { libc::munmap(self.kvm_run as *mut libc::c_void, self.run_size) };
     }
 }

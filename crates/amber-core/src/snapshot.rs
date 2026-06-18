@@ -161,11 +161,14 @@ pub fn read(dir: &Path) -> Result<Loaded> {
         cpus.push(serde_json::from_slice(&b).map_err(snap_err)?);
     }
     let gic = std::fs::read(dir.join("gic.bin")).map_err(snap_err)?;
-    // dev.json is newer than the first snapshots; default it if absent.
-    let dev = std::fs::read(dir.join("dev.json"))
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default();
+    // dev.json is newer than the first snapshots; default it if absent, but a
+    // present-but-corrupt file is an error (silently defaulting it would restore
+    // devices to reset state and hang the guest after restore).
+    let dev = match std::fs::read(dir.join("dev.json")) {
+        Ok(b) => serde_json::from_slice(&b).map_err(snap_err)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => DevState::default(),
+        Err(e) => return Err(snap_err(e)),
+    };
     Ok(Loaded { meta, cpu, cpus, gic, dev })
 }
 
@@ -241,6 +244,18 @@ mod tests {
         let loaded = read(&dir).unwrap();
         assert!(loaded.dev.pl011.is_empty());
         assert!(loaded.dev.virtio.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_errors_on_corrupt_devstate() {
+        let dir = tmpdir("baddev");
+        std::fs::write(dir.join("meta.json"), br#"{"mem_base":0,"mem_size":0}"#).unwrap();
+        std::fs::write(dir.join("cpu.json"), serde_json::to_vec(&CpuSnapshot::default()).unwrap()).unwrap();
+        std::fs::write(dir.join("gic.bin"), b"").unwrap();
+        std::fs::write(dir.join("dev.json"), b"{not json").unwrap();
+        // A present-but-corrupt dev.json must error, not silently default.
+        assert!(read(&dir).is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -272,9 +272,13 @@ mod imp {
                     log::warn!("lockdown: cannot open {} for Landlock rule", p.display());
                     continue;
                 }
-                add_path_rule(rs, pfd)?;
-            } else {
-                add_path_rule(rs, fd)?;
+                if let Err(e) = add_path_rule(rs, pfd) {
+                    unsafe { libc::close(rs) };
+                    return Err(e);
+                }
+            } else if let Err(e) = add_path_rule(rs, fd) {
+                unsafe { libc::close(rs) };
+                return Err(e);
             }
         }
 

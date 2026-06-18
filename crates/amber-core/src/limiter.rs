@@ -40,7 +40,8 @@ impl TokenBucket {
 
     fn refill(&mut self) {
         let now = Instant::now();
-        self.tokens = (self.tokens + self.last.elapsed().as_secs_f64() * self.rate).min(self.rate);
+        let dt = now.duration_since(self.last).as_secs_f64();
+        self.tokens = (self.tokens + dt * self.rate).min(self.rate);
         self.last = now;
     }
 

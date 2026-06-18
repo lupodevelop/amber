@@ -35,7 +35,8 @@ impl GuestMemory {
             return Err(Error::Mmap(std::io::Error::last_os_error()));
         }
         Ok(Self {
-            host: NonNull::new(ptr as *mut u8).unwrap(),
+            host: NonNull::new(ptr as *mut u8)
+                .ok_or_else(|| Error::Mmap(std::io::Error::other("mmap returned null")))?,
             len,
             base,
         })
@@ -66,7 +67,8 @@ impl GuestMemory {
             return Err(Error::Mmap(std::io::Error::last_os_error()));
         }
         Ok(Self {
-            host: NonNull::new(ptr as *mut u8).unwrap(),
+            host: NonNull::new(ptr as *mut u8)
+                .ok_or_else(|| Error::Mmap(std::io::Error::other("mmap returned null")))?,
             len,
             base,
         })
