@@ -17,10 +17,10 @@ pieces fit together, see [`docs/architecture.md`](docs/architecture.md) and
   overlay) with an interactive console, via `amber run`.
 - **Snapshots and restores** a running VM (RAM, vcpu, interrupt controller, device
   state), resuming mid-execution.
-- **Forks from a warm template** copy-on-write: a new sandbox in about 10 MiB of
-  private RAM, handed off from a pool in milliseconds.
+- **Forks from a warm template** copy-on-write: a new sandbox in about 16 MiB of
+  resident RAM, handed off from a pool in tens of milliseconds.
 - **Execs a fresh command per fork** with `amber exec <template> -- <cmd>`: a
-  clean, isolated sandbox per task in about 15 ms.
+  clean, isolated sandbox per task in about 30 ms.
 - **Networks by default**: a userspace netstack gives the guest outbound TCP and
   DNS by hostname, plus inbound port-forwards, rootless.
 - **Stays under a RAM budget**: admission control, real-RSS accounting,
@@ -39,16 +39,19 @@ Apple Silicon: the in-kernel vGIC cannot restore the timer.
 | **Networking** | outbound TCP and DNS by hostname, inbound port-forward; on by default, rootless |
 | **vsock** | guest↔host `AF_VSOCK` streams bridged to host unix sockets (Firecracker-hybrid), credit flow-controlled; `AMBER_VSOCK` |
 | **Snapshot / restore** | capture and resume a VM mid-execution: RAM, every vcpu (SMP included), interrupt controller, and PL011/virtio device state; the periodic timer survives |
-| **Fork** | copy-on-write from a template (about 10 MiB/fork), warm pool (millisecond handoff), budget-aware sizing and eviction; interactive `fork -i` |
-| **Exec** | `amber exec <template> -- <cmd>` runs a fresh command in a warm fork (about 15 ms), with exit codes |
+| **Fork** | copy-on-write from a template (about 16 MiB resident/fork), warm pool (tens-of-ms handoff), budget-aware sizing and eviction; interactive `fork -i` |
+| **Exec** | `amber exec <template> -- <cmd>` runs a fresh command in a warm fork (about 30 ms), with exit codes |
 | **RAM budget** | fleet ceiling and admission control, real-RSS accounting, virtio-balloon reclaim (passive and active), pool eviction |
 | **VMM lockdown** | the VM process drops privileges before the guest runs: no exec/fork, filesystem read-only, network only if the VM has a net device |
 | **Daemon** | `amberd` over a unix socket; `ps`/`logs`/`pause`/`resume`/`rm`/`budget`; templates and budget from `amber.toml` |
 
-Rough numbers (Apple Silicon, resin kernel, alpine:3 image): a warm `amber run --
-true` is about 100 ms; a warm `amber exec` is about 15 ms; a fork costs about
-10 MiB of private RAM; free-page reporting shrinks a VM's real footprint (for
-example 264 MiB → 52 MiB after the guest frees memory).
+Measured on an Apple M1 Pro (HVF, resin kernel, alpine:3): a warm `amber run` is
+about 200 ms, an `amber exec` into a warm fork is about 30 ms (end-to-end, CLI to
+exit code), and an idle fork holds about 16 MiB of resident RAM against a 512 MiB
+cap, so roughly 60 idle forks fit per GiB before RAM binds. Free-page reporting
+shrinks a VM's real footprint further after the guest frees memory. Methodology and
+per-machine results are in [`benchmarks/`](benchmarks/); KVM-on-real-hardware
+numbers are still pending.
 
 ## Install
 
@@ -120,7 +123,7 @@ amber run alpine:3 -- wget -qO- http://example.com
 # 3. fast repeated execs: build a template once, then exec into warm forks
 amber up                              # start the daemon
 amber template alpine:3 ./py          # boot once, snapshot a ready-to-exec template
-amber exec ./py -- 'echo $((6*7))'    # ~15 ms: a fresh sandbox runs the command -> 42
+amber exec ./py -- 'echo $((6*7))'    # ~30 ms: a fresh sandbox runs the command -> 42
 amber exec ./py -- uname -sr          # another fork, another command
 amber down                            # stop the daemon (reaps all VMs)
 ```
@@ -176,8 +179,8 @@ amber exec ./box -- 'exit 7'; echo $?           # 7
 
 `amber fork <template>` hands off a forked VM detached (id plus `amber logs`);
 `amber fork -i <template>` attaches your terminal to it. Forks are copy-on-write:
-the read-only base pages are shared, only writes cost private RAM (about 10 MiB
-per fork). The full mechanism is in
+the read-only base pages are shared, only writes cost private RAM (about 16 MiB
+resident per fork). The full mechanism is in
 [`docs/snapshot-and-exec.md`](docs/snapshot-and-exec.md).
 
 ### Networking
@@ -290,8 +293,9 @@ cannot spawn, drop files, or phone home.
   exec, fork, snapshot, restore, SMP, and pause. The KVM path is tested
   hardware-free with `scripts/kvm-*.sh` (QEMU emulates EL2 under TCG, a KVM-host
   Linux boots, and amber-kvm boots resin inside it), covering boot,
-  snapshot/restore, SMP teardown, and pause/resume; these run nightly in CI. It
-  has not yet been validated on real arm64 KVM hardware.
+  snapshot/restore, SMP teardown, and pause/resume; these run on demand in CI (the
+  `e2e` workflow, not a per-push gate). It has not yet been validated on real arm64
+  KVM hardware, so the published numbers are HVF-only.
 - The kernel is amber's own (resin), but busybox and musl are still borrowed
   Alpine artifacts and `assets/` ships separately; bundling everything into the
   amber binary ("single binary") is future work.
