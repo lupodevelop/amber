@@ -11,6 +11,7 @@ use crate::Result;
 use flate2::read::GzDecoder;
 use std::fs;
 use std::io;
+use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use tar::EntryType;
@@ -27,8 +28,18 @@ pub fn flatten(layers: &[PathBuf], dest: &Path) -> Result<()> {
     let root = dest.canonicalize()?;
 
     for layer in layers {
-        let file = fs::File::open(layer)?;
-        let mut archive = tar::Archive::new(GzDecoder::new(file));
+        // Registry layers are gzipped; a local `docker save` tar is plain tar.
+        // Sniff the gzip magic and pick the reader accordingly.
+        let mut file = fs::File::open(layer)?;
+        let mut magic = [0u8; 2];
+        let gzipped = file.read(&mut magic)? == 2 && magic == [0x1f, 0x8b];
+        file.seek(SeekFrom::Start(0))?;
+        let reader: Box<dyn Read> = if gzipped {
+            Box::new(GzDecoder::new(file))
+        } else {
+            Box::new(file)
+        };
+        let mut archive = tar::Archive::new(reader);
         for entry in archive.entries()? {
             let mut entry = entry?;
             let path = entry.path()?.into_owned();

@@ -11,6 +11,7 @@ mod flatten;
 mod pack;
 mod registry;
 
+use std::io;
 use std::path::{Path, PathBuf};
 
 pub use cpio::Cpio;
@@ -86,6 +87,11 @@ pub struct Built {
 /// wants). `refresh = true` always re-resolves against the registry and updates
 /// the mapping (what `pull` does, so a moved tag is picked up).
 pub fn build(reference: &str, cache_dir: &Path, refresh: bool) -> Result<Built> {
+    // A reference that names a file on disk is a local `docker save` tar, not a
+    // registry ref: load it offline (no network, no push).
+    if Path::new(reference).is_file() {
+        return build_local(reference, cache_dir);
+    }
     let parsed = Reference::parse(reference)?;
     let bases = cache_dir.join("bases");
     std::fs::create_dir_all(&bases)?;
@@ -142,6 +148,135 @@ pub fn build(reference: &str, cache_dir: &Path, refresh: bool) -> Result<Built> 
     std::fs::write(&cfg_path, json)?;
 
     Ok(Built { base, config })
+}
+
+/// Build from a local `docker save` tar (an OCI archive carrying a classic
+/// `manifest.json`). Lets a dev boot a locally-built image with no registry.
+fn build_local(tar_path: &str, cache_dir: &Path) -> Result<Built> {
+    let bases = cache_dir.join("bases");
+    let blobs = cache_dir.join("blobs");
+    std::fs::create_dir_all(&bases)?;
+    std::fs::create_dir_all(&blobs)?;
+    let refs_path = cache_dir.join("refs.json");
+
+    // manifest.json: the config blob and the ordered layer blobs, as tar members
+    // (`blobs/sha256/<hex>`). The config digest (its hex) is the content id.
+    let (config_member, layer_members) = read_save_manifest(tar_path)?;
+    let id = config_member.rsplit('/').next().unwrap_or(&config_member).to_string();
+
+    if let Some(built) = load_built(&bases, &id) {
+        ref_store(&refs_path, tar_path, &id);
+        log::info!("local image cache hit {}", short(&id));
+        return Ok(built);
+    }
+
+    log::info!("building local image {tar_path}");
+    let mut want: std::collections::HashSet<&str> =
+        layer_members.iter().map(String::as_str).collect();
+    want.insert(&config_member);
+    let extracted = extract_members(tar_path, &want, &blobs)?;
+    let member = |m: &str| -> Result<PathBuf> {
+        extracted
+            .get(m)
+            .cloned()
+            .ok_or_else(|| Error::Registry(format!("image tar missing blob {m}")))
+    };
+
+    let config = registry::parse_config(&std::fs::read(member(&config_member)?)?)?;
+    let layers: Vec<PathBuf> = layer_members.iter().map(|m| member(m)).collect::<Result<_>>()?;
+
+    let stamp = std::process::id();
+    let rootfs = bases.join(format!("rootfs-{id}.{stamp}"));
+    let base = bases.join(format!("{id}.sqfs"));
+    let base_tmp = bases.join(format!("{id}.{stamp}.tmp"));
+    flatten::flatten(&layers, &rootfs)?;
+    pack::pack_squashfs(&rootfs, &base_tmp)?;
+    std::fs::rename(&base_tmp, &base)?;
+    let _ = std::fs::remove_dir_all(&rootfs);
+
+    let json = serde_json::to_string(&config).map_err(|e| Error::Json(e.to_string()))?;
+    std::fs::write(bases.join(format!("{id}.json")), json)?;
+    ref_store(&refs_path, tar_path, &id);
+    Ok(Built { base, config })
+}
+
+/// Read `manifest.json` from a docker-save tar: `(config_member, layer_members)`.
+fn read_save_manifest(tar_path: &str) -> Result<(String, Vec<String>)> {
+    let mut ar = tar::Archive::new(std::fs::File::open(tar_path)?);
+    for entry in ar.entries()? {
+        let mut e = entry?;
+        if e.path()?.to_string_lossy() == "manifest.json" {
+            let mut buf = Vec::new();
+            io::copy(&mut e, &mut buf)?;
+            return parse_save_manifest(&buf);
+        }
+    }
+    Err(Error::Registry("no manifest.json in image tar".into()))
+}
+
+/// The pure JSON half of `read_save_manifest`: the first entry's `Config` blob
+/// and its ordered `Layers`.
+fn parse_save_manifest(json: &[u8]) -> Result<(String, Vec<String>)> {
+    let v: serde_json::Value =
+        serde_json::from_slice(json).map_err(|e| Error::Json(e.to_string()))?;
+    let m = v.get(0).ok_or_else(|| Error::Registry("empty manifest.json".into()))?;
+    let config = m["Config"]
+        .as_str()
+        .ok_or_else(|| Error::Registry("manifest.json: no Config".into()))?
+        .to_string();
+    let layers = registry::str_list(&m["Layers"]);
+    if layers.is_empty() {
+        return Err(Error::Registry("manifest.json: no Layers".into()));
+    }
+    Ok((config, layers))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_docker_save_manifest() {
+        let json = br#"[{"Config":"blobs/sha256/abc","RepoTags":["x:latest"],
+            "Layers":["blobs/sha256/l1","blobs/sha256/l2"]}]"#;
+        let (config, layers) = parse_save_manifest(json).unwrap();
+        assert_eq!(config, "blobs/sha256/abc");
+        assert_eq!(layers, ["blobs/sha256/l1", "blobs/sha256/l2"]);
+    }
+
+    #[test]
+    fn rejects_manifest_with_no_layers() {
+        let json = br#"[{"Config":"blobs/sha256/abc","Layers":[]}]"#;
+        assert!(parse_save_manifest(json).is_err());
+    }
+
+    #[test]
+    fn rejects_empty_manifest() {
+        assert!(parse_save_manifest(b"[]").is_err());
+    }
+}
+
+/// Extract the named members of a tar into `dest`, keyed by member path. Each
+/// lands at `dest/<basename>` (the blob's sha256), so repeats are deduped.
+fn extract_members(
+    tar_path: &str,
+    want: &std::collections::HashSet<&str>,
+    dest: &Path,
+) -> Result<std::collections::HashMap<String, PathBuf>> {
+    let mut ar = tar::Archive::new(std::fs::File::open(tar_path)?);
+    let mut out = std::collections::HashMap::new();
+    for entry in ar.entries()? {
+        let mut e = entry?;
+        let member = e.path()?.to_string_lossy().into_owned();
+        if want.contains(member.as_str()) {
+            let name = member.rsplit('/').next().unwrap_or(&member);
+            let path = dest.join(name);
+            let mut w = std::fs::File::create(&path)?;
+            io::copy(&mut e, &mut w)?;
+            out.insert(member, path);
+        }
+    }
+    Ok(out)
 }
 
 fn short(id: &str) -> &str {

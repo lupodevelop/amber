@@ -183,15 +183,7 @@ impl Client {
         if got != want {
             return Err(Error::Digest { want: want.to_string(), got });
         }
-        let v: serde_json::Value =
-            serde_json::from_str(&body).map_err(|e| Error::Json(e.to_string()))?;
-        let c = &v["config"];
-        Ok(ImageConfig {
-            entrypoint: str_list(&c["Entrypoint"]),
-            cmd: str_list(&c["Cmd"]),
-            env: str_list(&c["Env"]),
-            working_dir: c["WorkingDir"].as_str().filter(|s| !s.is_empty()).map(String::from),
-        })
+        parse_config(body.as_bytes())
     }
 
     /// Download a blob into `cache_dir/<hex>`, verifying its sha256. Cached hits
@@ -275,7 +267,21 @@ fn pick_arm64(index: &serde_json::Value) -> Result<String> {
     Err(Error::Registry("no arm64/linux image in index".into()))
 }
 
-fn str_list(v: &serde_json::Value) -> Vec<String> {
+/// Parse an OCI image config blob into the run bits amber needs. Shared by the
+/// registry path and the local-tar loader.
+pub(crate) fn parse_config(body: &[u8]) -> Result<ImageConfig> {
+    let v: serde_json::Value =
+        serde_json::from_slice(body).map_err(|e| Error::Json(e.to_string()))?;
+    let c = &v["config"];
+    Ok(ImageConfig {
+        entrypoint: str_list(&c["Entrypoint"]),
+        cmd: str_list(&c["Cmd"]),
+        env: str_list(&c["Env"]),
+        working_dir: c["WorkingDir"].as_str().filter(|s| !s.is_empty()).map(String::from),
+    })
+}
+
+pub(crate) fn str_list(v: &serde_json::Value) -> Vec<String> {
     v.as_array()
         .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
         .unwrap_or_default()
