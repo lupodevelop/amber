@@ -36,6 +36,9 @@ struct VmEntry {
     /// idle until the go byte.
     stdout: Option<std::process::ChildStdout>,
     stdin: Option<std::process::ChildStdin>,
+    /// Host-side vsock UDS base for this worker, if it has one (all restored
+    /// forks do). A host peer connects it and sends `CONNECT <port>\n`.
+    vsock: Option<String>,
 }
 
 type Registry = Arc<Mutex<HashMap<String, VmEntry>>>;
@@ -167,6 +170,7 @@ fn reserve(
             control: None,
             stdout: None,
             stdin: None,
+            vsock: None,
         },
     );
     Ok((id, kill))
@@ -243,6 +247,14 @@ fn attach_control(cmd: &mut Command) -> io::Result<(UnixStream, UnixStream)> {
 /// the costly work (CoW map + GIC + register restore), signals ready on the
 /// control channel, and blocks for a go byte. Returns once it is warmed and
 /// registered. The caller decides whether to pool the id or release it now.
+/// Host-side vsock UDS base path for a minted fork. Unique per (daemon, vm id).
+fn fork_vsock_base(pid: u32, id: &str) -> String {
+    std::env::temp_dir()
+        .join(format!("amber-fork-{pid}-{id}.sock"))
+        .to_string_lossy()
+        .into_owned()
+}
+
 fn spawn_paused(
     reg: &Registry,
     counter: &AtomicU64,
@@ -265,11 +277,15 @@ fn spawn_paused(
     // there), so the worker runs in swgic mode regardless of the daemon's env.
     cmd.arg("restore").arg(template);
     cmd.env("AMBER_PAUSED", "1").env("AMBER_GIC", "sw");
-    // The exec path gives the worker a vsock base so the in-guest agent can dial
-    // amberd's listener once this fork resumes.
-    if let Some(v) = vsock {
-        cmd.env("AMBER_VSOCK", v);
-    }
+    // Every restored fork gets a vsock base: exec passes its own (the in-guest
+    // agent dials `<base>_1`); a plain fork gets a minted one so a host peer can
+    // reach the guest with `CONNECT <port>`. Always set — templates carry a vsock
+    // device, so a restore without a base would mismatch the device set.
+    let base = match vsock {
+        Some(v) => v.to_string(),
+        None => fork_vsock_base(std::process::id(), &id),
+    };
+    cmd.env("AMBER_VSOCK", &base);
     cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(err);
     let (mut ctl_host, ctl_child) = match attach_control(&mut cmd) {
         Ok(p) => p,
@@ -303,6 +319,7 @@ fn spawn_paused(
         e.control = Some(ctl_host);
         e.stdout = cout;
         e.stdin = cin;
+        e.vsock = Some(base.clone());
     }
 
     let reg2 = reg.clone();
@@ -316,6 +333,8 @@ fn spawn_paused(
         if let Some(v) = pool2.lock().unwrap().get_mut(&tmpl2) {
             v.retain(|x| x != &id2);
         }
+        // SIGKILL skips the guest's Drop, so drop the host-side socket ourselves.
+        let _ = std::fs::remove_file(&base);
     });
     Ok(id)
 }
@@ -391,7 +410,7 @@ fn handle_fork(
         write_reply(&mut stream, &Reply::Error { message: format!("failed to release {id}") })?;
         return Ok(());
     }
-    refill_pool(reg, counter, pool, template);
+    refill_pool(reg.clone(), counter, pool, template);
 
     if interactive {
         relay_interactive(stream, cout, cin, kill)
@@ -406,7 +425,8 @@ fn handle_fork(
                 });
             }
         }
-        write_reply(&mut stream, &Reply::Started { id })
+        let vsock = reg.lock().unwrap().get(&id).and_then(|e| e.vsock.clone());
+        write_reply(&mut stream, &Reply::Started { id, vsock })
     }
 }
 
@@ -880,7 +900,7 @@ fn start_detached(
         reg2.lock().unwrap().remove(&id2);
     });
 
-    write_reply(&mut stream, &Reply::Started { id })?;
+    write_reply(&mut stream, &Reply::Started { id, vsock: None })?;
     Ok(())
 }
 
@@ -1161,7 +1181,7 @@ fn stream_client(req: &Request) -> io::Result<i32> {
 /// Start a detached VM; returns its id.
 pub fn run_detached(reference: &str, argv: &[String]) -> io::Result<String> {
     match request(&Request::RunDetached { reference: reference.to_string(), argv: argv.to_vec() })? {
-        Reply::Started { id } => Ok(id),
+        Reply::Started { id, .. } => Ok(id),
         Reply::BudgetExceeded { budget, used, requested } => {
             Err(io::Error::other(budget_msg(budget, used, requested)))
         }
@@ -1170,10 +1190,10 @@ pub fn run_detached(reference: &str, argv: &[String]) -> io::Result<String> {
     }
 }
 
-/// Fork a detached VM from a warm template; returns the new VM's id.
-pub fn fork(template: &str) -> io::Result<String> {
+/// Fork a detached VM from a warm template; returns its id and vsock UDS base.
+pub fn fork(template: &str) -> io::Result<(String, Option<String>)> {
     match request(&Request::Fork { template: template.to_string(), interactive: false })? {
-        Reply::Started { id } => Ok(id),
+        Reply::Started { id, vsock } => Ok((id, vsock)),
         Reply::BudgetExceeded { budget, used, requested } => {
             Err(io::Error::other(budget_msg(budget, used, requested)))
         }
@@ -1288,7 +1308,15 @@ mod tests {
             control: None,
             stdout: None,
             stdin: None,
+            vsock: None,
         }
+    }
+
+    #[test]
+    fn fork_vsock_base_is_deterministic_and_unique_per_id() {
+        assert_eq!(fork_vsock_base(7, "vm1"), fork_vsock_base(7, "vm1"));
+        assert_ne!(fork_vsock_base(7, "vm1"), fork_vsock_base(7, "vm2"));
+        assert!(fork_vsock_base(7, "vm1").contains("vm1"));
     }
 
     #[test]

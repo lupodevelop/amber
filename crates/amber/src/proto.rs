@@ -71,8 +71,14 @@ pub enum Request {
 pub enum Reply {
     /// Terminal reply for RunOneShot: the guest process exit code.
     Exit { code: i32 },
-    /// A detached VM was started, with its id.
-    Started { id: String },
+    /// A detached VM was started, with its id. `vsock` is the host-side Unix
+    /// socket base for a forked VM's guest↔host channel (None for other starts):
+    /// connect it and send `CONNECT <port>\n` to reach a guest port.
+    Started {
+        id: String,
+        #[serde(default)]
+        vsock: Option<String>,
+    },
     /// The live VM list.
     Vms { vms: Vec<VmInfo> },
     /// The fleet RAM budget and usage, in bytes (`budget` 0 = unlimited). `used`
@@ -160,6 +166,28 @@ mod tests {
         let (tag, payload) = read_frame(&mut Cursor::new(buf)).unwrap().unwrap();
         assert_eq!(tag, TAG_STDOUT);
         assert_eq!(payload, b"hello");
+    }
+
+    #[test]
+    fn started_reply_round_trips_vsock() {
+        for v in [None, Some("/tmp/amber-fork-9-vm1.sock".to_string())] {
+            let r = Reply::Started { id: "vm1".to_string(), vsock: v.clone() };
+            let back: Reply = serde_json::from_slice(&serde_json::to_vec(&r).unwrap()).unwrap();
+            match back {
+                Reply::Started { id, vsock } => {
+                    assert_eq!(id, "vm1");
+                    assert_eq!(vsock, v);
+                }
+                _ => panic!("wrong variant"),
+            }
+        }
+    }
+
+    #[test]
+    fn started_reply_without_vsock_field_defaults_to_none() {
+        // A pre-upgrade daemon omits the field; it must still decode.
+        let back: Reply = serde_json::from_str(r#"{"kind":"Started","id":"vm1"}"#).unwrap();
+        assert!(matches!(back, Reply::Started { vsock: None, .. }));
     }
 
     #[test]

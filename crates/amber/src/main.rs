@@ -934,8 +934,12 @@ fn cmd_fork(args: &[String]) -> ExitCode {
         }
     } else {
         match daemon::fork(template) {
-            Ok(id) => {
+            Ok((id, vsock)) => {
                 println!("{id}");
+                // Second line, when present: the host-side vsock UDS base.
+                if let Some(v) = vsock {
+                    println!("{v}");
+                }
                 ExitCode::SUCCESS
             }
             Err(e) => {
