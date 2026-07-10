@@ -19,7 +19,7 @@ dependencies = [
 
 [[package]]
 name = "amber"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "amber-core",
  "amber-hvf",
@@ -36,7 +36,7 @@ dependencies = [
 
 [[package]]
 name = "amber-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "log",
@@ -47,7 +47,7 @@ dependencies = [
 
 [[package]]
 name = "amber-hvf"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "amber-core",
  "libc",
@@ -56,7 +56,7 @@ dependencies = [
 
 [[package]]
 name = "amber-image"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "flate2",
  "hex",
@@ -70,7 +70,7 @@ dependencies = [
 
 [[package]]
 name = "amber-kvm"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "amber-core",
  "kvm-bindings",
@@ -81,7 +81,7 @@ dependencies = [
 
 [[package]]
 name = "amber-net"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "amber-core",
  "log",

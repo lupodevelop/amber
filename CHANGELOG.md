@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.0
+## 0.2.0
 
 - `amber fork` now assigns each forked VM a host-side vsock UDS base and returns
   it (a second stdout line; `Reply::Started.vsock`). A host peer reaches a guest
