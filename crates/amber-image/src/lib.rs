@@ -231,31 +231,6 @@ fn parse_save_manifest(json: &[u8]) -> Result<(String, Vec<String>)> {
     Ok((config, layers))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_docker_save_manifest() {
-        let json = br#"[{"Config":"blobs/sha256/abc","RepoTags":["x:latest"],
-            "Layers":["blobs/sha256/l1","blobs/sha256/l2"]}]"#;
-        let (config, layers) = parse_save_manifest(json).unwrap();
-        assert_eq!(config, "blobs/sha256/abc");
-        assert_eq!(layers, ["blobs/sha256/l1", "blobs/sha256/l2"]);
-    }
-
-    #[test]
-    fn rejects_manifest_with_no_layers() {
-        let json = br#"[{"Config":"blobs/sha256/abc","Layers":[]}]"#;
-        assert!(parse_save_manifest(json).is_err());
-    }
-
-    #[test]
-    fn rejects_empty_manifest() {
-        assert!(parse_save_manifest(b"[]").is_err());
-    }
-}
-
 /// Extract the named members of a tar into `dest`, keyed by member path. Each
 /// lands at `dest/<basename>` (the blob's sha256), so repeats are deduped.
 fn extract_members(
@@ -313,5 +288,30 @@ fn ref_store(refs_path: &Path, reference: &str, id: &str) {
         if std::fs::write(&tmp, json).is_ok() {
             let _ = std::fs::rename(&tmp, refs_path);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_docker_save_manifest() {
+        let json = br#"[{"Config":"blobs/sha256/abc","RepoTags":["x:latest"],
+            "Layers":["blobs/sha256/l1","blobs/sha256/l2"]}]"#;
+        let (config, layers) = parse_save_manifest(json).unwrap();
+        assert_eq!(config, "blobs/sha256/abc");
+        assert_eq!(layers, ["blobs/sha256/l1", "blobs/sha256/l2"]);
+    }
+
+    #[test]
+    fn rejects_manifest_with_no_layers() {
+        let json = br#"[{"Config":"blobs/sha256/abc","Layers":[]}]"#;
+        assert!(parse_save_manifest(json).is_err());
+    }
+
+    #[test]
+    fn rejects_empty_manifest() {
+        assert!(parse_save_manifest(b"[]").is_err());
     }
 }
