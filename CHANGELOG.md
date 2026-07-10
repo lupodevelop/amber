@@ -1,15 +1,15 @@
 # Changelog
 
-## Unreleased
-
-- vsock: host→guest connections now use monotonic ephemeral ports instead of
-  restarting at 1024 each time. Immediate reuse collided with the just-closed
-  connection the guest was still tearing down, which made every *other*
-  sequential connect to a fork fail.
+## 0.1.0
 
 - `amber fork` now assigns each forked VM a host-side vsock UDS base and returns
-  it (second stdout line; `Reply::Started.vsock`). A host peer can reach a guest
-  port with `CONNECT <port>\n`. Also fixes the device-set mismatch on restore.
-- `amber pull`/`run` accept a local `docker save` tar path (not just a registry
-  reference): resolve, flatten, and pack it offline, no registry. Layer reader
-  now sniffs gzip so plain (uncompressed) tar layers work too.
+  it (a second stdout line; `Reply::Started.vsock`). A host peer reaches a guest
+  port by connecting that socket and sending `CONNECT <port>\n`. This also fixes
+  the device-set mismatch when restoring a snapshot that carries a vsock device.
+- `amber pull` and `amber run` accept a local `docker save` tar path, not only a
+  registry reference: amber resolves, flattens, and packs it offline with no
+  registry. The layer reader sniffs gzip, so uncompressed tar layers work too.
+- vsock host-to-guest connections use monotonic ephemeral ports instead of
+  restarting at 1024 every time. Immediate reuse collided with the just-closed
+  connection the guest was still tearing down, which made every other sequential
+  connect to a fork fail.
