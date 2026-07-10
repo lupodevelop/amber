@@ -18,6 +18,8 @@ use std::sync::mpsc::Receiver;
 const HDR_LEN: usize = 44;
 const TYPE_STREAM: u16 = 1;
 const CID_HOST: u64 = 2;
+/// Bottom of the host ephemeral port range for host→guest connections.
+const EPHEMERAL_BASE: u32 = 1024;
 
 // Operations.
 const OP_REQUEST: u16 = 1;
@@ -141,6 +143,10 @@ pub struct VsockDevice {
     conns: Vec<Conn>,
     /// Packets queued for the guest rx queue (each already header+payload).
     rx: VecDeque<Vec<u8>>,
+    /// Next ephemeral host port for a host→guest connection. Monotonic so a
+    /// just-closed connection's port is not reused while the guest still has it
+    /// in teardown — reuse made every other sequential connect to a fork fail.
+    next_host_port: u32,
 }
 
 impl VsockDevice {
@@ -150,7 +156,26 @@ impl VsockDevice {
     const EVENT: usize = 2;
 
     pub fn new(guest_cid: u64, backend: Box<dyn VsockBackend>) -> Self {
-        Self { backend, guest_cid, conns: Vec::new(), rx: VecDeque::new() }
+        Self {
+            backend,
+            guest_cid,
+            conns: Vec::new(),
+            rx: VecDeque::new(),
+            next_host_port: EPHEMERAL_BASE,
+        }
+    }
+
+    /// A host source port not currently in use for `guest_port`, cycling through
+    /// the ephemeral range instead of restarting at the bottom each time.
+    fn alloc_host_port(&mut self, guest_port: u32) -> u32 {
+        for _ in 0..=(u32::MAX - EPHEMERAL_BASE) {
+            let hp = self.next_host_port;
+            self.next_host_port = hp.checked_add(1).unwrap_or(EPHEMERAL_BASE);
+            if self.find(guest_port, hp).is_none() {
+                return hp;
+            }
+        }
+        EPHEMERAL_BASE
     }
 
     /// Queue a control/data packet for the guest. `fwd_cnt`/`buf_alloc` ride along
@@ -257,10 +282,8 @@ impl VsockDevice {
         // New host→guest connections: tell the guest with a REQUEST.
         while let Some((guest_port, stream)) = self.backend.accept() {
             let _ = stream.set_nonblocking(true);
-            // Pick a host port not already in use for this guest port.
-            let host_port = (1024..u32::MAX)
-                .find(|hp| self.find(guest_port, *hp).is_none())
-                .unwrap_or(1024);
+            // A fresh ephemeral host port (never an immediate reuse).
+            let host_port = self.alloc_host_port(guest_port);
             self.conns.push(Conn {
                 guest_port,
                 host_port,
@@ -508,6 +531,21 @@ mod tests {
             VsockDevice::new(3, Box::new(TestBackend { dialed: None, incoming: VecDeque::new() }));
         dev.on_guest_packet(&guest_pkt(40000, 9999, OP_REQUEST, 0, b""));
         assert_eq!(hdr(&dev.rx.pop_front().unwrap()).2, OP_RST);
+    }
+
+    #[test]
+    fn host_ports_are_not_immediately_reused() {
+        let mut dev =
+            VsockDevice::new(3, Box::new(TestBackend { dialed: None, incoming: VecDeque::new() }));
+        // Sequential connections to the same guest port get distinct, advancing
+        // host ports — never a fresh 1024 that collides with one still tearing
+        // down (that was the every-other-connect failure to a fork).
+        let a = dev.alloc_host_port(40000);
+        let b = dev.alloc_host_port(40000);
+        let c = dev.alloc_host_port(40000);
+        assert_eq!(a, EPHEMERAL_BASE);
+        assert_eq!(b, EPHEMERAL_BASE + 1);
+        assert_eq!(c, EPHEMERAL_BASE + 2);
     }
 
     #[test]
