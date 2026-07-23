@@ -1002,4 +1002,19 @@ mod tests {
         assert!(matches!(r, Err(crate::Error::Snapshot(_))), "count mismatch must error");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn restore_succeeds_when_the_full_device_set_matches() {
+        // No false positive: with net + vsock both present and a matching captured
+        // count (rng + net + vsock + balloon = 4), the backstop must NOT fire.
+        let dir = snap_dir("full-set");
+        write_snapshot(&dir, true, true, 4);
+        let sock = std::env::temp_dir().join(format!("amber-vm-{}-vsock.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        let net: Box<dyn crate::net::NetBackend> = Box::new(crate::net::CaptureBackend);
+        let r = Vm::restore_from(&dir, Some(net), Some(sock.clone()));
+        assert!(r.is_ok(), "a matching device set must restore, got {:?}", r.err());
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
