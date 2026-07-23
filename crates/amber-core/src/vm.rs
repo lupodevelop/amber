@@ -680,15 +680,19 @@ fn dispatch_mmio<H: Hypervisor>(
     let ipa = access.ipa;
     if ipa >= pl011_lo && ipa < pl011_hi {
         let off = ipa - pl011_lo;
+        // Hold the guard across the access AND set_irq so level-compute and
+        // level-apply are atomic: otherwise the console reader (pushing RX on
+        // another thread) can interleave and its set_irq override this one with a
+        // stale level, briefly asserting/deasserting the line spuriously.
+        let mut p = pl011.lock().unwrap();
         match access.write {
-            Some(value) => pl011.lock().unwrap().write(off, access.size, value),
+            Some(value) => p.write(off, access.size, value),
             None => {
-                let v = pl011.lock().unwrap().read(off, access.size);
+                let v = p.read(off, access.size);
                 vcpu.complete_mmio_read(v)?;
             }
         }
-        let lvl = pl011.lock().unwrap().irq_level();
-        hv.set_irq(pl011_intid, lvl)?;
+        hv.set_irq(pl011_intid, p.irq_level())?;
     } else {
         // Service the device under the lock, but capture any rate-limit deficit and
         // sleep it off AFTER dropping the guard — sleeping while holding the shared
@@ -869,14 +873,17 @@ fn console_reader<H: Hypervisor>(
         if r <= 0 {
             break; // EOF or error: stop feeding input
         }
+        // Apply the interrupt under the same guard that pushes RX, so this level is
+        // never overridden by a concurrent stale set_irq from the vcpu MMIO path.
         let level = {
             let mut p = pl011.lock().unwrap();
             for b in &buf[..r as usize] {
                 p.push_rx(*b);
             }
-            p.irq_level()
+            let level = p.irq_level();
+            let _ = hv.set_irq(intid, level);
+            level
         };
-        let _ = hv.set_irq(intid, level);
         // Wake the vcpu if it is parked in the idle handler (software-GIC mode,
         // where the line is only sampled between guest entries). With the in-kernel
         // vGIC `set_irq` already wakes it, so the unpark is just a harmless nudge.
@@ -921,7 +928,13 @@ fn control_reader<H: Hypervisor>(
         }
         let mut op = [0u8; 1];
         if unsafe { libc::read(fd, op.as_mut_ptr() as *mut libc::c_void, 1) } != 1 {
-            break; // EOF: amberd closed the channel
+            // EOF on the control channel means amberd is gone. Don't run on as an
+            // orphan holding RAM with no supervisor — stop the vcpu so `run`
+            // unwinds and the process exits (dropping its host-side sockets).
+            running.store(false, Ordering::Relaxed);
+            hv.set_yield(true);
+            hv.kick();
+            break;
         }
         match op[0] {
             crate::control::BALLOON => {

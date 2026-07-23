@@ -294,7 +294,11 @@ impl GicV2 {
             x
         };
         let ncpu = (next() as usize).clamp(1, MAX_CPUS);
-        self.cpus = vec![CpuBank::default(); ncpu];
+        // Never shrink below the configured vcpu count: a blob recording fewer cpus
+        // than this VM has would otherwise leave `cpus` too short, and the first
+        // per-vcpu GIC access on a higher vcpu would index out of bounds and panic.
+        // Read the `ncpu` banks the blob actually holds; any extra stay default.
+        self.cpus = vec![CpuBank::default(); ncpu.max(self.cpus.len())];
         self.dist_enabled = next() != 0;
         for k in 0..ncpu {
             let bank = &mut self.cpus[k];
@@ -691,6 +695,19 @@ mod tests {
     }
     fn enabled_gic() -> GicV2 {
         enabled_gic_n(1)
+    }
+
+    #[test]
+    fn restore_of_a_smaller_blob_does_not_shrink_below_vcpu_count() {
+        // A blob captured from a 1-cpu GIC restored into a 4-cpu GIC must keep 4
+        // banks, or a per-vcpu access on a higher vcpu would index out of bounds.
+        let blob = enabled_gic_n(1).capture();
+        let mut g = GicV2::with_cpus(4);
+        g.restore(&blob);
+        assert!(g.num_cpus() >= 4, "restore shrank the bank set below the vcpu count");
+        // Would panic before the fix (cpus had length 1).
+        g.set_level(3, SPI, true);
+        let _ = g.irq_pending(3);
     }
 
     #[test]
