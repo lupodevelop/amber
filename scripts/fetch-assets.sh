@@ -22,6 +22,26 @@ set -euo pipefail
 
 ALPINE_VER="${ALPINE_VER:-3.22.1}"
 ARCH=aarch64
+# Pinned SHA256 of alpine-minirootfs-<ver>-aarch64.tar.gz (busybox + musl baked
+# into every guest). Bumping ALPINE_VER requires setting MINIROOTFS_SHA256 to the
+# new digest, or the check below fails closed rather than trusting the CDN.
+MINIROOTFS_SHA256="${MINIROOTFS_SHA256:-188416d41f9f0c9a6e9427b75149e43ccf3a89587b2d27c9ad506e7ffca78d1c}"
+
+# Fail unless $1 hashes to $2. Works with sha256sum (Linux) or shasum (macOS).
+verify_sha256() {
+  _want="$2"
+  if command -v sha256sum >/dev/null 2>&1; then
+    _got="$(sha256sum "$1" | cut -d' ' -f1)"
+  else
+    _got="$(shasum -a 256 "$1" | cut -d' ' -f1)"
+  fi
+  [ "$_got" = "$_want" ] || {
+    echo "error: checksum mismatch for $1" >&2
+    echo "  want $_want" >&2
+    echo "  got  $_got" >&2
+    exit 1
+  }
+}
 BRANCH="v${ALPINE_VER%.*}"                # 3.22.1 -> v3.22
 CDN="https://dl-cdn.alpinelinux.org/alpine/${BRANCH}/releases/${ARCH}"
 NETBOOT="${CDN}/netboot-${ALPINE_VER}"
@@ -48,6 +68,7 @@ echo "==> Alpine ${ALPINE_VER} ${ARCH} userland -> ${OUT}/"
 # busybox + musl loader, from the minirootfs tarball.
 echo "  - busybox + musl (minirootfs)"
 curl -fSL --retry 3 "${CDN}/alpine-minirootfs-${ALPINE_VER}-${ARCH}.tar.gz" -o "$tmp/root.tgz"
+verify_sha256 "$tmp/root.tgz" "$MINIROOTFS_SHA256"
 # Extract the whole rootfs (~4 MB), not named members: the tarball stores paths
 # with a leading `./`, which GNU tar (Linux/CI) will not match against `bin/busybox`
 # the way BSD tar (macOS) does. The copies below resolve the paths on either tar.
