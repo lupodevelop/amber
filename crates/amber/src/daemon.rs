@@ -19,7 +19,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::Duration;
 
@@ -39,6 +39,19 @@ struct VmEntry {
     /// Host-side vsock UDS base for this worker, if it has one (all restored
     /// forks do). A host peer connects it and sends `CONNECT <port>\n`.
     vsock: Option<String>,
+}
+
+/// Lock a Mutex, recovering from poison instead of propagating the panic. A
+/// connection thread panicking under the registry lock must not brick the whole
+/// daemon (every later List/Kill/Fork would `unwrap()`-panic on the poison); the
+/// map's own operations are self-contained, so the recovered state is usable.
+trait LockRecover<T> {
+    fn locked(&self) -> MutexGuard<'_, T>;
+}
+impl<T> LockRecover<T> for Mutex<T> {
+    fn locked(&self) -> MutexGuard<'_, T> {
+        self.lock().unwrap_or_else(|e| e.into_inner())
+    }
 }
 
 type Registry = Arc<Mutex<HashMap<String, VmEntry>>>;
@@ -145,7 +158,7 @@ fn reserve(
     let requested = vm_ram_bytes(reference);
     let budget = ram_budget();
 
-    let mut g = reg.lock().unwrap();
+    let mut g = reg.locked();
     if let Some(budget) = budget {
         let used: u64 = g.values().map(|e| e.info.ram_bytes).sum();
         if used + requested > budget {
@@ -182,11 +195,11 @@ fn reserve(
 /// reconstructible, so they yield to a real admission under budget pressure.
 fn evict_one_pooled(reg: &Registry, pool: &Pool) -> bool {
     let id = {
-        let mut p = pool.lock().unwrap();
+        let mut p = pool.locked();
         p.values_mut().find_map(|v| v.pop())
     };
     let Some(id) = id else { return false };
-    let mut g = reg.lock().unwrap();
+    let mut g = reg.locked();
     if let Some(e) = g.remove(&id) {
         e.kill.store(true, Ordering::Relaxed); // the supervisor reaps the process
     }
@@ -217,7 +230,7 @@ fn reserve_with_evict(
 
 /// Record a reserved VM's pid and control channel once its worker has spawned.
 fn set_runtime(reg: &Registry, id: &str, pid: u32, control: UnixStream) {
-    if let Some(e) = reg.lock().unwrap().get_mut(id) {
+    if let Some(e) = reg.locked().get_mut(id) {
         e.info.pid = pid;
         e.control = Some(control);
     }
@@ -290,14 +303,14 @@ fn spawn_paused(
     let (mut ctl_host, ctl_child) = match attach_control(&mut cmd) {
         Ok(p) => p,
         Err(e) => {
-            reg.lock().unwrap().remove(&id);
+            reg.locked().remove(&id);
             return Err(e);
         }
     };
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            reg.lock().unwrap().remove(&id);
+            reg.locked().remove(&id);
             return Err(e);
         }
     };
@@ -310,11 +323,11 @@ fn spawn_paused(
     // This is the warming cost, paid ahead of any fork request.
     let mut ready = [0u8; 1];
     if io::Read::read_exact(&mut ctl_host, &mut ready).is_err() {
-        reg.lock().unwrap().remove(&id);
+        reg.locked().remove(&id);
         let _ = child.kill();
         return Err(io::Error::other("worker failed to warm"));
     }
-    if let Some(e) = reg.lock().unwrap().get_mut(&id) {
+    if let Some(e) = reg.locked().get_mut(&id) {
         e.info.pid = pid;
         e.control = Some(ctl_host);
         e.stdout = cout;
@@ -329,8 +342,8 @@ fn spawn_paused(
     thread::spawn(move || {
         let never = AtomicBool::new(false);
         let _ = supervise(&mut child, &kill, &never);
-        reg2.lock().unwrap().remove(&id2);
-        if let Some(v) = pool2.lock().unwrap().get_mut(&tmpl2) {
+        reg2.locked().remove(&id2);
+        if let Some(v) = pool2.locked().get_mut(&tmpl2) {
             v.retain(|x| x != &id2);
         }
         // SIGKILL skips the guest's Drop, so drop the host-side socket ourselves.
@@ -341,7 +354,7 @@ fn spawn_paused(
 
 /// Release a paused worker by writing the go byte to its control channel.
 fn release(reg: &Registry, id: &str) -> bool {
-    let g = reg.lock().unwrap();
+    let g = reg.locked();
     match g.get(id).and_then(|e| e.control.as_ref()) {
         Some(ctl) => {
             let mut w: &UnixStream = ctl;
@@ -354,7 +367,7 @@ fn release(reg: &Registry, id: &str) -> bool {
 /// Send one control frame to a VM by id and optionally record its paused state.
 /// The reply is an `Ok`, or an error if the VM is unknown / has no channel.
 fn control_op(reg: &Registry, id: &str, frame: &[u8], set_paused: Option<bool>) -> Reply {
-    let mut g = reg.lock().unwrap();
+    let mut g = reg.locked();
     let Some(e) = g.get_mut(id) else {
         return Reply::Error { message: format!("no such vm: {id}") };
     };
@@ -385,7 +398,7 @@ fn handle_fork(
     interactive: bool,
 ) -> io::Result<()> {
     // Take a pre-warmed worker if the pool has one; otherwise stage one now.
-    let pooled = pool.lock().unwrap().get_mut(&template).and_then(|v| v.pop());
+    let pooled = pool.locked().get_mut(&template).and_then(|v| v.pop());
     let id = match pooled {
         Some(id) => id,
         None => match spawn_paused(&reg, &counter, &pool, &template, None) {
@@ -400,7 +413,7 @@ fn handle_fork(
     // Grab the worker's console pipes before releasing it (paused, so silent until
     // the go byte — nothing is lost) and start the refill so the next fork is warm.
     let (cout, cin, kill) = {
-        let mut g = reg.lock().unwrap();
+        let mut g = reg.locked();
         match g.get_mut(&id) {
             Some(e) => (e.stdout.take(), e.stdin.take(), Some(e.kill.clone())),
             None => (None, None, None),
@@ -425,7 +438,7 @@ fn handle_fork(
                 });
             }
         }
-        let vsock = reg.lock().unwrap().get(&id).and_then(|e| e.vsock.clone());
+        let vsock = reg.locked().get(&id).and_then(|e| e.vsock.clone());
         write_reply(&mut stream, &Reply::Started { id, vsock })
     }
 }
@@ -481,7 +494,7 @@ fn handle_exec(
     };
 
     // Tear the worker down and clean up the sockets.
-    if let Some(flag) = reg.lock().unwrap().get(&id).map(|e| e.kill.clone()) {
+    if let Some(flag) = reg.locked().get(&id).map(|e| e.kill.clone()) {
         flag.store(true, Ordering::Relaxed);
     }
     let _ = std::fs::remove_file(&listen_path);
@@ -625,9 +638,9 @@ fn relay_interactive(
 fn refill_pool(reg: Registry, counter: Arc<AtomicU64>, pool: Pool, template: String) {
     let target = pool_target();
     thread::spawn(move || {
-        while pool.lock().unwrap().get(&template).map_or(0, |v| v.len()) < target {
+        while pool.locked().get(&template).map_or(0, |v| v.len()) < target {
             match spawn_paused(&reg, &counter, &pool, &template, None) {
-                Ok(rid) => pool.lock().unwrap().entry(template.clone()).or_default().push(rid),
+                Ok(rid) => pool.locked().entry(template.clone()).or_default().push(rid),
                 Err(_) => break,
             }
         }
@@ -763,7 +776,7 @@ fn handle(
     match req {
         Request::List => {
             // Snapshot under the lock, then sample RSS (a subprocess) unlocked.
-            let mut vms: Vec<VmInfo> = reg.lock().unwrap().values().map(|e| e.info.clone()).collect();
+            let mut vms: Vec<VmInfo> = reg.locked().values().map(|e| e.info.clone()).collect();
             for v in &mut vms {
                 v.rss_bytes = rss_bytes(v.pid);
             }
@@ -771,7 +784,7 @@ fn handle(
         }
         Request::Budget => {
             let pids: Vec<(u64, u32)> = {
-                let g = reg.lock().unwrap();
+                let g = reg.locked();
                 g.values().map(|e| (e.info.ram_bytes, e.info.pid)).collect()
             };
             let used: u64 = pids.iter().map(|(ram, _)| ram).sum();
@@ -803,7 +816,7 @@ fn handle(
         }
         Request::Kill { id } => {
             // Signal the owner thread; it kills and reaps the child it owns.
-            let found = reg.lock().unwrap().get(&id).map(|e| e.kill.clone());
+            let found = reg.locked().get(&id).map(|e| e.kill.clone());
             match found {
                 Some(flag) => {
                     flag.store(true, Ordering::Relaxed);
@@ -817,7 +830,7 @@ fn handle(
             // Kill every VM before exiting so detached ones aren't orphaned. Skip
             // pid 0 (reserved but not yet spawned): kill(0, …) would signal amberd's
             // whole process group, including amberd itself.
-            for e in reg.lock().unwrap().values() {
+            for e in reg.locked().values() {
                 if e.info.pid != 0 {
                     unsafe { libc::kill(e.info.pid as i32, libc::SIGKILL) };
                 }
@@ -877,14 +890,14 @@ fn start_detached(
     let (ctl_host, ctl_child) = match attach_control(&mut cmd) {
         Ok(p) => p,
         Err(e) => {
-            reg.lock().unwrap().remove(&id);
+            reg.locked().remove(&id);
             return Err(e);
         }
     };
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            reg.lock().unwrap().remove(&id); // release the reservation
+            reg.locked().remove(&id); // release the reservation
             return Err(e);
         }
     };
@@ -897,7 +910,7 @@ fn start_detached(
     thread::spawn(move || {
         let never = AtomicBool::new(false);
         let _ = supervise(&mut child, &kill, &never);
-        reg2.lock().unwrap().remove(&id2);
+        reg2.locked().remove(&id2);
     });
 
     write_reply(&mut stream, &Reply::Started { id, vsock: None })?;
@@ -945,14 +958,14 @@ fn run_one_shot(
     let (ctl_host, ctl_child) = match attach_control(&mut cmd) {
         Ok(p) => p,
         Err(e) => {
-            reg.lock().unwrap().remove(&id);
+            reg.locked().remove(&id);
             return Err(e);
         }
     };
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            reg.lock().unwrap().remove(&id); // release the reservation
+            reg.locked().remove(&id); // release the reservation
             return Err(e);
         }
     };
@@ -1012,7 +1025,7 @@ fn run_one_shot(
     // Supervise: exit on guest shutdown, or kill the child if asked (rm) or if the
     // client disconnected.
     let code = supervise(&mut child, &kill, &client_gone);
-    reg.lock().unwrap().remove(&id);
+    reg.locked().remove(&id);
 
     // Tell the client, then close the socket so the relay threads unblock and join.
     let _ = write_reply(&mut stream, &Reply::Exit { code });
@@ -1325,11 +1338,11 @@ mod tests {
         let pool: Pool = Arc::new(Mutex::new(HashMap::new()));
         let e = fake_entry("vm1");
         let kill = e.kill.clone();
-        reg.lock().unwrap().insert("vm1".to_string(), e);
-        pool.lock().unwrap().insert("tmpl".to_string(), vec!["vm1".to_string()]);
+        reg.locked().insert("vm1".to_string(), e);
+        pool.locked().insert("tmpl".to_string(), vec!["vm1".to_string()]);
 
         assert!(evict_one_pooled(&reg, &pool));
-        assert!(!reg.lock().unwrap().contains_key("vm1"));
+        assert!(!reg.locked().contains_key("vm1"));
         assert!(kill.load(Ordering::Relaxed), "supervisor must be told to reap");
     }
 
@@ -1341,9 +1354,29 @@ mod tests {
     }
 
     #[test]
+    fn poisoned_registry_still_serves() {
+        // M3: a thread panicking under the registry lock poisons the Mutex. The
+        // daemon must keep managing VMs instead of every later op panicking.
+        let reg: Registry = Arc::new(Mutex::new(HashMap::new()));
+        reg.locked().insert("vm1".to_string(), fake_entry("vm1"));
+
+        let r2 = reg.clone();
+        let _ = std::thread::spawn(move || {
+            let _g = r2.lock().unwrap();
+            panic!("boom while holding the registry lock");
+        })
+        .join();
+
+        assert!(reg.lock().is_err(), "mutex should be poisoned by the panic");
+        // The recovering accessor still works and preserves prior state.
+        assert!(reg.locked().contains_key("vm1"));
+        assert!(!release(&reg, "vm1")); // still callable, no panic
+    }
+
+    #[test]
     fn release_is_false_without_a_control_channel() {
         let reg: Registry = Arc::new(Mutex::new(HashMap::new()));
-        reg.lock().unwrap().insert("vm1".to_string(), fake_entry("vm1"));
+        reg.locked().insert("vm1".to_string(), fake_entry("vm1"));
         assert!(!release(&reg, "vm1")); // control is None
         assert!(!release(&reg, "missing"));
     }

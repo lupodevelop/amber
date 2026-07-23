@@ -19,13 +19,22 @@ use tar::EntryType;
 const WH_PREFIX: &str = ".wh.";
 const WH_OPAQUE: &str = ".wh..wh..opq";
 
+/// Ceiling on total decompressed bytes written across all layers. A gzip layer
+/// expands ~1000x, so without this a small malicious image fills the host disk.
+const MAX_TOTAL_BYTES: u64 = 8 << 30; // 8 GiB
+
 pub fn flatten(layers: &[PathBuf], dest: &Path) -> Result<()> {
+    flatten_limited(layers, dest, MAX_TOTAL_BYTES)
+}
+
+fn flatten_limited(layers: &[PathBuf], dest: &Path, max_total: u64) -> Result<()> {
     if dest.exists() {
         fs::remove_dir_all(dest)?;
     }
     fs::create_dir_all(dest)?;
     // Canonical root for the symlink-containment check below.
     let root = dest.canonicalize()?;
+    let mut written: u64 = 0;
 
     for layer in layers {
         // Registry layers are gzipped; a local `docker save` tar is plain tar.
@@ -75,7 +84,7 @@ pub fn flatten(layers: &[PathBuf], dest: &Path) -> Result<()> {
                 log::debug!("skip {} (parent escapes rootfs)", out.display());
                 continue;
             }
-            extract(&mut entry, &out)?;
+            written += extract(&mut entry, &out, &root, max_total - written)?;
         }
     }
     Ok(())
@@ -96,7 +105,14 @@ fn within_root(root: &Path, out: &Path) -> bool {
     false
 }
 
-fn extract<R: io::Read>(entry: &mut tar::Entry<R>, out: &Path) -> Result<()> {
+/// Extract one entry. `root` is the canonical rootfs root; `budget` is the
+/// remaining decompressed-byte allowance. Returns bytes written to disk.
+fn extract<R: io::Read>(
+    entry: &mut tar::Entry<R>,
+    out: &Path,
+    root: &Path,
+    budget: u64,
+) -> Result<u64> {
     let kind = entry.header().entry_type();
     let mode = entry.header().mode().unwrap_or(0o644);
 
@@ -111,8 +127,13 @@ fn extract<R: io::Read>(entry: &mut tar::Entry<R>, out: &Path) -> Result<()> {
             }
             remove_any(out)?;
             let mut f = fs::File::create(out)?;
-            io::copy(entry, &mut f)?;
+            // Copy at most budget+1 bytes; more means we've blown the ceiling.
+            let n = io::copy(&mut entry.take(budget.saturating_add(1)), &mut f)?;
+            if n > budget {
+                return Err(crate::Error::Pack("image exceeds size limit".into()));
+            }
             let _ = fs::set_permissions(out, fs::Permissions::from_mode(mode));
+            return Ok(n);
         }
         EntryType::Symlink => {
             if let Some(target) = entry.link_name()? {
@@ -126,8 +147,15 @@ fn extract<R: io::Read>(entry: &mut tar::Entry<R>, out: &Path) -> Result<()> {
         EntryType::Link => {
             // Hard link: target is relative to the rootfs root (out's ancestor).
             if let Some(target) = entry.link_name()? {
-                if let Some(root) = rootfs_root(out, entry.path()?.as_ref()) {
-                    let src = root.join(sanitize(&target).unwrap_or_default());
+                if let Some(link_root) = rootfs_root(out, entry.path()?.as_ref()) {
+                    let src = link_root.join(sanitize(&target).unwrap_or_default());
+                    // hard_link/copy follow symlinks in `src`'s path components, so
+                    // a hardlink through an in-image symlink could pull in a host
+                    // file. Require the resolved source to stay inside the rootfs.
+                    if !within_root(root, &src) {
+                        log::debug!("skip hardlink {} (source escapes rootfs)", out.display());
+                        return Ok(0);
+                    }
                     if let Some(parent) = out.parent() {
                         fs::create_dir_all(parent)?;
                     }
@@ -143,7 +171,7 @@ fn extract<R: io::Read>(entry: &mut tar::Entry<R>, out: &Path) -> Result<()> {
         // provides /dev. Skip rather than require root.
         _ => log::debug!("skip {:?} entry {}", kind, out.display()),
     }
-    Ok(())
+    Ok(0)
 }
 
 /// Reject absolute paths and any `..` escape; strip leading `./`. Returns a path
@@ -243,6 +271,57 @@ mod tests {
 
         assert!(!outside.join("pwned").exists(), "traversal wrote outside the rootfs");
         let _ = fs::remove_dir_all(&outside);
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn hardlink_source_escape_is_blocked() {
+        // H1: a hardlink whose target resolves through an in-image symlink to a
+        // host path must NOT link/copy the host file into the rootfs.
+        let outside = tmp("outside-3");
+        let dest = tmp("dest-3");
+        let layer = tmp("layer-3.tar.gz");
+        let _ = fs::remove_dir_all(&outside);
+        let _ = fs::remove_dir_all(&dest);
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("secret"), b"TOPSECRET").unwrap();
+
+        write_layer(&layer, |b| {
+            // esc -> <outside> (absolute symlink, legitimate to create)
+            let mut h = Header::new_gnu();
+            h.set_entry_type(EntryType::Symlink);
+            h.set_mode(0o777);
+            h.set_size(0);
+            b.append_link(&mut h, "esc", &outside).unwrap();
+            // hardlink loot -> esc/secret (target relative to rootfs root)
+            let mut hl = Header::new_gnu();
+            hl.set_entry_type(EntryType::Link);
+            hl.set_mode(0o644);
+            hl.set_size(0);
+            b.append_link(&mut hl, "loot", "esc/secret").unwrap();
+        });
+
+        flatten(&[layer], &dest).unwrap();
+
+        let leaked = fs::read(dest.join("loot")).map(|d| d == b"TOPSECRET").unwrap_or(false);
+        assert!(!leaked, "hardlink escaped rootfs and leaked host file");
+        let _ = fs::remove_dir_all(&outside);
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn oversized_extraction_is_rejected() {
+        // H2: cumulative extracted bytes past the cap must fail closed.
+        let dest = tmp("dest-4");
+        let layer = tmp("layer-4.tar.gz");
+        let _ = fs::remove_dir_all(&dest);
+        write_layer(&layer, |b| {
+            reg(b, "a", &vec![0u8; 1024]);
+            reg(b, "b", &vec![0u8; 1024]);
+        });
+
+        let r = flatten_limited(std::slice::from_ref(&layer), &dest, 1024);
+        assert!(r.is_err(), "extraction over cap should fail");
         let _ = fs::remove_dir_all(&dest);
     }
 

@@ -56,17 +56,28 @@ impl TokenBucket {
         }
     }
 
-    /// Take `bytes`, sleeping off any deficit first. The caller is the vcpu
-    /// thread inside a device notify, so the guest simply sees a slower device.
-    pub fn throttle(&mut self, bytes: u64) {
+    /// Take `bytes` and return how long the caller must wait to clear the deficit
+    /// (None if the bucket covered it). Does NOT sleep — the caller sleeps once it
+    /// has released any locks it holds. `last` is advanced to when the debt clears
+    /// so a later refill doesn't double-credit the wait.
+    pub fn debit(&mut self, bytes: u64) -> Option<Duration> {
         self.refill();
         self.tokens -= bytes as f64;
         if self.tokens < 0.0 {
-            std::thread::sleep(Duration::from_secs_f64(-self.tokens / self.rate));
-            // The slept-off debt is exactly the refill over the sleep; settle to 0
-            // rather than re-running refill and double-counting.
+            let wait = Duration::from_secs_f64(-self.tokens / self.rate);
             self.tokens = 0.0;
-            self.last = Instant::now();
+            self.last = Instant::now() + wait;
+            Some(wait)
+        } else {
+            None
+        }
+    }
+
+    /// Take `bytes`, sleeping off any deficit first. The caller is the vcpu
+    /// thread inside a device notify, so the guest simply sees a slower device.
+    pub fn throttle(&mut self, bytes: u64) {
+        if let Some(wait) = self.debit(bytes) {
+            std::thread::sleep(wait);
         }
     }
 }
@@ -82,6 +93,20 @@ mod tests {
         assert!(!b.try_take(10 * 1024)); // empty now
         std::thread::sleep(Duration::from_millis(120));
         assert!(b.try_take(4 * 1024)); // ~12 KiB refilled
+    }
+
+    #[test]
+    fn debit_returns_wait_without_sleeping() {
+        // M1: debit must report the deficit as a Duration and return immediately,
+        // so the caller can sleep after releasing its locks.
+        let mut b = TokenBucket::new(1000); // 1000 B/s, starts full
+        let t0 = Instant::now();
+        let wait = b.debit(3000); // 1000 on hand, 2000 short -> ~2 s wait
+        assert!(t0.elapsed() < Duration::from_millis(100), "debit slept: {:?}", t0.elapsed());
+        assert!(wait.expect("a deficit") >= Duration::from_secs(1));
+        // A within-budget debit reports no wait.
+        let mut b = TokenBucket::new(10_000);
+        assert!(b.debit(100).is_none());
     }
 
     #[test]

@@ -679,21 +679,39 @@ fn dispatch_mmio<H: Hypervisor>(
         }
         let lvl = pl011.lock().unwrap().irq_level();
         hv.set_irq(pl011_intid, lvl)?;
-    } else if let Some(d) = virtio.lock().unwrap().iter_mut().find(|d| d.contains(ipa)) {
-        let off = ipa - d.base;
-        match access.write {
-            Some(value) => d.mmio.write(off, access.size, value),
-            None => {
-                let v = d.mmio.read(off, access.size);
-                vcpu.complete_mmio_read(v)?;
-            }
-        }
-        hv.set_irq(d.intid, d.mmio.irq_level())?;
     } else {
-        // Unbacked MMIO: no device at this address. Reads return 0, writes drop.
-        match access.write {
-            Some(value) => log::trace!("mmio write {value:#x} to unbacked {ipa:#x}"),
-            None => vcpu.complete_mmio_read(0)?,
+        // Service the device under the lock, but capture any rate-limit deficit and
+        // sleep it off AFTER dropping the guard — sleeping while holding the shared
+        // virtio lock would freeze every other vcpu, the rx pump, and all devices.
+        let mut throttle = None;
+        let handled = {
+            let mut devs = virtio.lock().unwrap();
+            if let Some(d) = devs.iter_mut().find(|d| d.contains(ipa)) {
+                let off = ipa - d.base;
+                match access.write {
+                    Some(value) => d.mmio.write(off, access.size, value),
+                    None => {
+                        let v = d.mmio.read(off, access.size);
+                        vcpu.complete_mmio_read(v)?;
+                    }
+                }
+                hv.set_irq(d.intid, d.mmio.irq_level())?;
+                throttle = d.mmio.take_throttle();
+                true
+            } else {
+                false
+            }
+        };
+        if handled {
+            if let Some(wait) = throttle {
+                std::thread::sleep(wait);
+            }
+        } else {
+            // Unbacked MMIO: no device at this address. Reads return 0, writes drop.
+            match access.write {
+                Some(value) => log::trace!("mmio write {value:#x} to unbacked {ipa:#x}"),
+                None => vcpu.complete_mmio_read(0)?,
+            }
         }
     }
     vcpu.advance_mmio()

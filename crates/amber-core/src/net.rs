@@ -75,6 +75,10 @@ pub struct NetDevice {
     rx_limit: Option<crate::limiter::TokenBucket>,
     /// A received frame the rate cap deferred; retried on the next rx pump.
     pending_rx: Option<Vec<u8>>,
+    /// Transmit rate debt the run loop must sleep off — set in `handle`, drained
+    /// by `take_throttle` so the vcpu sleeps AFTER releasing the shared virtio
+    /// lock, not while holding it (which would freeze every other device).
+    tx_debt: Option<std::time::Duration>,
 }
 
 impl NetDevice {
@@ -92,6 +96,7 @@ impl NetDevice {
             tx_limit: crate::limiter::TokenBucket::from_env("AMBER_NET_BPS"),
             rx_limit: crate::limiter::TokenBucket::from_env("AMBER_NET_BPS"),
             pending_rx: None,
+            tx_debt: None,
         }
     }
 }
@@ -145,13 +150,17 @@ impl VirtioDevice for NetDevice {
             }
             if frame.len() > VIRTIO_NET_HDR_LEN {
                 if let Some(l) = &mut self.tx_limit {
-                    l.throttle((frame.len() - VIRTIO_NET_HDR_LEN) as u64);
+                    // Record the deficit; the run loop sleeps it off off-lock.
+                    self.tx_debt = l.debit((frame.len() - VIRTIO_NET_HDR_LEN) as u64);
                 }
                 self.backend.send(&frame[VIRTIO_NET_HDR_LEN..]);
             }
         }
         // tx consumes the buffer with no bytes written back; rx is pumped elsewhere.
         0
+    }
+    fn take_throttle(&mut self) -> Option<std::time::Duration> {
+        self.tx_debt.take()
     }
     fn poll_rx(&mut self, _max_frame: usize) -> Option<Vec<u8>> {
         // Ethernet frames are whole and fit any posted rx buffer, so `max_frame`
@@ -223,6 +232,35 @@ mod tests {
     }
 
     #[test]
+    fn tx_throttle_is_deferred_not_slept() {
+        // M1: a rate-limited tx notify must NOT sleep inside `handle` (it runs
+        // under the shared virtio lock). It records the deficit for the run loop
+        // to sleep off after releasing the lock.
+        let be = RecBackend::default();
+        let mut dev = NetDevice {
+            backend: Box::new(be),
+            mac: [0u8; 6],
+            tx_limit: Some(crate::limiter::TokenBucket::new(1000)), // 1000 B/s
+            rx_limit: None,
+            pending_rx: None,
+            tx_debt: None,
+        };
+        let m = ram(0x2000);
+        let r = m.ram();
+        let n = VIRTIO_NET_HDR_LEN + 2000; // 2000 payload bytes, 2x the per-sec budget
+        r.write(DATA, &vec![0u8; n]);
+        let bufs = vec![Buf { addr: DATA, len: n as u32, writable: false }];
+
+        let t0 = std::time::Instant::now();
+        dev.handle(NetDevice::TX, &r, &bufs);
+        let elapsed = t0.elapsed();
+
+        assert!(elapsed < std::time::Duration::from_millis(200), "handle slept: {elapsed:?}");
+        assert!(dev.take_throttle().is_some(), "deficit not recorded");
+        assert!(dev.take_throttle().is_none(), "deficit must drain on take");
+    }
+
+    #[test]
     fn tx_header_only_frame_is_dropped() {
         let be = RecBackend::default();
         let sent = be.sent.clone();
@@ -287,10 +325,11 @@ mod tests {
         let r = m.ram();
         let len = VIRTIO_NET_HDR_LEN as u32 + 2048; // 2 KiB payload ≈ 100 ms debt
         let bufs = vec![Buf { addr: DATA, len, writable: false }];
-        let t0 = std::time::Instant::now();
         dev.handle(NetDevice::TX, &r, &bufs);
-        assert!(t0.elapsed() >= std::time::Duration::from_millis(60));
-        assert_eq!(sent.lock().unwrap().len(), 1); // throttled, not dropped
+        // Backpressure surfaces as a deferred debt (the run loop sleeps it off
+        // off-lock), and the frame is throttled, not dropped.
+        assert!(dev.take_throttle().expect("a debt") >= std::time::Duration::from_millis(60));
+        assert_eq!(sent.lock().unwrap().len(), 1);
     }
 
     #[test]
