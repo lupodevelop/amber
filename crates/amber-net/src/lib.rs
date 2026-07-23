@@ -45,6 +45,25 @@ mod smoltcp_backend {
     const MAX_FLOWS: usize = 256;
     const MAX_PENDING_DNS: usize = 256;
 
+    /// Whether the guest is forbidden from dialing `ip`. Loopback, link-local
+    /// (cloud metadata), and the unspecified/broadcast/documentation ranges are
+    /// always refused; private/LAN ranges are refused unless the operator opts in
+    /// with AMBER_NET_ALLOW_PRIVATE=1.
+    fn egress_blocked(ip: Ipv4Addr) -> bool {
+        if ip.is_loopback()
+            || ip.is_link_local()
+            || ip.is_broadcast()
+            || ip.is_unspecified()
+            || ip.is_documentation()
+        {
+            return true;
+        }
+        if ip.is_private() {
+            return std::env::var("AMBER_NET_ALLOW_PRIVATE").as_deref() != Ok("1");
+        }
+        false
+    }
+
     type Frames = Arc<Mutex<VecDeque<Vec<u8>>>>;
 
     struct Bridge {
@@ -376,6 +395,14 @@ mod smoltcp_backend {
                 log::warn!("net: flow cap ({MAX_FLOWS}) reached, dropping SYN to {dst}:{dport}");
                 return;
             }
+            // Egress policy: a sandboxed guest must not be able to dial the host's
+            // own services or internal network. Block loopback / link-local (cloud
+            // metadata at 169.254.169.254) / private ranges by default; private is
+            // opt-in via AMBER_NET_ALLOW_PRIVATE=1 for users who want LAN access.
+            if egress_blocked(dst) {
+                log::warn!("net: blocked egress to {dst}:{dport}");
+                return;
+            }
             // Connect on a thread so the vcpu is never blocked; the stream arrives
             // over the channel and the flow starts forwarding once it lands.
             let (tx, rx) = std::sync::mpsc::channel();
@@ -505,6 +532,20 @@ mod smoltcp_backend {
         use super::*;
         use smoltcp::phy::ChecksumCapabilities;
         use smoltcp::wire::{Ipv4Repr, TcpControl, TcpRepr, TcpSeqNumber};
+
+        #[test]
+        fn egress_policy_blocks_host_and_internal_targets() {
+            // Always refused: no legitimate sandbox egress to these.
+            assert!(egress_blocked(Ipv4Addr::new(127, 0, 0, 1)), "loopback");
+            assert!(egress_blocked(Ipv4Addr::new(169, 254, 169, 254)), "cloud metadata");
+            assert!(egress_blocked(Ipv4Addr::new(0, 0, 0, 0)), "unspecified");
+            // Private/LAN refused by default (AMBER_NET_ALLOW_PRIVATE unset here).
+            assert!(egress_blocked(Ipv4Addr::new(192, 168, 1, 10)), "private lan");
+            assert!(egress_blocked(Ipv4Addr::new(10, 0, 0, 1)), "nat gateway");
+            // Public internet is allowed.
+            assert!(!egress_blocked(Ipv4Addr::new(8, 8, 8, 8)), "public dns");
+            assert!(!egress_blocked(Ipv4Addr::new(93, 184, 216, 34)), "public host");
+        }
 
         /// Build an Ethernet/IPv4/TCP frame with correct checksums.
         fn build(src: Ipv4Address, dst: Ipv4Address, sport: u16, dport: u16, ctrl: TcpControl) -> Vec<u8> {

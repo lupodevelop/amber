@@ -135,6 +135,11 @@ impl Client {
     fn authenticate(&mut self, challenge: &str) -> Result<()> {
         let realm = challenge_field(challenge, "realm")
             .ok_or_else(|| Error::Registry(format!("no realm in challenge: {challenge}")))?;
+        // The realm comes from an untrusted (or MITM'd) registry's WWW-Authenticate
+        // header and is about to become a host-side request URL. Validate it, or a
+        // hostile registry could point the token GET at http://169.254.169.254/...
+        // or a loopback/LAN service (SSRF).
+        validate_realm(&realm)?;
         let service = challenge_field(challenge, "service").unwrap_or_default();
         let scope = format!("repository:{}:pull", self.repository);
 
@@ -296,9 +301,54 @@ fn challenge_field(challenge: &str, key: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
+/// Reject a token realm that isn't https or that targets an internal address, so a
+/// hostile registry can't turn the auth flow into a host-side SSRF or a cleartext
+/// downgrade.
+fn validate_realm(realm: &str) -> Result<()> {
+    let rest = realm
+        .strip_prefix("https://")
+        .ok_or_else(|| Error::Registry(format!("token realm must be https: {realm}")))?;
+    // Authority up to the path/query, minus any userinfo.
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let hostport = authority.rsplit('@').next().unwrap_or(authority);
+    // Host, handling a bracketed IPv6 literal and an optional :port.
+    let host = if let Some(h) = hostport.strip_prefix('[') {
+        h.split(']').next().unwrap_or(h)
+    } else {
+        hostport.split(':').next().unwrap_or(hostport)
+    };
+    let internal = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::Ipv4Addr>()
+            .map(|ip| ip.is_loopback() || ip.is_link_local() || ip.is_private() || ip.is_unspecified())
+            .unwrap_or(false)
+        || host
+            .parse::<std::net::Ipv6Addr>()
+            .map(|ip| ip.is_loopback() || ip.is_unspecified())
+            .unwrap_or(false);
+    if internal {
+        return Err(Error::Registry(format!("token realm points at an internal address: {realm}")));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn realm_validation_rejects_ssrf_and_cleartext() {
+        assert!(validate_realm("https://auth.docker.io/token").is_ok());
+        assert!(validate_realm("https://ghcr.io/token").is_ok());
+        // cleartext downgrade
+        assert!(validate_realm("http://auth.docker.io/token").is_err());
+        // internal / metadata targets
+        assert!(validate_realm("https://169.254.169.254/latest/meta-data").is_err());
+        assert!(validate_realm("https://127.0.0.1/token").is_err());
+        assert!(validate_realm("https://localhost:8080/token").is_err());
+        assert!(validate_realm("https://10.0.0.5/token").is_err());
+        assert!(validate_realm("https://[::1]/token").is_err());
+    }
 
     #[test]
     fn docker_official_image_gets_library_prefix_and_latest() {
