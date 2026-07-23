@@ -36,6 +36,20 @@ echo "amber: downloading $asset from $repo" >&2
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 curl -fSL --retry 3 "$url" -o "$tmp/$asset"
+
+# Integrity: verify the bundle against SHA256SUMS from the same release before we
+# unpack and run it. (Provenance is also attested — verify out of band with
+# `gh attestation verify $tmp/$asset --repo $repo`.)
+curl -fSL --retry 3 "${url%/*}/SHA256SUMS" -o "$tmp/SHA256SUMS"
+want="$(grep " $asset\$" "$tmp/SHA256SUMS" | cut -d' ' -f1)"
+[ -n "$want" ] || { echo "amber: $asset not listed in SHA256SUMS" >&2; exit 1; }
+if command -v sha256sum >/dev/null 2>&1; then
+  got="$(sha256sum "$tmp/$asset" | cut -d' ' -f1)"
+else
+  got="$(shasum -a 256 "$tmp/$asset" | cut -d' ' -f1)"
+fi
+[ "$got" = "$want" ] || { echo "amber: checksum mismatch (want $want, got $got)" >&2; exit 1; }
+
 tar -C "$tmp" -xzf "$tmp/$asset"
 [ -x "$tmp/amber/amber" ] || { echo "amber: bad bundle (no binary inside)" >&2; exit 1; }
 

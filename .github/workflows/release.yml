@@ -13,6 +13,8 @@ on:
 
 permissions:
   contents: write
+  id-token: write      # keyless signing for build provenance
+  attestations: write  # publish the provenance attestation
 
 jobs:
   assets:
@@ -69,7 +71,15 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with: { pattern: amber-*, merge-multiple: true, path: dist/ }
+      - name: checksums
+        run: cd dist && sha256sum amber-*.tar.gz | tee SHA256SUMS
+      - name: build provenance (verify later with `gh attestation verify`)
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/amber-*.tar.gz
       - uses: softprops/action-gh-release@v2
         with:
-          files: dist/amber-*.tar.gz
+          files: |
+            dist/amber-*.tar.gz
+            dist/SHA256SUMS
           generate_release_notes: true

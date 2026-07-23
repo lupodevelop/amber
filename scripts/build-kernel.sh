@@ -17,6 +17,9 @@ set -euo pipefail
 
 KVER="${KVER:-6.12.93}"
 KMAJ="${KVER%%.*}"
+# Pinned SHA256 of linux-<KVER>.tar.xz (kernel.org). Bumping KVER requires setting
+# KSHA256 to the new digest, else the in-container check fails closed.
+KSHA256="${KSHA256:-492648a87c0b69c5ac7f43be64792b9000e3439550d4e82e4a14710c49094fa3}"
 OUT="${OUT:-assets/Image}"
 JOBS="${JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -45,7 +48,10 @@ docker run --rm -v "$ROOT:/work" -v "$CACHE:/cache" -w /work debian:bookworm bas
   if [ ! -f "$tarball" ]; then
     url="https://cdn.kernel.org/pub/linux/kernel/v'"$KMAJ"'.x/linux-'"$KVER"'.tar.xz"
     echo "--> fetch $url"
-    curl -fSL --retry 3 "$url" -o "$tarball.tmp" && mv "$tarball.tmp" "$tarball"
+    curl -fSL --retry 3 "$url" -o "$tarball.tmp"
+    echo "'"$KSHA256"'  $tarball.tmp" | sha256sum -c - || {
+      echo "error: kernel source checksum mismatch" >&2; rm -f "$tarball.tmp"; exit 1; }
+    mv "$tarball.tmp" "$tarball"
   else
     echo "--> using cached source $(basename "$tarball")"
   fi
