@@ -223,32 +223,42 @@ impl Vm {
         }
         let i = virtio.len();
         virtio.push(VirtioDev::new(i, Box::new(RngDevice::open()?)));
+        // `run` applies the captured virtio queue state positionally (zip below),
+        // so a device the snapshot had but we skip here would shift every later
+        // device's state onto the wrong device. Recreate exactly, or fail closed.
         if loaded.meta.net {
-            if let Some(backend) = net {
-                let i = virtio.len();
-                virtio.push(VirtioDev::new(i, Box::new(crate::net::NetDevice::new(backend))));
-            }
+            let backend = net.ok_or_else(|| {
+                crate::Error::Snapshot("snapshot has a net device but no backend was provided".into())
+            })?;
+            let i = virtio.len();
+            virtio.push(VirtioDev::new(i, Box::new(crate::net::NetDevice::new(backend))));
         }
         // vsock sits after net and before balloon, matching prepare()'s order so
         // the restored virtio queues line up. A fresh UDS backend; the guest's
         // driver state is in restored RAM, and the agent dials only post-restore.
         if loaded.meta.vsock {
-            if let Some(path) = vsock {
-                match crate::vsock::UdsBackend::new(path.clone()) {
-                    Some(b) => {
-                        let i = virtio.len();
-                        virtio.push(VirtioDev::new(
-                            i,
-                            Box::new(crate::vsock::VsockDevice::new(3, Box::new(b))),
-                        ));
-                    }
-                    None => log::warn!("vsock: cannot bind {} on restore", path.display()),
-                }
-            } else {
-                log::warn!("snapshot has a vsock device but no AMBER_VSOCK given; device set will mismatch");
-            }
+            let path = vsock.ok_or_else(|| {
+                crate::Error::Snapshot(
+                    "snapshot has a vsock device but no AMBER_VSOCK path was given".into(),
+                )
+            })?;
+            let b = crate::vsock::UdsBackend::new(path.clone()).ok_or_else(|| {
+                crate::Error::Snapshot(format!("vsock: cannot bind {} on restore", path.display()))
+            })?;
+            let i = virtio.len();
+            virtio.push(VirtioDev::new(i, Box::new(crate::vsock::VsockDevice::new(3, Box::new(b)))));
         }
         let balloon = push_balloon(&mut virtio);
+
+        // Backstop: the recreated device set must match the snapshot's exactly, or
+        // the positional restore in `run` would corrupt device state.
+        if virtio.len() != loaded.dev.virtio.len() {
+            return Err(crate::Error::Snapshot(format!(
+                "device-set mismatch on restore: rebuilt {} virtio devices, snapshot captured {}",
+                virtio.len(),
+                loaded.dev.virtio.len()
+            )));
+        }
 
         Ok(Self {
             mem,
@@ -942,5 +952,69 @@ fn control_reader<H: Hypervisor>(
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::snapshot::{self, CpuSnapshot, DevState, VirtioDevState};
+
+    fn snap_dir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("amber-vm-{}-{}", std::process::id(), name));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    /// Write a minimal restorable snapshot with the given device flags and captured
+    /// virtio device count.
+    fn write_snapshot(dir: &std::path::Path, net: bool, vsock: bool, virtio_count: usize) {
+        let mem = GuestMemory::new(0x4000_0000, 0x1000).unwrap();
+        let cpu = CpuSnapshot::default();
+        let dev = DevState {
+            pl011: vec![],
+            virtio: (0..virtio_count).map(|_| VirtioDevState::default()).collect(),
+        };
+        snapshot::write(dir, &mem, std::slice::from_ref(&cpu), &[], None, None, &dev, net, vsock)
+            .unwrap();
+    }
+
+    #[test]
+    fn restore_errors_when_a_snapshot_device_has_no_backend() {
+        // M2: a snapshot that had a vsock device must not restore without one —
+        // silently omitting it shifts every later device's queue state (zip in
+        // `run`) onto the wrong device.
+        let dir = snap_dir("vsock-missing");
+        write_snapshot(&dir, false, true, 3);
+        let r = Vm::restore_from(&dir, None, None);
+        assert!(matches!(r, Err(crate::Error::Snapshot(_))), "restore should fail closed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_errors_on_device_count_mismatch() {
+        // Backstop: even with no conditional devices, a snapshot whose captured
+        // count doesn't match the rebuilt set (format drift) must fail, not zip-
+        // truncate. Rebuilt here is rng + balloon = 2; claim 4.
+        let dir = snap_dir("count-drift");
+        write_snapshot(&dir, false, false, 4);
+        let r = Vm::restore_from(&dir, None, None);
+        assert!(matches!(r, Err(crate::Error::Snapshot(_))), "count mismatch must error");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_succeeds_when_the_full_device_set_matches() {
+        // No false positive: with net + vsock both present and a matching captured
+        // count (rng + net + vsock + balloon = 4), the backstop must NOT fire.
+        let dir = snap_dir("full-set");
+        write_snapshot(&dir, true, true, 4);
+        let sock = std::env::temp_dir().join(format!("amber-vm-{}-vsock.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        let net: Box<dyn crate::net::NetBackend> = Box::new(crate::net::CaptureBackend);
+        let r = Vm::restore_from(&dir, Some(net), Some(sock.clone()));
+        assert!(r.is_ok(), "a matching device set must restore, got {:?}", r.err());
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
