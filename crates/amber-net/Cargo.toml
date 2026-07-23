@@ -11,7 +11,7 @@ repository.workspace = true
 [dependencies]
 amber-core.workspace = true
 log.workspace = true
-smoltcp = { version = "0.12", default-features = false, features = [
+smoltcp = { version = "0.13", default-features = false, features = [
     "std",
     "medium-ethernet",
     "proto-ipv4",
