@@ -33,6 +33,11 @@ const OP_CREDIT_REQUEST: u16 = 7;
 /// Our advertised receive window per connection. The guest may have this many
 /// bytes in flight to us before it must wait for a credit update.
 const BUF_ALLOC: u32 = 256 * 1024;
+/// Largest guest→host packet we reassemble. A well-behaved packet carries at most
+/// our advertised window of payload; a chain claiming more (e.g. 256 × 16 MiB
+/// descriptors) is a hostile attempt to make the host allocate gigabytes, so we
+/// drop it rather than reassemble.
+const MAX_PACKET: usize = HDR_LEN + BUF_ALLOC as usize;
 /// A nominal RW payload cap used by tests. At run time the payload is instead
 /// sized to the guest's actual posted rx buffer (see `poll_rx`/`pump`), which on
 /// Linux is under a page once skb overhead is accounted for.
@@ -256,7 +261,17 @@ impl VsockDevice {
             }
             OP_RW => {
                 if let Some(i) = self.find(gp, hp) {
-                    self.conns[i].to_host.extend(payload);
+                    // The guest agreed to keep at most BUF_ALLOC bytes in flight to
+                    // us (our advertised window). If it floods past that, the host
+                    // UDS can't drain fast enough and `to_host` grows unbounded, so
+                    // reset the connection rather than buffer without limit.
+                    if self.conns[i].to_host.len() + payload.len() > BUF_ALLOC as usize {
+                        self.conns[i].up = false;
+                        self.conns[i].host_done = true;
+                        self.send(gp, hp, OP_RST, 0, &[]);
+                    } else {
+                        self.conns[i].to_host.extend(payload);
+                    }
                 }
             }
             OP_CREDIT_REQUEST => {
@@ -435,7 +450,14 @@ impl VirtioDevice for VsockDevice {
     /// descriptors. Reassemble and process it. The event queue (2) is ignored.
     fn handle(&mut self, queue: usize, ram: &GuestRam, bufs: &[Buf]) -> u32 {
         if queue == Self::TX {
-            let mut pkt = Vec::new();
+            // Bound the host allocation: sum the readable lengths first and drop a
+            // packet that claims more than our window (guest is misbehaving).
+            let total: usize = bufs.iter().filter(|b| !b.writable).map(|b| b.len as usize).sum();
+            if total > MAX_PACKET {
+                log::debug!("vsock: dropping oversized tx packet ({total} bytes)");
+                return 0;
+            }
+            let mut pkt = Vec::with_capacity(total);
             for b in bufs.iter().filter(|b| !b.writable) {
                 let mut d = vec![0u8; b.len as usize];
                 ram.read(b.addr, &mut d);
@@ -523,6 +545,62 @@ mod tests {
         dev.pump(MAX_RW);
         let rw = dev.rx.iter().find(|p| hdr(p).2 == OP_RW).expect("an RW back");
         assert_eq!(&rw[HDR_LEN..], b"pong");
+    }
+
+    #[test]
+    fn guest_exceeding_window_is_reset() {
+        // M4: a guest that floods past its advertised window (host never drains)
+        // must be RST, and buffered bytes must never exceed the window.
+        let (a, _b) = UnixStream::pair().unwrap();
+        let _ = a.set_nonblocking(true);
+        let mut dev =
+            VsockDevice::new(3, Box::new(TestBackend { dialed: Some(a), incoming: VecDeque::new() }));
+        dev.on_guest_packet(&guest_pkt(40000, 1024, OP_REQUEST, 0, b""));
+        dev.rx.clear();
+
+        // No pump between sends: the host side never advances fwd_cnt.
+        let full = vec![0u8; BUF_ALLOC as usize];
+        dev.on_guest_packet(&guest_pkt(40000, 1024, OP_RW, 0, &full)); // fills window
+        dev.on_guest_packet(&guest_pkt(40000, 1024, OP_RW, 0, b"x")); // one over -> RST
+
+        assert!(dev.rx.iter().any(|p| hdr(p).2 == OP_RST), "flooding past the window must RST");
+        let i = dev.find(40000, 1024).unwrap();
+        assert!(
+            dev.conns[i].to_host.len() <= BUF_ALLOC as usize,
+            "buffered bytes exceeded the advertised window",
+        );
+    }
+
+    #[test]
+    fn oversized_tx_packet_is_dropped() {
+        // M4: a tx descriptor chain claiming more than MAX_PACKET bytes must be
+        // dropped without reassembly, so a hostile chain can't OOM the host.
+        let mem = crate::memory::GuestMemory::new(0, MAX_PACKET + 0x2000).unwrap();
+        let ram = mem.ram();
+        let (a, _b) = UnixStream::pair().unwrap();
+        let _ = a.set_nonblocking(true);
+        let mut dev =
+            VsockDevice::new(3, Box::new(TestBackend { dialed: Some(a), incoming: VecDeque::new() }));
+        dev.on_guest_packet(&guest_pkt(40000, 1024, OP_REQUEST, 0, b""));
+        dev.rx.clear();
+
+        // A small valid RW header in buf0, plus a huge in-range filler buf that
+        // pushes the chain total past MAX_PACKET.
+        let rw = guest_pkt(40000, 1024, OP_RW, 0, b"ping");
+        ram.write(0, &rw);
+        let bufs = vec![
+            Buf { addr: 0, len: rw.len() as u32, writable: false },
+            Buf { addr: 0x1000, len: MAX_PACKET as u32, writable: false },
+        ];
+        dev.handle(VsockDevice::TX, &ram, &bufs);
+
+        let i = dev.find(40000, 1024).unwrap();
+        assert!(dev.conns[i].to_host.is_empty(), "oversized packet was not dropped");
+
+        // A normal-sized packet still delivers.
+        let bufs = vec![Buf { addr: 0, len: rw.len() as u32, writable: false }];
+        dev.handle(VsockDevice::TX, &ram, &bufs);
+        assert_eq!(dev.conns[i].to_host.len(), 4, "normal packet should deliver");
     }
 
     #[test]

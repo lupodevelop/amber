@@ -123,6 +123,11 @@ pub trait VirtioDevice: Send {
     fn wants_poll(&self) -> bool {
         false
     }
+    /// A rate-limit deficit incurred by the last `handle`, for the run loop to
+    /// sleep off after it drops the shared virtio lock. Draining (`take`) semantics.
+    fn take_throttle(&mut self) -> Option<std::time::Duration> {
+        None
+    }
 }
 
 #[derive(Default, Clone, Copy)]
@@ -201,6 +206,12 @@ impl VirtioMmio {
 
     pub fn irq_level(&self) -> bool {
         self.interrupt_status != 0 || self.dev.config_changed()
+    }
+
+    /// Rate-limit deficit from the last notify, for the caller to sleep off after
+    /// it releases the shared virtio lock.
+    pub fn take_throttle(&mut self) -> Option<std::time::Duration> {
+        self.dev.take_throttle()
     }
 
     pub fn read(&mut self, offset: u64, _size: u8) -> u64 {
