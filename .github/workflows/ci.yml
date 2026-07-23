@@ -14,12 +14,24 @@ jobs:
   build-test:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - run: rustup component add clippy
       - name: clippy (warnings are errors)
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: unit tests
         run: cargo test --workspace
+
+  # Scan the dependency tree for RUSTSEC advisories on every push/PR so a CVE in a
+  # transitive crate (the ureq -> rustls -> ring TLS path) can't land unnoticed.
+  audit:
+    name: dependency audit (RUSTSEC)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: cargo-audit
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit
 
   # The Linux sandbox (seccomp + Landlock) is the host-protection barrier and is
   # untestable on macOS, so it gets its own arm64-Linux job. Cheap: build + run the
@@ -29,7 +41,7 @@ jobs:
     name: linux lockdown (seccomp + landlock)
     runs-on: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - name: kernel + LSM diagnostic
         run: |
           uname -r
