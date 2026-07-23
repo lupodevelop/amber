@@ -255,7 +255,9 @@ fn extract_members(
 }
 
 fn short(id: &str) -> &str {
-    &id[..id.len().min(12)]
+    // `get` returns None if 12 lands mid-UTF-8-char (a crafted local-tar id can be
+    // multibyte), so fall back to the whole id rather than panicking on a slice.
+    id.get(..12).unwrap_or(id)
 }
 
 /// Load a built image by content id if both its base and config are present.
@@ -294,6 +296,13 @@ fn ref_store(refs_path: &Path, reference: &str, id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn short_does_not_panic_on_a_multibyte_id() {
+        let id = "aaaaaaaaaaa\u{1F980}"; // byte 12 falls inside the multibyte char
+        let _ = short(id); // would panic slicing &id[..12] before the fix
+        assert_eq!(short("0123456789abcdef"), "0123456789ab");
+    }
 
     #[test]
     fn parses_docker_save_manifest() {

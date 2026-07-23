@@ -595,7 +595,7 @@ impl VirtioDevice for BlkDevice {
             return 0;
         }
         let req_type = ram.read_u32(bufs[0].addr);
-        let sector = ram.read_u64(bufs[0].addr + 8);
+        let sector = ram.read_u64(bufs[0].addr.wrapping_add(8));
         let status_idx = bufs.len() - 1;
         let data = &bufs[1..status_idx];
         let mut written = 0u32;
@@ -613,19 +613,22 @@ impl VirtioDevice for BlkDevice {
         let status = match req_type {
             Self::T_IN => {
                 rate(&mut self.limit, true);
-                let mut offset = sector * SECTOR;
+                // Guest-controlled `sector`/lengths: wrap rather than panic in an
+                // overflow-checked build. An out-of-range offset just makes the
+                // bounds-checked disk read/RAM write a no-op — memory-safe either way.
+                let mut offset = sector.wrapping_mul(SECTOR);
                 for b in data.iter().filter(|b| b.writable) {
                     let mut d = vec![0u8; b.len as usize];
                     self.read_disk(offset, &mut d);
                     ram.write(b.addr, &d);
-                    offset += b.len as u64;
-                    written += b.len;
+                    offset = offset.wrapping_add(b.len as u64);
+                    written = written.wrapping_add(b.len);
                 }
                 Self::S_OK
             }
             Self::T_OUT if self.writable => {
                 rate(&mut self.limit, false);
-                let mut offset = sector * SECTOR;
+                let mut offset = sector.wrapping_mul(SECTOR);
                 let mut ok = true;
                 for b in data.iter().filter(|b| !b.writable) {
                     let mut d = vec![0u8; b.len as usize];
@@ -634,7 +637,7 @@ impl VirtioDevice for BlkDevice {
                         ok = false;
                         break;
                     }
-                    offset += b.len as u64;
+                    offset = offset.wrapping_add(b.len as u64);
                 }
                 if ok { Self::S_OK } else { Self::S_IOERR }
             }
@@ -1140,6 +1143,22 @@ mod tests {
         r.read(DATA + 16, &mut data);
         assert!(data.iter().all(|&b| b == 0xAB));
         assert_eq!(r.read_u32(DATA + 16 + 512) & 0xff, 0); // VIRTIO_BLK_S_OK
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn blk_in_with_overflowing_sector_does_not_panic() {
+        // A guest sector so large that sector*512 overflows must wrap, not panic
+        // (overflow-checked builds); the bounds-checked read just yields zeros.
+        let path = tmp("blk-ovf.img");
+        std::fs::write(&path, vec![0u8; 512]).unwrap();
+        let mut blk = BlkDevice::open(&path).unwrap();
+        let m = ram();
+        let r = m.ram();
+        r.write_u32(DATA, BlkDevice::T_IN);
+        r.write(DATA + 8, &u64::MAX.to_le_bytes());
+        let written = blk.handle(0, &r, &blk_chain(512));
+        assert_eq!(written, 512 + 1); // completed instead of panicking
         std::fs::remove_file(&path).ok();
     }
 

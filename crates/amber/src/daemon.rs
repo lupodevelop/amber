@@ -319,6 +319,13 @@ fn spawn_paused(
     let cout = child.stdout.take();
     let cin = child.stdin.take();
 
+    // Record the real pid now, before the (potentially slow) warm wait below. A
+    // Shutdown that lands during warming would otherwise see pid 0 and skip this
+    // child as an unspawned reservation, orphaning it.
+    if let Some(e) = reg.locked().get_mut(&id) {
+        e.info.pid = pid;
+    }
+
     // Block until the worker finishes the restore and signals ready (one byte).
     // This is the warming cost, paid ahead of any fork request.
     let mut ready = [0u8; 1];
@@ -833,6 +840,11 @@ fn handle(
             for e in reg.locked().values() {
                 if e.info.pid != 0 {
                     unsafe { libc::kill(e.info.pid as i32, libc::SIGKILL) };
+                }
+                // exit(0) below skips the per-worker supervisor cleanup, so unlink
+                // each host-side vsock socket here or it leaks in /tmp.
+                if let Some(v) = &e.vsock {
+                    let _ = std::fs::remove_file(v);
                 }
             }
             let _ = std::fs::remove_file(sock);
